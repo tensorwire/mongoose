@@ -1,0 +1,47 @@
+=== RUN   TestCPUName
+--- PASS: TestCPUName (0.00s)
+=== RUN   TestCPUMatMul_2x3_3x2
+--- PASS: TestCPUMatMul_2x3_3x2 (0.00s)
+=== RUN   TestCPUMatMul_Identity
+--- PASS: TestCPUMatMul_Identity (0.00s)
+=== RUN   TestCPUReLU
+--- PASS: TestCPUReLU (0.00s)
+=== RUN   TestCPUSoftMax
+--- PASS: TestCPUSoftMax (0.00s)
+=== RUN   TestCPURMSNorm
+--- PASS: TestCPURMSNorm (0.00s)
+=== RUN   TestCPUBenchmark
+    cpu_test.go:100: CPU benchmark: 1.21 GFLOPS
+--- PASS: TestCPUBenchmark (2.21s)
+=== RUN   TestCPUVRAM
+--- PASS: TestCPUVRAM (0.00s)
+=== RUN   TestCosineDecay_BoundaryValues
+--- PASS: TestCosineDecay_BoundaryValues (0.00s)
+=== RUN   TestCosineDecay_Monotonic
+--- PASS: TestCosineDecay_Monotonic (0.00s)
+=== RUN   TestCosineDecay_WarmupLinear
+--- PASS: TestCosineDecay_WarmupLinear (0.00s)
+=== RUN   TestCosineDecay_NoWarmup
+--- PASS: TestCosineDecay_NoWarmup (0.00s)
+=== RUN   TestCosineDecayDefaults
+--- PASS: TestCosineDecayDefaults (0.00s)
+=== RUN   TestLRScheduleTable
+--- PASS: TestLRScheduleTable (0.00s)
+=== RUN   TestLRWarmup_Linear
+--- PASS: TestLRWarmup_Linear (0.00s)
+=== RUN   TestLRWarmup_ZeroSteps
+--- PASS: TestLRWarmup_ZeroSteps (0.00s)
+=== RUN   TestRecommendWarmupSteps
+--- PASS: TestRecommendWarmupSteps (0.00s)
+=== RUN   TestGradAccumulator_Averaging
+--- PASS: TestGradAccumulator_Averaging (0.00s)
+=== RUN   TestGradAccumulator_VaryingGradients
+--- PASS: TestGradAccumulator_VaryingGradients (0.00s)
+=== RUN   TestGradAccumulator_SingleStep
+--- PASS: TestGradAccumulator_SingleStep (0.00s)
+=== RUN   TestRecommendAccumSteps
+--- PASS: TestRecommendAccumSteps (0.00s)
+=== RUN   TestTokensPerBatch
+--- PASS: TestTokensPerBatch (0.00s)
+PASS
+ok  	github.com/open-ai-org/mongoose	2.614s
