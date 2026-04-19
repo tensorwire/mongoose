@@ -1,0 +1,75 @@
+// Fused softmax + cross-entropy loss + gradient computation.
+// One workgroup per position. Processes vocab_size elements.
+//
+// Input:  logits[n_pos * vocab_size] — raw logits from LM head
+//         targets[n_pos]             — target token IDs (int32)
+// Output: losses[n_pos]              — per-position cross-entropy loss
+//         grad[n_pos * vocab_size]   — gradient: (softmax - one_hot) * inv_n
+//
+// Compile: clang -cl-std=CL2.0 -target spir64 -O2 -o cross_entropy.bc -c -x cl cross_entropy.comp
+//          llvm-spirv-18 cross_entropy.bc -o cross_entropy.spv
+
+__kernel void cross_entropy(
+    __global float* logits,     // [n_pos, vocab_size] — modified in-place (becomes exp values)
+    __global const int* targets, // [n_pos]
+    __global float* losses,      // [n_pos]
+    __global float* grad,        // [n_pos, vocab_size]
+    const uint vocab_size,
+    const float inv_n            // 1.0 / n_positions
+) {
+    uint pos = get_group_id(0);
+    uint tid = get_local_id(0);
+    uint wg_size = get_local_size(0);
+
+    __global float* row = logits + pos * vocab_size;
+    __global float* grow = grad + pos * vocab_size;
+    int target = targets[pos];
+
+    // Pass 1: find max (numerically stable softmax)
+    __local float sdata[256];
+    float mx = -1e30f;
+    for (uint i = tid; i < vocab_size; i += wg_size) {
+        float v = row[i];
+        if (v > mx) mx = v;
+    }
+    sdata[tid] = mx;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (uint s = wg_size / 2; s > 0; s >>= 1) {
+        if (tid < s && sdata[tid + s] > sdata[tid])
+            sdata[tid] = sdata[tid + s];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    mx = sdata[0];
+
+    // Pass 2: exp(x - max) and sum
+    float local_sum = 0.0f;
+    for (uint i = tid; i < vocab_size; i += wg_size) {
+        float v = exp(row[i] - mx);
+        row[i] = v;
+        local_sum += v;
+    }
+    sdata[tid] = local_sum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (uint s = wg_size / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    float sum_exp = sdata[0];
+
+    // Pass 3: compute gradient and loss
+    // grad[i] = (softmax[i] * inv_n)  for i != target
+    // grad[target] = (softmax[target] - 1) * inv_n
+    // loss = -log(softmax[target])
+    for (uint i = tid; i < vocab_size; i += wg_size) {
+        float p = row[i] / sum_exp;
+        grow[i] = p * inv_n;
+    }
+
+    // Thread 0 writes loss and adjusts target gradient
+    if (tid == 0) {
+        float prob = row[target] / sum_exp;
+        if (prob < 1e-10f) prob = 1e-10f;
+        losses[pos] = -log(prob);
+        grow[target] -= inv_n;
+    }
+}
