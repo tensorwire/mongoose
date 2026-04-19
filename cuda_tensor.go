@@ -413,6 +413,7 @@ void tw_gpu_copy_d2d(void* dst, const void* src, size_t bytes) {
 import "C"
 
 import (
+	"fmt"
 	"log"
 	"math"
 	"sync"
