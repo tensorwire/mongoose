@@ -9,6 +9,7 @@ package mongoose
 #include <cuda_runtime.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <string.h>
 
 // tw_cublas_handle is defined in cuda.go's C block
 extern cublasHandle_t tw_cublas_handle;
@@ -34,6 +35,19 @@ void tw_gpu_download(void* dst, const void* src, size_t bytes) {
 
 void tw_gpu_zero(void* ptr, size_t bytes) {
     cudaMemset(ptr, 0, bytes);
+}
+
+// Pinned host memory — page-locked, L3-resident, zero-copy GPU access
+void* tw_gpu_alloc_pinned(size_t bytes) {
+    void* ptr = NULL;
+    cudaError_t err = cudaHostAlloc(&ptr, bytes, cudaHostAllocDefault);
+    if (err != cudaSuccess) return NULL;
+    return ptr;
+}
+
+int tw_register_host_memory(void* ptr, size_t bytes) {
+    cudaError_t err = cudaHostRegister(ptr, bytes, cudaHostRegisterDefault);
+    return (int)err;
 }
 
 // FP32 matmul with TF32 tensor cores
@@ -851,4 +865,30 @@ func (c *CUDA) AdamWStep(D, G, M, V []float32, n int,
 		mh := M[i] / bc1; vh := V[i] / bc2
 		D[i] -= lr * (mh/(float32(math.Sqrt(float64(vh)))+eps) + wd*D[i])
 	}
+}
+
+// === L3 Bridge — pinned host memory for zero-copy GPU access ===
+
+// AllocL3Bridge allocates pinned host memory via cudaHostAlloc.
+func (c *CUDA) AllocL3Bridge(bytes int) *L3Bridge {
+	ptr := C.tw_gpu_alloc_pinned(C.size_t(bytes))
+	if ptr == nil {
+		return nil
+	}
+	C.memset(ptr, 0, C.size_t(bytes))
+	log.Printf("[cuda] L3 bridge: %d MB pinned host memory", bytes/(1024*1024))
+	return &L3Bridge{Ptr: unsafe.Pointer(ptr), Size: bytes}
+}
+
+// RegisterL3Bridge registers external host memory with CUDA for DMA.
+func (c *CUDA) RegisterL3Bridge(bridge *L3Bridge) error {
+	if bridge == nil {
+		return nil
+	}
+	ret := C.tw_register_host_memory(bridge.Ptr, C.size_t(bridge.Size))
+	if ret != 0 {
+		return fmt.Errorf("cudaHostRegister failed: %d", ret)
+	}
+	log.Printf("[cuda] L3 bridge registered — %d MB", bridge.Size/(1024*1024))
+	return nil
 }
