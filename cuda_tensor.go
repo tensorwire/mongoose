@@ -871,25 +871,6 @@ func (c *CUDA) FreeFP16Tensor(t *Tensor) {
 	}
 }
 
-func (c *CUDA) FromHostFP16(data []float32, shape []int) *Tensor {
-	size := 1
-	for _, s := range shape { size *= s }
-	fp16 := make([]uint16, size)
-	for i, v := range data { fp16[i] = float32ToFP16(v) }
-	ptr := C.tw_gpu_alloc(C.size_t(size * 2))
-	C.tw_gpu_upload(ptr, unsafe.Pointer(&fp16[0]), C.size_t(size*2))
-	return &Tensor{Shape: shape, Size: size, device: &cuPtr{ptr: ptr}, eng: c}
-}
-
-func float32ToFP16(f float32) uint16 {
-	b := math.Float32bits(f)
-	sign := (b >> 16) & 0x8000
-	exp := int((b>>23)&0xFF) - 127
-	frac := b & 0x7FFFFF
-	if exp > 15 { return uint16(sign | 0x7C00) }
-	if exp < -14 { return uint16(sign) }
-	return uint16(sign | uint32(exp+15)<<10 | (frac >> 13))
-}
 
 // === TrainEngine implementation ===
 // Host-slice operations backed by GPU compute.
