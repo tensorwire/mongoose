@@ -802,7 +802,94 @@ func (c *CUDA) TransposeT(a *Tensor, rows, cols int) *Tensor {
 // Dequantize to FP16 or FP32 on-the-fly for cuBLAS matmuls.
 // Memory: 14B params → ~14GB INT8 vs 56GB FP32.
 
-// INT8 quantized tensor ops moved to needle package.
+// QuantizedTensor holds INT8-quantized weight data with per-row absmax scales.
+type QuantizedTensor struct {
+	DataInt8 []int8
+	Scales   []float32
+	Shape    []int
+	Rows     int
+	Cols     int
+}
+
+// Int8Tensor holds quantized weights on GPU with their scale factors.
+type Int8Tensor struct {
+	DataPtr  unsafe.Pointer
+	ScalePtr unsafe.Pointer
+	Rows     int
+	Cols     int
+	eng      *CUDA
+}
+
+func (q *Int8Tensor) VRAMBytes() int {
+	return q.Rows*q.Cols + q.Rows*4
+}
+
+func (c *CUDA) FromHostInt8(qt *QuantizedTensor) *Int8Tensor {
+	nBytes := C.size_t(qt.Rows * qt.Cols)
+	dataPtr := C.tw_gpu_alloc(nBytes)
+	C.tw_gpu_upload(dataPtr, unsafe.Pointer(&qt.DataInt8[0]), nBytes)
+
+	scaleBytes := C.size_t(qt.Rows * 4)
+	scalePtr := C.tw_gpu_alloc(scaleBytes)
+	C.tw_gpu_upload(scalePtr, unsafe.Pointer(&qt.Scales[0]), scaleBytes)
+
+	return &Int8Tensor{
+		DataPtr:  dataPtr,
+		ScalePtr: scalePtr,
+		Rows:     qt.Rows,
+		Cols:     qt.Cols,
+		eng:      c,
+	}
+}
+
+func (c *CUDA) ReleaseInt8(q *Int8Tensor) {
+	if q.DataPtr != nil { C.tw_gpu_free(q.DataPtr); q.DataPtr = nil }
+	if q.ScalePtr != nil { C.tw_gpu_free(q.ScalePtr); q.ScalePtr = nil }
+}
+
+func (c *CUDA) DequantToFP16(q *Int8Tensor, fp16Buf unsafe.Pointer) {
+	KDequantInt8ToFP16(q.DataPtr, q.ScalePtr, fp16Buf, q.Rows, q.Cols)
+}
+
+func (c *CUDA) DequantToFP32(q *Int8Tensor, fp32Buf unsafe.Pointer) {
+	KDequantInt8ToFP32(q.DataPtr, q.ScalePtr, fp32Buf, q.Rows, q.Cols)
+}
+
+func (c *CUDA) AllocFP16Buffer(nElements int) unsafe.Pointer {
+	return C.tw_gpu_alloc(C.size_t(nElements * 2))
+}
+
+func (c *CUDA) AllocFP16Tensor(nElements int, shape []int) *Tensor {
+	ptr := C.tw_gpu_alloc(C.size_t(nElements * 2))
+	return &Tensor{Shape: shape, Size: nElements, device: &cuPtr{ptr: ptr}}
+}
+
+func (c *CUDA) FreeFP16Tensor(t *Tensor) {
+	if t != nil && t.device != nil {
+		C.tw_gpu_free(t.device.(*cuPtr).ptr)
+		t.device = nil
+	}
+}
+
+func (c *CUDA) FromHostFP16(data []float32, shape []int) *Tensor {
+	size := 1
+	for _, s := range shape { size *= s }
+	fp16 := make([]uint16, size)
+	for i, v := range data { fp16[i] = float32ToFP16(v) }
+	ptr := C.tw_gpu_alloc(C.size_t(size * 2))
+	C.tw_gpu_upload(ptr, unsafe.Pointer(&fp16[0]), C.size_t(size*2))
+	return &Tensor{Shape: shape, Size: size, device: &cuPtr{ptr: ptr}, eng: c}
+}
+
+func float32ToFP16(f float32) uint16 {
+	b := math.Float32bits(f)
+	sign := (b >> 16) & 0x8000
+	exp := int((b>>23)&0xFF) - 127
+	frac := b & 0x7FFFFF
+	if exp > 15 { return uint16(sign | 0x7C00) }
+	if exp < -14 { return uint16(sign) }
+	return uint16(sign | uint32(exp+15)<<10 | (frac >> 13))
+}
 
 // === TrainEngine implementation ===
 // Host-slice operations backed by GPU compute.

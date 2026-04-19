@@ -39,4 +39,48 @@ func (c *CUDA) GraphSetVariable(varIdx int, data []float32) int { return 0 }
 
 func (c *CUDA) MatMulL3(wT *Tensor, pinnedX unsafe.Pointer, pinnedOut unsafe.Pointer, m, k, n int) {}
 
+// TensorEngine stubs
+func (c *CUDA) FromHost(data []float32, shape []int) *Tensor    { return nil }
+func (c *CUDA) Zeros(shape []int) *Tensor                       { return nil }
+func (c *CUDA) ToHost(t *Tensor) []float32                      { return nil }
+func (c *CUDA) Release(t *Tensor)                               {}
+func (c *CUDA) MatMulT(a, b *Tensor, m, k, n int) *Tensor       { return nil }
+func (c *CUDA) MatMulTransposeAT(a, b *Tensor, m, k, n int) *Tensor { return nil }
+func (c *CUDA) MatMulTransposeBT(a, b *Tensor, m, k, n int) *Tensor { return nil }
+func (c *CUDA) AddT(a, b *Tensor) *Tensor                       { return nil }
+func (c *CUDA) AddInPlace(a, b *Tensor)                         {}
+func (c *CUDA) ScaleT(a *Tensor, s float32) *Tensor             { return nil }
+func (c *CUDA) ReLUT(a *Tensor) *Tensor                         { return nil }
+func (c *CUDA) ReLUBackwardT(dOut, fwdInput *Tensor) *Tensor    { return nil }
+func (c *CUDA) TransposeT(a *Tensor, rows, cols int) *Tensor    { return nil }
+func (c *CUDA) CopyT(src *Tensor) *Tensor                       { return nil }
+func (c *CUDA) CopyInto(dst, src *Tensor)                       {}
+func (c *CUDA) ZerosBF16(shape []int) *Tensor                   { return nil }
+
+// INT8 stubs
+type QuantizedTensor struct {
+	DataInt8 []int8
+	Scales   []float32
+	Shape    []int
+	Rows     int
+	Cols     int
+}
+
+type Int8Tensor struct {
+	DataPtr  unsafe.Pointer
+	ScalePtr unsafe.Pointer
+	Rows     int
+	Cols     int
+}
+
+func (q *Int8Tensor) VRAMBytes() int                             { return 0 }
+func (c *CUDA) FromHostInt8(qt *QuantizedTensor) *Int8Tensor     { return nil }
+func (c *CUDA) ReleaseInt8(q *Int8Tensor)                        {}
+func (c *CUDA) DequantToFP16(q *Int8Tensor, fp16Buf unsafe.Pointer) {}
+func (c *CUDA) DequantToFP32(q *Int8Tensor, fp32Buf unsafe.Pointer) {}
+func (c *CUDA) AllocFP16Buffer(nElements int) unsafe.Pointer     { return nil }
+func (c *CUDA) AllocFP16Tensor(nElements int, shape []int) *Tensor { return nil }
+func (c *CUDA) FreeFP16Tensor(t *Tensor)                        {}
+func (c *CUDA) FromHostFP16(data []float32, shape []int) *Tensor { return nil }
+
 func PoolStats() (int64, int64, int64, int64) { return 0, 0, 0, 0 }
