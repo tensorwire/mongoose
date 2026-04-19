@@ -4,6 +4,7 @@ package mongoose
 
 /*
 #include <stdlib.h>
+#include <string.h>
 
 // Pinned host memory — page-locked, DMA-accessible, L3-resident.
 // Both CPU and GPU access through cache coherency. Zero copy.
