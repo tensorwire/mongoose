@@ -720,6 +720,33 @@ func (c *CUDA) MatMulTransposeBT(a, b *Tensor, m, k, n int) *Tensor {
 	return &Tensor{Shape: []int{m, n}, Size: size, device: &cuPtr{ptr: ptr}, eng: c}
 }
 
+func (c *CUDA) MatMulTransposeBTInto(out, a, b *Tensor, m, k, n int) {
+	C.tw_gpu_sgemm_transB(
+		(*C.float)(a.device.(*cuPtr).ptr),
+		(*C.float)(b.device.(*cuPtr).ptr),
+		(*C.float)(out.device.(*cuPtr).ptr),
+		C.int(m), C.int(k), C.int(n),
+	)
+}
+
+func (c *CUDA) MatMulTInto(out, a, b *Tensor, m, k, n int) {
+	C.tw_gpu_sgemm(
+		(*C.float)(a.device.(*cuPtr).ptr),
+		(*C.float)(b.device.(*cuPtr).ptr),
+		(*C.float)(out.device.(*cuPtr).ptr),
+		C.int(m), C.int(k), C.int(n),
+	)
+}
+
+func (c *CUDA) MatMulTransposeATInto(out, a, b *Tensor, m, k, n int) {
+	C.tw_gpu_sgemm_transA(
+		(*C.float)(a.device.(*cuPtr).ptr),
+		(*C.float)(b.device.(*cuPtr).ptr),
+		(*C.float)(out.device.(*cuPtr).ptr),
+		C.int(m), C.int(k), C.int(n),
+	)
+}
+
 func (c *CUDA) AddInPlace(a, b *Tensor) {
 	C.tw_gpu_add_inplace((*C.float)(a.device.(*cuPtr).ptr), (*C.float)(b.device.(*cuPtr).ptr), C.int(a.Size))
 }

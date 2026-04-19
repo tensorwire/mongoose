@@ -38,6 +38,9 @@ func (c *CUDA) GraphNumWeights() int                    { return 0 }
 func (c *CUDA) GraphSetVariable(varIdx int, data []float32) int { return 0 }
 
 func (c *CUDA) MatMulL3(wT *Tensor, pinnedX unsafe.Pointer, pinnedOut unsafe.Pointer, m, k, n int) {}
+func (c *CUDA) MatMulTransposeBTInto(out, a, b *Tensor, m, k, n int) {}
+func (c *CUDA) MatMulTInto(out, a, b *Tensor, m, k, n int) {}
+func (c *CUDA) MatMulTransposeATInto(out, a, b *Tensor, m, k, n int) {}
 
 // TensorEngine stubs
 func (c *CUDA) FromHost(data []float32, shape []int) *Tensor    { return nil }
