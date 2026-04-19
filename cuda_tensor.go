@@ -50,6 +50,56 @@ int tw_register_host_memory(void* ptr, size_t bytes) {
     return (int)err;
 }
 
+// FP32 matmul where A is on device, B and C are pinned host memory.
+// cuBLAS reads B from L3 cache, writes C to L3 cache. Zero upload for B.
+int tw_gpu_sgemm_l3(const float* dA, const float* pinnedB, float* pinnedC, int m, int k, int n) {
+    float alpha = 1.0f, beta = 0.0f;
+    cublasStatus_t s = cublasGemmEx(tw_cublas_handle,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        n, m, k,
+        &alpha,
+        pinnedB, CUDA_R_32F, n,
+        dA, CUDA_R_32F, k,
+        &beta,
+        pinnedC, CUDA_R_32F, n,
+        CUBLAS_COMPUTE_32F_FAST_TF32,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    return (int)s;
+}
+
+// C = A^T @ B where A is on device, B and C are pinned.
+int tw_gpu_sgemm_transA_l3(const float* dA, const float* pinnedB, float* pinnedC, int m, int k, int n) {
+    float alpha = 1.0f, beta = 0.0f;
+    cublasStatus_t s = cublasGemmEx(tw_cublas_handle,
+        CUBLAS_OP_N, CUBLAS_OP_T,
+        n, k, m,
+        &alpha,
+        pinnedB, CUDA_R_32F, n,
+        dA, CUDA_R_32F, k,
+        &beta,
+        pinnedC, CUDA_R_32F, n,
+        CUBLAS_COMPUTE_32F_FAST_TF32,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    return (int)s;
+}
+
+// C = A @ B^T where A is pinned, B is on device, C is pinned.
+// This is the main inference/training matmul: hidden (pinned) @ weight^T (device) → output (pinned)
+int tw_gpu_sgemm_transB_l3(const float* pinnedA, const float* dB, float* pinnedC, int m, int k, int n) {
+    float alpha = 1.0f, beta = 0.0f;
+    cublasStatus_t s = cublasGemmEx(tw_cublas_handle,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        n, m, k,
+        &alpha,
+        dB, CUDA_R_32F, k,
+        pinnedA, CUDA_R_32F, k,
+        &beta,
+        pinnedC, CUDA_R_32F, n,
+        CUBLAS_COMPUTE_32F_FAST_TF32,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    return (int)s;
+}
+
 // FP32 matmul with TF32 tensor cores
 int tw_gpu_sgemm(const float* dA, const float* dB, float* dC, int m, int k, int n) {
     float alpha = 1.0f, beta = 0.0f;
@@ -892,4 +942,12 @@ func (c *CUDA) RegisterL3Bridge(bridge *L3Bridge) error {
 	}
 	log.Printf("[cuda] L3 bridge registered — %d MB", bridge.Size/(1024*1024))
 	return nil
+}
+
+// MatMulL3 computes C = W @ X^T where W is on GPU, X and C are pinned L3 memory.
+// W[rows,cols] on device, X[n,cols] pinned, C[n,rows] pinned.
+// cuBLAS reads X from L3 cache, writes C to L3 cache. Zero upload for activations.
+func (c *CUDA) MatMulL3(wT *Tensor, pinnedX unsafe.Pointer, pinnedOut unsafe.Pointer, m, k, n int) {
+	wPtr := wT.DevicePtr()
+	C.tw_gpu_sgemm_transB_l3((*C.float)(pinnedX), (*C.float)(wPtr), (*C.float)(pinnedOut), C.int(m), C.int(k), C.int(n))
 }

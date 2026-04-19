@@ -2,6 +2,8 @@
 
 package mongoose
 
+import "unsafe"
+
 type CUDA struct{}
 
 func NewCUDA() *CUDA                                          { return nil }
@@ -34,5 +36,7 @@ func (c *CUDA) BuildFullGraph(dim, kvDim, headDim, nHeads, nKVHeads, ffnDim, voc
 func (c *CUDA) GraphTrainStepAdam(tokens, targets []int32, lr float32) float32 { return -1 }
 func (c *CUDA) GraphNumWeights() int                    { return 0 }
 func (c *CUDA) GraphSetVariable(varIdx int, data []float32) int { return 0 }
+
+func (c *CUDA) MatMulL3(wT *Tensor, pinnedX unsafe.Pointer, pinnedOut unsafe.Pointer, m, k, n int) {}
 
 func PoolStats() (int64, int64, int64, int64) { return 0, 0, 0, 0 }
