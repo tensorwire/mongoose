@@ -49,6 +49,68 @@ int mtl_graph_accum_adam_step(float learningRate, float accumScale);
 
 int mtl_init_compute(void);
 int mtl_compute_ready(void);
+
+// Inference graph
+int mtl_infer_build(int dim, int kvDim, int headDim,
+                    int nHeads, int nKVHeads, int ffnDim,
+                    int vocabSize, int nLayers, float ropeTheta);
+int mtl_infer_num_weights(void);
+int mtl_infer_set_weight(int idx, const float* data, int nFloats);
+int mtl_infer_forward(float* hiddenIO, float* cosData, float* sinData,
+                      float* qOut, float* kOut, float* vOut,
+                      float* attnIn, float* logitsOut, int layer);
+int mtl_infer_forward_b(float* hiddenIO, float* attnOut, int layer);
+
+// Fused compute-shader inference (one command buffer per token)
+int mtl_fused_build(int dim, int kvDim, int headDim,
+                    int nHeads, int nKVHeads, int ffnDim,
+                    int vocabSize, int nLayers, int maxSeq);
+int mtl_fused_num_weights(void);
+int mtl_fused_set_weight(int idx, const float* data, int nFloats);
+int mtl_fused_step(const float* hiddenIn, const float* cosData, const float* sinData,
+                   int pos, float* logitsOut);
+
+// Fused single-dispatch inference (MPSGraph — deprecated)
+int mtl_fused_infer_build(int dim, int kvDim, int headDim,
+                          int nHeads, int nKVHeads, int ffnDim,
+                          int vocabSize, int nLayers, int maxSeq,
+                          float ropeTheta);
+int mtl_fused_infer_num_weights(void);
+int mtl_fused_infer_set_weight(int idx, const float* data, int nFloats);
+int mtl_fused_infer_step(float* hiddenIn, float* cosData, float* sinData,
+                         int pos, float* logitsOut);
+int mtl_fused_infer_reset(void);
+
+// Fused training compute kernels
+void mtl_fused_begin(void);
+void mtl_fused_end(void);
+void mtl_fused_begin_slot(int slot);
+void mtl_fused_end_slot(int slot);
+void mtl_fused_set_slot(int slot);
+void mtl_fused_sync_all(void);
+void mtl_fused_gemm_bt(void* a, void* b, void* c, int M, int K, int N);
+void mtl_fused_gemm_nn(void* a, void* b, void* c, int M, int K, int N);
+void mtl_fused_gemm_tn(void* a, void* b, void* c, int M, int K, int N);
+void mtl_fused_gemm_f32_bt(void* a, void* b, void* c, int M, int K, int N);
+void mtl_fused_gemm_f32_nn(void* a, void* b, void* c, int M, int K, int N);
+void mtl_fused_gemm_f32_tn(void* a, void* b, void* c, int M, int K, int N);
+void mtl_fused_rmsnorm(void* x, void* w, void* scale, int seqLen, int dim);
+void mtl_fused_rmsnorm_bwd(void* dOut, void* xIn, void* w, void* scale, void* dx, int seqLen, int dim);
+void mtl_fused_rope(void* x, int headDim, int nHeads, float theta, int stride, int seqLen);
+void mtl_fused_attn(void* q, void* k, void* v, void* out, void* scores, int dim, int kvDim, int headDim, int nHeads, int nKVHeads, int seqLen);
+void mtl_fused_attention_bwd_q(void* dOut, void* q, void* k, void* v, void* scores, void* dQ, void* dK, void* dV, int dim, int kvDim, int headDim, int nHeads, int nKVHeads, int seqLen, int qLen);
+void mtl_fused_silu_gate_mul(void* gate, void* up, void* out, int n);
+void mtl_silu_gate_backward_gpu(void* dOut, void* gatePre, void* upOut, void* gateAct, void* dGatePre, void* dUp, int n);
+void mtl_fused_add_inplace(void* a, void* b, int n);
+void mtl_fused_copy(void* dst, void* src, int n);
+void mtl_ce_loss(void* logits, void* targets, void* losses, int seqLen, int vocabSize);
+void mtl_adamw_gpu(void* param, void* grad, void* m, void* v, float lr, float beta1, float beta2, float bc1, float bc2, float eps, float wd, int n);
+void mtl_dna_rung_gpu(void* d1, void* g1, void* m1, void* v1, void* d2, void* g2, void* m2, void* v2, float bb1, float gly1, float hb1, float hb2, float gly2, float bb2, float bondStr, float lr, float beta1, float beta2, float bc1, float bc2, float eps, float wd, int n);
+void mtl_dna_rung_warm(void* d1, void* g1, void* d2, void* g2, void* cache, int m1Off, int v1Off, int m2Off, int v2Off, float bb1, float gly1, float hb1, float hb2, float gly2, float bb2, float bondStr, float lr, float beta1, float beta2, float bc1, float bc2, float eps, float wd, int n);
+void mtl_adamw_warm(void* param, void* grad, void* cache, int mOff, int vOff, float lr, float beta1, float beta2, float bc1, float bc2, float eps, float wd, int n);
+void* mtl_shared_ptr(MTLBufferRef buf);
+void mtl_grad_norm_sq(void* grad, void* out, int n);
+
 */
 import "C"
 
@@ -67,6 +129,7 @@ type Metal struct {
 	pool       map[int][]C.MTLBufferRef
 	poolMu     sync.Mutex
 }
+
 
 func NewMetal() *Metal {
 	ret := C.mtl_init()
@@ -315,6 +378,98 @@ func (m *Metal) GraphTrainStepAccum(tokens, targets []int32) float32 {
 		nil, nil, 0, 0, 2))
 }
 
+// --- Inference Graph ---
+
+func (m *Metal) BuildInferGraph(dim, kvDim, headDim, nHeads, nKVHeads, ffnDim, vocabSize, nLayers int, ropeTheta float64) int {
+	return int(C.mtl_infer_build(C.int(dim), C.int(kvDim), C.int(headDim),
+		C.int(nHeads), C.int(nKVHeads), C.int(ffnDim),
+		C.int(vocabSize), C.int(nLayers), C.float(ropeTheta)))
+}
+
+func (m *Metal) InferNumWeights() int {
+	return int(C.mtl_infer_num_weights())
+}
+
+func (m *Metal) InferSetWeight(idx int, data []float32) int {
+	return int(C.mtl_infer_set_weight(C.int(idx), (*C.float)(unsafe.Pointer(&data[0])), C.int(len(data))))
+}
+
+func (m *Metal) InferForwardA(hidden []float32, cosSlice, sinSlice []float32, qOut, kOut, vOut []float32, layer int) int {
+	return int(C.mtl_infer_forward(
+		(*C.float)(unsafe.Pointer(&hidden[0])),
+		(*C.float)(unsafe.Pointer(&cosSlice[0])),
+		(*C.float)(unsafe.Pointer(&sinSlice[0])),
+		(*C.float)(unsafe.Pointer(&qOut[0])),
+		(*C.float)(unsafe.Pointer(&kOut[0])),
+		(*C.float)(unsafe.Pointer(&vOut[0])),
+		nil, nil, C.int(layer)))
+}
+
+func (m *Metal) InferForwardB(hidden []float32, attnOut []float32, layer int) int {
+	return int(C.mtl_infer_forward_b(
+		(*C.float)(unsafe.Pointer(&hidden[0])),
+		(*C.float)(unsafe.Pointer(&attnOut[0])),
+		C.int(layer)))
+}
+
+func (m *Metal) InferLogits(hidden []float32, logitsOut []float32) int {
+	return int(C.mtl_infer_forward(
+		(*C.float)(unsafe.Pointer(&hidden[0])),
+		nil, nil, nil, nil, nil, nil,
+		(*C.float)(unsafe.Pointer(&logitsOut[0])),
+		C.int(10000))) // layer >= nLayers triggers final path
+}
+
+func (m *Metal) BuildFused(dim, kvDim, headDim, nHeads, nKVHeads, ffnDim, vocabSize, nLayers, maxSeq int) int {
+	return int(C.mtl_fused_build(C.int(dim), C.int(kvDim), C.int(headDim),
+		C.int(nHeads), C.int(nKVHeads), C.int(ffnDim),
+		C.int(vocabSize), C.int(nLayers), C.int(maxSeq)))
+}
+
+func (m *Metal) FusedNumWeights() int {
+	return int(C.mtl_fused_num_weights())
+}
+
+func (m *Metal) FusedSetWeight(idx int, data []float32) int {
+	return int(C.mtl_fused_set_weight(C.int(idx), (*C.float)(unsafe.Pointer(&data[0])), C.int(len(data))))
+}
+
+func (m *Metal) FusedStep(hidden []float32, cosSlice, sinSlice []float32, pos int, logitsOut []float32) int {
+	return int(C.mtl_fused_step(
+		(*C.float)(unsafe.Pointer(&hidden[0])),
+		(*C.float)(unsafe.Pointer(&cosSlice[0])),
+		(*C.float)(unsafe.Pointer(&sinSlice[0])),
+		C.int(pos),
+		(*C.float)(unsafe.Pointer(&logitsOut[0]))))
+}
+
+func (m *Metal) BuildFusedInfer(dim, kvDim, headDim, nHeads, nKVHeads, ffnDim, vocabSize, nLayers, maxSeq int, ropeTheta float64) int {
+	return int(C.mtl_fused_infer_build(C.int(dim), C.int(kvDim), C.int(headDim),
+		C.int(nHeads), C.int(nKVHeads), C.int(ffnDim),
+		C.int(vocabSize), C.int(nLayers), C.int(maxSeq), C.float(ropeTheta)))
+}
+
+func (m *Metal) FusedInferNumWeights() int {
+	return int(C.mtl_fused_infer_num_weights())
+}
+
+func (m *Metal) FusedInferSetWeight(idx int, data []float32) int {
+	return int(C.mtl_fused_infer_set_weight(C.int(idx), (*C.float)(unsafe.Pointer(&data[0])), C.int(len(data))))
+}
+
+func (m *Metal) FusedInferStep(hidden []float32, cosSlice, sinSlice []float32, pos int, logitsOut []float32) int {
+	return int(C.mtl_fused_infer_step(
+		(*C.float)(unsafe.Pointer(&hidden[0])),
+		(*C.float)(unsafe.Pointer(&cosSlice[0])),
+		(*C.float)(unsafe.Pointer(&sinSlice[0])),
+		C.int(pos),
+		(*C.float)(unsafe.Pointer(&logitsOut[0]))))
+}
+
+func (m *Metal) FusedInferReset() int {
+	return int(C.mtl_fused_infer_reset())
+}
+
 func (m *Metal) poolGet(sizeFloats int) C.MTLBufferRef {
 	m.poolMu.Lock()
 	if free := m.pool[sizeFloats]; len(free) > 0 {
@@ -336,4 +491,172 @@ func (m *Metal) poolPut(sizeFloats int, buf C.MTLBufferRef) {
 	}
 	m.pool[sizeFloats] = append(m.pool[sizeFloats], buf)
 	m.poolMu.Unlock()
+}
+
+// === Fused Training Compute Kernels ===
+
+func (m *Metal) FusedBegin()             { C.mtl_fused_begin() }
+func (m *Metal) FusedEnd()               { C.mtl_fused_end() }
+func (m *Metal) FusedBeginSlot(slot int) { C.mtl_fused_begin_slot(C.int(slot)) }
+func (m *Metal) FusedEndSlot(slot int)   { C.mtl_fused_end_slot(C.int(slot)) }
+func (m *Metal) FusedSetSlot(slot int)   { C.mtl_fused_set_slot(C.int(slot)) }
+func (m *Metal) FusedSyncAll()           { C.mtl_fused_sync_all() }
+
+func (m *Metal) FusedGemmBT(a, b, c *Tensor, M, K, N int) {
+	C.mtl_fused_gemm_bt(MtlBufPtr(a), MtlBufPtr(b), MtlBufPtr(c), C.int(M), C.int(K), C.int(N))
+}
+func (m *Metal) FusedGemmNN(a, b, c *Tensor, M, K, N int) {
+	C.mtl_fused_gemm_nn(MtlBufPtr(a), MtlBufPtr(b), MtlBufPtr(c), C.int(M), C.int(K), C.int(N))
+}
+func (m *Metal) FusedGemmTN(a, b, c *Tensor, M, K, N int) {
+	C.mtl_fused_gemm_tn(MtlBufPtr(a), MtlBufPtr(b), MtlBufPtr(c), C.int(M), C.int(K), C.int(N))
+}
+func (m *Metal) FusedGemmF32BT(a, b, c *Tensor, M, K, N int) {
+	C.mtl_fused_gemm_f32_bt(MtlBufPtr(a), MtlBufPtr(b), MtlBufPtr(c), C.int(M), C.int(K), C.int(N))
+}
+func (m *Metal) FusedGemmF32NN(a, b, c *Tensor, M, K, N int) {
+	C.mtl_fused_gemm_f32_nn(MtlBufPtr(a), MtlBufPtr(b), MtlBufPtr(c), C.int(M), C.int(K), C.int(N))
+}
+func (m *Metal) FusedGemmF32TN(a, b, c *Tensor, M, K, N int) {
+	C.mtl_fused_gemm_f32_tn(MtlBufPtr(a), MtlBufPtr(b), MtlBufPtr(c), C.int(M), C.int(K), C.int(N))
+}
+func (m *Metal) FusedRMSNorm(x, w, scale *Tensor, seqLen, dim int) {
+	C.mtl_fused_rmsnorm(MtlBufPtr(x), MtlBufPtr(w), MtlBufPtr(scale), C.int(seqLen), C.int(dim))
+}
+func (m *Metal) FusedRMSNormBwd(dOut, xIn, w, scale, dx *Tensor, seqLen, dim int) {
+	C.mtl_fused_rmsnorm_bwd(MtlBufPtr(dOut), MtlBufPtr(xIn), MtlBufPtr(w), MtlBufPtr(scale), MtlBufPtr(dx), C.int(seqLen), C.int(dim))
+}
+func (m *Metal) FusedRoPE(x *Tensor, headDim, nHeads int, theta float32, stride, seqLen int) {
+	C.mtl_fused_rope(MtlBufPtr(x), C.int(headDim), C.int(nHeads), C.float(theta), C.int(stride), C.int(seqLen))
+}
+func (m *Metal) FusedAttention(q, k, v, out, scores *Tensor, dim, kvDim, headDim, nHeads, nKVHeads, seqLen int) {
+	C.mtl_fused_attn(MtlBufPtr(q), MtlBufPtr(k), MtlBufPtr(v), MtlBufPtr(out), MtlBufPtr(scores),
+		C.int(dim), C.int(kvDim), C.int(headDim), C.int(nHeads), C.int(nKVHeads), C.int(seqLen))
+}
+func (m *Metal) FusedAttentionBwdQ(dOut, q, k, v, scores, dQ, dK, dV *Tensor,
+	dim, kvDim, headDim, nHeads, nKVHeads, seqLen, qLen int) {
+	C.mtl_fused_attention_bwd_q(MtlBufPtr(dOut), MtlBufPtr(q), MtlBufPtr(k), MtlBufPtr(v), MtlBufPtr(scores),
+		MtlBufPtr(dQ), MtlBufPtr(dK), MtlBufPtr(dV),
+		C.int(dim), C.int(kvDim), C.int(headDim), C.int(nHeads), C.int(nKVHeads), C.int(seqLen), C.int(qLen))
+}
+func (m *Metal) FusedSiLUGateMul(gate, up, out *Tensor, n int) {
+	C.mtl_fused_silu_gate_mul(MtlBufPtr(gate), MtlBufPtr(up), MtlBufPtr(out), C.int(n))
+}
+func (m *Metal) SiLUGateBackward(dOut, gatePre, upOut, gateAct, dGatePre, dUp *Tensor) {
+	C.mtl_silu_gate_backward_gpu(MtlBufPtr(dOut), MtlBufPtr(gatePre), MtlBufPtr(upOut),
+		MtlBufPtr(gateAct), MtlBufPtr(dGatePre), MtlBufPtr(dUp), C.int(dOut.Size))
+}
+func (m *Metal) FusedAddInPlace(a, b *Tensor, n int) {
+	C.mtl_fused_add_inplace(MtlBufPtr(a), MtlBufPtr(b), C.int(n))
+}
+func (m *Metal) FusedCopy(dst, src *Tensor, n int) {
+	C.mtl_fused_copy(MtlBufPtr(dst), MtlBufPtr(src), C.int(n))
+}
+func (m *Metal) CELoss(logits, targets, losses *Tensor, seqLen, vocabSize int) {
+	C.mtl_ce_loss(MtlBufPtr(logits), MtlBufPtr(targets), MtlBufPtr(losses), C.int(seqLen), C.int(vocabSize))
+}
+func (m *Metal) AdamWT(param, grad, mState, vState *Tensor, lr, wd float32, step int) {
+	bc1 := C.float(1.0 - math.Pow(0.9, float64(step)))
+	bc2 := C.float(1.0 - math.Pow(0.95, float64(step)))
+	C.mtl_adamw_gpu(MtlBufPtr(param), MtlBufPtr(grad), MtlBufPtr(mState), MtlBufPtr(vState),
+		C.float(lr), C.float(0.9), C.float(0.95), bc1, bc2, C.float(1e-8), C.float(wd), C.int(param.Size))
+}
+func (m *Metal) DNARungGPU(d1, g1, m1, v1, d2, g2, m2, v2 *Tensor,
+	bb1, gly1, hb1, hb2, gly2, bb2, bondStr, lr, beta1, beta2, bc1, bc2, eps, wd float32, n int) {
+	C.mtl_dna_rung_gpu(MtlBufPtr(d1), MtlBufPtr(g1), MtlBufPtr(m1), MtlBufPtr(v1),
+		MtlBufPtr(d2), MtlBufPtr(g2), MtlBufPtr(m2), MtlBufPtr(v2),
+		C.float(bb1), C.float(gly1), C.float(hb1), C.float(hb2), C.float(gly2), C.float(bb2),
+		C.float(bondStr), C.float(lr), C.float(beta1), C.float(beta2),
+		C.float(bc1), C.float(bc2), C.float(eps), C.float(wd), C.int(n))
+}
+func (m *Metal) GradNormSqGPU(grad, out *Tensor, n int) {
+	C.mtl_grad_norm_sq(MtlBufPtr(grad), MtlBufPtr(out), C.int(n))
+}
+
+// WarmCache is a single MTLBuffer in unified memory that holds all optimizer state
+// (momentum + velocity for every parameter). Both CPU and GPU access the same physical
+// pages — the CPU (helix) computes rung geometry and reads/writes m/v via []float32
+// slices; the GPU kernel reads/writes the same m/v via buffer offsets. No copy.
+type WarmCache struct {
+	buf      C.MTLBufferRef
+	nFloats  int
+	sharedF  []float32
+}
+
+// NewWarmCache allocates a single unified-memory buffer large enough to hold
+// nFloats float32 values. Returns a WarmCache whose Slice method yields
+// CPU-visible []float32 windows that the GPU also reads/writes.
+func (m *Metal) NewWarmCache(nFloats int) *WarmCache {
+	buf := C.mtl_alloc(C.size_t(nFloats * 4))
+	C.mtl_zero(buf, C.size_t(nFloats*4))
+
+	ptr := C.mtl_shared_ptr(buf)
+	shared := (*[1 << 30]float32)(ptr)[:nFloats:nFloats]
+
+	return &WarmCache{
+		buf:     buf,
+		nFloats: nFloats,
+		sharedF: shared,
+	}
+}
+
+// Slice returns a CPU-visible []float32 view into the warm cache starting at
+// float offset 'off' with length 'n'. This slice is backed by the MTLBuffer's
+// shared memory — writes from Go are visible to the GPU and vice versa.
+func (wc *WarmCache) Slice(off, n int) []float32 {
+	return wc.sharedF[off : off+n]
+}
+
+// ByteOffset returns the byte offset for a given float index, for passing
+// to the GPU kernel dispatch.
+func (wc *WarmCache) ByteOffset(floatIdx int) int {
+	return floatIdx * 4
+}
+
+// BufPtr returns the raw MTLBuffer pointer for use with kernel dispatch.
+func (wc *WarmCache) BufPtr() unsafe.Pointer {
+	return unsafe.Pointer(wc.buf)
+}
+
+// Release frees the underlying MTLBuffer.
+func (wc *WarmCache) Release() {
+	if wc.buf != nil {
+		C.mtl_free(wc.buf)
+		wc.buf = nil
+		wc.sharedF = nil
+	}
+}
+
+// SharedSlice returns a CPU-visible []float32 view of a Tensor's underlying
+// MTLBuffer. On Apple Silicon this IS the GPU memory — unified architecture.
+// The returned slice is valid as long as the Tensor is not released.
+func (m *Metal) SharedSlice(t *Tensor) []float32 {
+	mp := t.device.(*mtlPtr)
+	ptr := C.mtl_shared_ptr(mp.buf)
+	return (*[1 << 30]float32)(ptr)[:t.Size:t.Size]
+}
+
+// DNARungWarm dispatches the paired DNA rung kernel with m/v read from a warm cache
+// at the given float offsets. No separate m/v tensor allocations needed.
+func (m *Metal) DNARungWarm(d1, g1, d2, g2 *Tensor, wc *WarmCache,
+	m1Off, v1Off, m2Off, v2Off int,
+	bb1, gly1, hb1, hb2, gly2, bb2, bondStr, lr, beta1, beta2, bc1, bc2, eps, wd float32, n int) {
+	C.mtl_dna_rung_warm(MtlBufPtr(d1), MtlBufPtr(g1), MtlBufPtr(d2), MtlBufPtr(g2),
+		wc.BufPtr(),
+		C.int(wc.ByteOffset(m1Off)), C.int(wc.ByteOffset(v1Off)),
+		C.int(wc.ByteOffset(m2Off)), C.int(wc.ByteOffset(v2Off)),
+		C.float(bb1), C.float(gly1), C.float(hb1), C.float(hb2), C.float(gly2), C.float(bb2),
+		C.float(bondStr), C.float(lr), C.float(beta1), C.float(beta2),
+		C.float(bc1), C.float(bc2), C.float(eps), C.float(wd), C.int(n))
+}
+
+// AdamWWarm dispatches the AdamW kernel with m/v read from a warm cache at the given
+// float offsets. Single-strand update for unpaired parameters.
+func (m *Metal) AdamWWarm(param, grad *Tensor, wc *WarmCache, mOff, vOff int,
+	lr, beta1, beta2, bc1, bc2, eps, wd float32, n int) {
+	C.mtl_adamw_warm(MtlBufPtr(param), MtlBufPtr(grad),
+		wc.BufPtr(),
+		C.int(wc.ByteOffset(mOff)), C.int(wc.ByteOffset(vOff)),
+		C.float(lr), C.float(beta1), C.float(beta2),
+		C.float(bc1), C.float(bc2), C.float(eps), C.float(wd), C.int(n))
 }
