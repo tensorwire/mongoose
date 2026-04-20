@@ -377,7 +377,7 @@ func KCausalAttention(qPtr, kPtr, vPtr, outPtr unsafe.Pointer, seqLen, dim, numH
 // KAdamW: full AdamW update on GPU. No CPU round-trip. No PCIe transfer.
 func KAdamW(paramPtr, gradPtr, mPtr, vPtr unsafe.Pointer, lr, wd float32, step int, n int) {
 	beta1 := float32(0.9)
-	beta2 := float32(0.999)
+	beta2 := float32(0.95)
 	bc1 := C.float(1.0 - math.Pow(float64(beta1), float64(step)))
 	bc2 := C.float(1.0 - math.Pow(float64(beta2), float64(step)))
 	C.tw_k_adamw(
