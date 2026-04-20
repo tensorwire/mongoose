@@ -173,6 +173,11 @@ void tw_k_copy(void* dst, const void* src, size_t bytes) {
 void tw_k_zero(void* ptr, size_t bytes) {
     if (k_zero) k_zero(ptr, bytes, 0);
 }
+const char* tw_cuda_check() {
+    cudaError_t err = cudaPeekAtLastError();
+    if (err != cudaSuccess) return cudaGetErrorString(err);
+    return NULL;
+}
 void tw_k_sync() {
     if (k_sync) k_sync(0);
 }
@@ -389,6 +394,13 @@ func KCopy(dst, src unsafe.Pointer, bytes int) {
 // KZero: memset zero on GPU.
 func KZero(ptr unsafe.Pointer, bytes int) {
 	C.tw_k_zero(ptr, C.size_t(bytes))
+}
+
+// CUDACheck returns the last CUDA error string, or empty string if no error.
+func CUDACheck() string {
+	s := C.tw_cuda_check()
+	if s == nil { return "" }
+	return C.GoString(s)
 }
 
 // KSync: synchronize default stream.

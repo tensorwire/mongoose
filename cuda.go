@@ -14,14 +14,19 @@ package mongoose
 cublasHandle_t tw_cublas_handle;
 int tw_cuda_initialized = 0;
 
+static void* tw_cublas_workspace = NULL;
+static size_t tw_cublas_workspace_size = 32 * 1024 * 1024; // 32 MiB
+
 int tw_cuda_init() {
     if (tw_cuda_initialized) return 0;
     cudaError_t cerr = cudaSetDevice(0);
     if (cerr != cudaSuccess) return -1;
     cublasStatus_t serr = cublasCreate(&tw_cublas_handle);
     if (serr != CUBLAS_STATUS_SUCCESS) return -2;
-    // Enable TF32 tensor core math globally — same as PyTorch default
     cublasSetMathMode(tw_cublas_handle, CUBLAS_TF32_TENSOR_OP_MATH);
+    // Cap cuBLAS workspace to 32MB — Blackwell cublasGemmEx allocates multi-GB otherwise
+    cudaMalloc(&tw_cublas_workspace, tw_cublas_workspace_size);
+    cublasSetWorkspace(tw_cublas_handle, tw_cublas_workspace, tw_cublas_workspace_size);
     tw_cuda_initialized = 1;
     return 0;
 }

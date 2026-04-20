@@ -8,6 +8,7 @@ package mongoose
 #include <cublasLt.h>
 #include <cuda_runtime.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -100,10 +101,10 @@ int tw_gpu_sgemm_transB_l3(const float* pinnedA, const float* dB, float* pinnedC
     return (int)s;
 }
 
-// FP32 matmul with TF32 tensor cores
+// C = A @ B: A[m,k], B[k,n], C[m,n] row-major
 int tw_gpu_sgemm(const float* dA, const float* dB, float* dC, int m, int k, int n) {
     float alpha = 1.0f, beta = 0.0f;
-    cublasStatus_t s = cublasGemmEx(tw_cublas_handle,
+    return (int)cublasGemmEx(tw_cublas_handle,
         CUBLAS_OP_N, CUBLAS_OP_N,
         n, m, k,
         &alpha,
@@ -111,9 +112,7 @@ int tw_gpu_sgemm(const float* dA, const float* dB, float* dC, int m, int k, int 
         dA, CUDA_R_32F, k,
         &beta,
         dC, CUDA_R_32F, n,
-        CUBLAS_COMPUTE_32F_FAST_TF32,
-        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-    return (int)s;
+        CUBLAS_COMPUTE_32F_FAST_TF32, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 }
 
 // FP16 matmul with FP32 accumulation — maximum tensor core throughput
