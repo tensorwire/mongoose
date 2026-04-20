@@ -50,4 +50,7 @@ func KFP32ToFP16(inPtr, outPtr unsafe.Pointer, n int) {}
 func KFP16ToFP32(inPtr, outPtr unsafe.Pointer, n int) {}
 func HelixDNALoaded() bool { return false }
 func KHelixDNAStep(d1, d2, g1, g2, m1, m2, v1, v2 unsafe.Pointer, lr, beta1, beta2 float32, step int, eps, wd float32, bb1, gly1, hb1, hb2, gly2, bb2, bondStrength float32, n int) {}
+func HelixNeedleLoaded() bool { return false }
+func KHelixNeedle(dataPtr, scalesPtr, gradPtr, momPtr, velPtr, maskPtr unsafe.Pointer, lr, beta1, beta2 float32, step int, eps, wd float32, n, cols int) {}
+func KHelixNeedlePaired(d1Ptr, d2Ptr, s1Ptr, s2Ptr, g1Ptr, g2Ptr, m1Ptr, m2Ptr, v1Ptr, v2Ptr, maskPtr unsafe.Pointer, lr, beta1, beta2 float32, step int, eps, wd float32, bb1, gly1, hb1, hb2, gly2, bb2, bondStrength float32, n, cols int) {}
 func CUDACheck() string { return "" }

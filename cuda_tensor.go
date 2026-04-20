@@ -510,6 +510,33 @@ func (c *CUDA) Zeros(shape []int) *Tensor {
 	}
 }
 
+// ZerosL3 allocates a tensor in L3 pinned host memory instead of GPU VRAM.
+// The tensor is device-accessible through cache coherency — cuBLAS and custom
+// kernels read/write it without memcpy. Use for activations that don't need
+// to persist across steps.
+func (c *CUDA) ZerosL3(shape []int) *Tensor {
+	size := 1
+	for _, s := range shape { size *= s }
+	ptr := C.tw_gpu_alloc_pinned(C.size_t(size * 4))
+	if ptr == nil {
+		return c.Zeros(shape)
+	}
+	C.memset(ptr, 0, C.size_t(size*4))
+	return &Tensor{
+		Shape:  shape,
+		Size:   size,
+		device: &cuPtr{ptr: ptr},
+		eng:    c,
+	}
+}
+
+// AllocGPU allocates raw GPU memory and zeros it. Returns device pointer.
+func (c *CUDA) AllocGPU(bytes int) unsafe.Pointer {
+	ptr := C.tw_gpu_alloc(C.size_t(bytes))
+	C.tw_gpu_zero(ptr, C.size_t(bytes))
+	return ptr
+}
+
 func (c *CUDA) ToHost(t *Tensor) []float32 {
 	cu := t.device.(*cuPtr)
 	data := make([]float32, t.Size)
