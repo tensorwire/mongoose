@@ -38,6 +38,7 @@ typedef void (*fn_decode_attn)(const float*, const float*, const float*, float*,
 typedef void (*fn_rmsnorm_save)(const float*, float*, const float*, float*, int, int, cudaStream_t);
 typedef void (*fn_rmsnorm_bwd)(const float*, const float*, const float*, const float*, float*, int, int, cudaStream_t);
 typedef void (*fn_softmax_ce)(float*, const int*, float*, float*, int, int, float, cudaStream_t);
+typedef void (*fn_helix_dna_step)(float*, float*, const float*, const float*, float*, float*, float*, float*, float, float, float, float, float, float, float, float, float, float, float, float, float, float, int, cudaStream_t);
 typedef void (*fn_dequant_int8_fp16)(const void*, const float*, void*, int, int, cudaStream_t);
 typedef void (*fn_dequant_int8_fp32)(const void*, const float*, float*, int, int, cudaStream_t);
 typedef void (*fn_fp32_to_fp16)(const float*, void*, int, cudaStream_t);
@@ -76,6 +77,7 @@ static fn_decode_attn       k_decode_attn = NULL;
 static fn_rmsnorm_save      k_rmsnorm_save = NULL;
 static fn_rmsnorm_bwd       k_rmsnorm_bwd = NULL;
 static fn_softmax_ce        k_softmax_ce = NULL;
+static fn_helix_dna_step    k_helix_dna_step = NULL;
 static fn_dequant_int8_fp16 k_dequant_int8_fp16 = NULL;
 static fn_dequant_int8_fp32 k_dequant_int8_fp32 = NULL;
 static fn_fp32_to_fp16     k_fp32_to_fp16 = NULL;
@@ -117,6 +119,7 @@ int tw_load_kernels(const char* path) {
     k_rmsnorm_save        = (fn_rmsnorm_save)dlsym(kernel_lib, "mongoose_rmsnorm_out_save");
     k_rmsnorm_bwd         = (fn_rmsnorm_bwd)dlsym(kernel_lib, "mongoose_rmsnorm_backward");
     k_softmax_ce          = (fn_softmax_ce)dlsym(kernel_lib, "mongoose_softmax_ce");
+    k_helix_dna_step      = (fn_helix_dna_step)dlsym(kernel_lib, "mongoose_helix_dna_step");
     k_dequant_int8_fp16   = (fn_dequant_int8_fp16)dlsym(kernel_lib, "mongoose_dequant_int8_to_fp16");
     k_dequant_int8_fp32   = (fn_dequant_int8_fp32)dlsym(kernel_lib, "mongoose_dequant_int8_to_fp32");
     k_fp32_to_fp16        = (fn_fp32_to_fp16)dlsym(kernel_lib, "mongoose_fp32_to_fp16");
@@ -167,6 +170,16 @@ void tw_k_adamw(float* param, const float* grad, float* m, float* v,
                 float lr, float wd, float beta1, float beta2, float bc1, float bc2, int n) {
     if (k_adamw) k_adamw(param, grad, m, v, lr, wd, beta1, beta2, bc1, bc2, n, 0);
 }
+void tw_k_helix_dna_step(float* d1, float* d2, const float* g1, const float* g2,
+                          float* m1, float* m2, float* v1, float* v2,
+                          float lr, float beta1, float beta2, float bc1, float bc2,
+                          float eps, float wd,
+                          float bb1, float gly1, float hb1, float hb2, float gly2, float bb2,
+                          float bs, int n) {
+    if (k_helix_dna_step) k_helix_dna_step(d1, d2, g1, g2, m1, m2, v1, v2,
+        lr, beta1, beta2, bc1, bc2, eps, wd, bb1, gly1, hb1, hb2, gly2, bb2, bs, n, 0);
+}
+int tw_helix_dna_loaded() { return k_helix_dna_step != NULL ? 1 : 0; }
 void tw_k_copy(void* dst, const void* src, size_t bytes) {
     if (k_copy) k_copy(dst, src, bytes, 0);
 }
@@ -383,6 +396,26 @@ func KAdamW(paramPtr, gradPtr, mPtr, vPtr unsafe.Pointer, lr, wd float32, step i
 	C.tw_k_adamw(
 		(*C.float)(paramPtr), (*C.float)(gradPtr), (*C.float)(mPtr), (*C.float)(vPtr),
 		C.float(lr), C.float(wd), C.float(beta1), C.float(beta2), bc1, bc2, C.int(n),
+	)
+}
+
+// HelixDNALoaded returns true if the helix DNA step kernel is available.
+func HelixDNALoaded() bool { return C.tw_helix_dna_loaded() == 1 }
+
+// KHelixDNAStep: paired FP32 weight update with DNA rung coupling.
+// Rung has 6 coefficients: backbone1, glyco1, hbond1, hbond2, glyco2, backbone2.
+func KHelixDNAStep(d1, d2, g1, g2, m1, m2, v1, v2 unsafe.Pointer,
+	lr, beta1, beta2 float32, step int, eps, wd float32,
+	bb1, gly1, hb1, hb2, gly2, bb2, bondStrength float32, n int) {
+	bc1 := C.float(1.0 - math.Pow(float64(beta1), float64(step)))
+	bc2 := C.float(1.0 - math.Pow(float64(beta2), float64(step)))
+	C.tw_k_helix_dna_step(
+		(*C.float)(d1), (*C.float)(d2), (*C.float)(g1), (*C.float)(g2),
+		(*C.float)(m1), (*C.float)(m2), (*C.float)(v1), (*C.float)(v2),
+		C.float(lr), C.float(beta1), C.float(beta2), bc1, bc2,
+		C.float(eps), C.float(wd),
+		C.float(bb1), C.float(gly1), C.float(hb1), C.float(hb2), C.float(gly2), C.float(bb2),
+		C.float(bondStrength), C.int(n),
 	)
 }
 

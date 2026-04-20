@@ -1188,6 +1188,52 @@ void mongoose_softmax_ce(
         logits, targets, losses, grad, vocabSize, invN);
 }
 
+// === Helix DNA step — FP32 paired parameter update with rung coupling ===
+__global__ void helix_dna_step_kernel(
+    float* d1, float* d2,
+    const float* g1, const float* g2,
+    float* m1, float* m2,
+    float* v1, float* v2,
+    float lr, float beta1, float beta2, float bc1, float bc2,
+    float eps, float wd,
+    float backbone1, float glyco1, float hbond1,
+    float hbond2, float glyco2, float backbone2,
+    float bondStrength, int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    float ob1 = 1.0f - beta1, ob2 = 1.0f - beta2;
+
+    float effGrad1 = g1[i] * glyco1 + g2[i] * hbond1 * bondStrength;
+    float mi1 = beta1 * m1[i] + ob1 * effGrad1;
+    float vi1 = beta2 * v1[i] + ob2 * effGrad1 * effGrad1;
+    m1[i] = mi1; v1[i] = vi1;
+    d1[i] -= lr * (mi1 / bc1 / (sqrtf(vi1 / bc2) + eps) + wd * backbone1 * d1[i]);
+
+    float effGrad2 = g2[i] * glyco2 + g1[i] * hbond2 * bondStrength;
+    float mi2 = beta1 * m2[i] + ob1 * effGrad2;
+    float vi2 = beta2 * v2[i] + ob2 * effGrad2 * effGrad2;
+    m2[i] = mi2; v2[i] = vi2;
+    d2[i] -= lr * (mi2 / bc1 / (sqrtf(vi2 / bc2) + eps) + wd * backbone2 * d2[i]);
+}
+
+void mongoose_helix_dna_step(
+    float* d1, float* d2, const float* g1, const float* g2,
+    float* m1, float* m2, float* v1, float* v2,
+    float lr, float beta1, float beta2, float bc1, float bc2,
+    float eps, float wd,
+    float backbone1, float glyco1, float hbond1,
+    float hbond2, float glyco2, float backbone2,
+    float bondStrength, int n, cudaStream_t stream
+) {
+    helix_dna_step_kernel<<<(n+255)/256, 256, 0, stream>>>(
+        d1, d2, g1, g2, m1, m2, v1, v2,
+        lr, beta1, beta2, bc1, bc2, eps, wd,
+        backbone1, glyco1, hbond1, hbond2, glyco2, backbone2,
+        bondStrength, n);
+}
+
 // === FP16 Matmul with Transpose B ===
 // C[m,n] = A[m,k] @ B[n,k]^T, where A and B are FP16, C is FP32.
 // This is the mixed-precision path for Q8 LoRA forward: INT8→FP16 dequant + FP16 matmul.

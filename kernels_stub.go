@@ -48,3 +48,6 @@ func KDequantInt8ToFP16(dataPtr, scalesPtr, outPtr unsafe.Pointer, rows, cols in
 func KDequantInt8ToFP32(dataPtr, scalesPtr, outPtr unsafe.Pointer, rows, cols int) {}
 func KFP32ToFP16(inPtr, outPtr unsafe.Pointer, n int) {}
 func KFP16ToFP32(inPtr, outPtr unsafe.Pointer, n int) {}
+func HelixDNALoaded() bool { return false }
+func KHelixDNAStep(d1, d2, g1, g2, m1, m2, v1, v2 unsafe.Pointer, lr, beta1, beta2 float32, step int, eps, wd float32, bb1, gly1, hb1, hb2, gly2, bb2, bondStrength float32, n int) {}
+func CUDACheck() string { return "" }
