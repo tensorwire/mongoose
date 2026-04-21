@@ -111,6 +111,17 @@ void mtl_adamw_warm(void* param, void* grad, void* cache, int mOff, int vOff, fl
 void* mtl_shared_ptr(MTLBufferRef buf);
 void mtl_grad_norm_sq(void* grad, void* out, int n);
 
+// Fused training: grad clipping + needle optimizer (encode into active fused encoder)
+void mtl_fused_zero_scalar(void* buf);
+void mtl_fused_barrier_buffers(void);
+void mtl_fused_grad_norm_sq(void* grad, void* sumSq, int n);
+void mtl_fused_grad_clip_scale(void* grad, void* sumSq, float maxNorm, int n);
+void mtl_fused_dequant_delta(void* src, void* scales, void* delta, void* dst, int n, int cols);
+void mtl_fused_end_async(void);
+void mtl_fused_wait(void);
+void mtl_fused_needle(void* data, void* scales, void* grad, void* mom, void* vel, void* mask, void* delta, float lr, float beta1, float beta2, float bc1, float bc2, float eps, float wd, int n, int cols);
+void mtl_fused_needle_paired(void* d1, void* d2, void* s1, void* s2, void* g1, void* g2, void* m1, void* m2, void* v1, void* v2, void* mask, void* delta1, void* delta2, float lr, float beta1, float beta2, float bc1, float bc2, float eps, float wd, float backbone1, float glyco1, float hbond1, float hbond2, float glyco2, float backbone2, float bondStrength, int n, int cols);
+
 */
 import "C"
 
@@ -659,4 +670,79 @@ func (m *Metal) AdamWWarm(param, grad *Tensor, wc *WarmCache, mOff, vOff int,
 		C.int(wc.ByteOffset(mOff)), C.int(wc.ByteOffset(vOff)),
 		C.float(lr), C.float(beta1), C.float(beta2),
 		C.float(bc1), C.float(bc2), C.float(eps), C.float(wd), C.int(n))
+}
+
+func (m *Metal) FusedZeroScalar(buf *Tensor) { C.mtl_fused_zero_scalar(MtlBufPtr(buf)) }
+func (m *Metal) FusedBarrierBuffers()        { C.mtl_fused_barrier_buffers() }
+func (m *Metal) FusedEndAsync()              { C.mtl_fused_end_async() }
+func (m *Metal) FusedWait()                  { C.mtl_fused_wait() }
+
+func (m *Metal) FusedGradNormSq(grad, sumSq *Tensor, n int) {
+	C.mtl_fused_grad_norm_sq(MtlBufPtr(grad), MtlBufPtr(sumSq), C.int(n))
+}
+
+func (m *Metal) FusedGradClipScale(grad, sumSq *Tensor, maxNorm float32, n int) {
+	C.mtl_fused_grad_clip_scale(MtlBufPtr(grad), MtlBufPtr(sumSq), C.float(maxNorm), C.int(n))
+}
+
+func (m *Metal) FusedDequantDelta(src, scales, delta, dst *Tensor, n, cols int) {
+	C.mtl_fused_dequant_delta(MtlBufPtr(src), MtlBufPtr(scales), MtlBufPtr(delta), MtlBufPtr(dst), C.int(n), C.int(cols))
+}
+
+func (m *Metal) FusedNeedle(data, scales, grad, mom, vel *Tensor, mask *HotRowMask, delta *Tensor,
+	lr, beta1, beta2, bc1, bc2, eps, wd float32, n, cols int) {
+	C.mtl_fused_needle(MtlBufPtr(data), MtlBufPtr(scales), MtlBufPtr(grad),
+		MtlBufPtr(mom), MtlBufPtr(vel), mask.BufPtr(), MtlBufPtr(delta),
+		C.float(lr), C.float(beta1), C.float(beta2),
+		C.float(bc1), C.float(bc2), C.float(eps), C.float(wd),
+		C.int(n), C.int(cols))
+}
+
+func (m *Metal) FusedNeedlePaired(d1, d2, s1, s2, g1, g2, m1, m2, v1, v2 *Tensor, mask *HotRowMask, delta1, delta2 *Tensor,
+	lr, beta1, beta2, bc1, bc2, eps, wd,
+	backbone1, glyco1, hbond1, hbond2, glyco2, backbone2, bondStrength float32,
+	n, cols int) {
+	C.mtl_fused_needle_paired(MtlBufPtr(d1), MtlBufPtr(d2), MtlBufPtr(s1), MtlBufPtr(s2),
+		MtlBufPtr(g1), MtlBufPtr(g2), MtlBufPtr(m1), MtlBufPtr(m2),
+		MtlBufPtr(v1), MtlBufPtr(v2), mask.BufPtr(), MtlBufPtr(delta1), MtlBufPtr(delta2),
+		C.float(lr), C.float(beta1), C.float(beta2),
+		C.float(bc1), C.float(bc2), C.float(eps), C.float(wd),
+		C.float(backbone1), C.float(glyco1), C.float(hbond1),
+		C.float(hbond2), C.float(glyco2), C.float(backbone2),
+		C.float(bondStrength), C.int(n), C.int(cols))
+}
+
+type HotRowMask struct {
+	buf    C.MTLBufferRef
+	nRows  int
+	shared []int8
+}
+
+func (m *Metal) NewHotRowMask(nRows int) *HotRowMask {
+	buf := C.mtl_alloc(C.size_t(nRows))
+	C.mtl_zero(buf, C.size_t(nRows))
+	ptr := C.mtl_shared_ptr(buf)
+	shared := (*[1 << 30]int8)(ptr)[:nRows:nRows]
+	return &HotRowMask{buf: buf, nRows: nRows, shared: shared}
+}
+
+func (h *HotRowMask) Set(hotRows []int32) {
+	for i := range h.shared {
+		h.shared[i] = 0
+	}
+	for _, r := range hotRows {
+		if int(r) >= 0 && int(r) < h.nRows {
+			h.shared[r] = 1
+		}
+	}
+}
+
+func (h *HotRowMask) BufPtr() unsafe.Pointer { return unsafe.Pointer(h.buf) }
+
+func (h *HotRowMask) Release() {
+	if h.buf != nil {
+		C.mtl_free(h.buf)
+		h.buf = nil
+		h.shared = nil
+	}
 }

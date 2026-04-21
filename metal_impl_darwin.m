@@ -1333,6 +1333,35 @@ static NSString* const g_kernel_source = @"\n"
 "    }\n"
 "}\n"
 "\n"
+"// Gradient clip scale: grad[i] *= min(1, maxNorm / sqrt(sumSq[0])).\n"
+"kernel void grad_clip_scale(\n"
+"    device float* grad            [[buffer(0)]],\n"
+"    device const float* sumSq     [[buffer(1)]],\n"
+"    constant float& maxNorm       [[buffer(2)]],\n"
+"    uint id [[thread_position_in_grid]])\n"
+"{\n"
+"    float norm = sqrt(sumSq[0]);\n"
+"    float scale = (norm > maxNorm) ? (maxNorm / norm) : 1.0f;\n"
+"    grad[id] *= scale;\n"
+"}\n"
+"\n"
+"// Memory copy — compute kernel for use within a fused encoder.\n"
+"kernel void copy_mem(\n"
+"    device const float* src [[buffer(0)]],\n"
+"    device float* dst       [[buffer(1)]],\n"
+"    uint id [[thread_position_in_grid]])\n"
+"{\n"
+"    dst[id] = src[id];\n"
+"}\n"
+"\n"
+"// Debug: write 42.0 to all elements of an FP32 buffer.\n"
+"kernel void debug_fill_42(\n"
+"    device float* dst [[buffer(0)]],\n"
+"    uint id [[thread_position_in_grid]])\n"
+"{\n"
+"    dst[id] = 42.0f;\n"
+"}\n"
+"\n"
 "// ============================================================\n"
 "// ============================================================\n"
 "// Tiled GEMM: C[M,N] = A[M,K] @ B[N,K]^T (B transposed)\n"
@@ -1892,9 +1921,9 @@ static NSString* const g_kernel_source = @"\n"
 "    constant uint& cols          [[buffer(14)]],\n"
 "    uint i [[thread_position_in_grid]])\n"
 "{\n"
-"    if (mask[i] == 0) return;\n"
-"\n"
 "    uint row = i / cols;\n"
+"    if (mask[row] == 0) return;\n"
+"\n"
 "    float scale = scales[row] / 127.0f;\n"
 "\n"
 "    // Effective weight = INT8 * scale + delta\n"
@@ -1963,9 +1992,9 @@ static NSString* const g_kernel_source = @"\n"
 "    constant uint& cols          [[buffer(27)]],\n"
 "    uint i [[thread_position_in_grid]])\n"
 "{\n"
-"    if (mask[i] == 0) return;\n"
-"\n"
 "    uint row = i / cols;\n"
+"    if (mask[row] == 0) return;\n"
+"\n"
 "    float scale1 = s1[row] / 127.0f;\n"
 "    float scale2 = s2[row] / 127.0f;\n"
 "\n"
@@ -2030,6 +2059,8 @@ static id<MTLComputePipelineState> g_ps_adamw = nil;
 static id<MTLComputePipelineState> g_ps_zero_mem = nil;
 static id<MTLComputePipelineState> g_ps_dna_rung = nil;
 static id<MTLComputePipelineState> g_ps_grad_norm = nil;
+static id<MTLComputePipelineState> g_ps_grad_clip = nil;
+static id<MTLComputePipelineState> g_ps_copy_mem = nil;
 static id<MTLComputePipelineState> g_ps_lm_pass1 = nil;
 static id<MTLComputePipelineState> g_ps_lm_pass2 = nil;
 static id<MTLComputePipelineState> g_ps_lm_sparse1 = nil;
@@ -2099,6 +2130,8 @@ int mtl_init_compute(void) {
     g_ps_zero_mem = make_ps(@"zero_mem");
     g_ps_dna_rung = make_ps(@"dna_rung_paired");
     g_ps_grad_norm = make_ps(@"grad_norm_sq");
+    g_ps_grad_clip = make_ps(@"grad_clip_scale");
+    g_ps_copy_mem = make_ps(@"copy_mem");
     g_ps_lm_pass1 = make_ps(@"lm_head_pass1");
     g_ps_lm_pass2 = make_ps(@"lm_head_pass2");
     g_ps_lm_sparse1 = make_ps(@"lm_head_sparse_pass1");
@@ -3445,11 +3478,13 @@ void mtl_fused_attn(void* qRef, void* kRef, void* vRef, void* outRef, void* scor
 
 void mtl_fused_rope(void* xRef, int headDim, int nHeads, float theta, int stride, int seqLen) {
     uint32_t uhd = headDim, unh = nHeads, ust = stride;
-    id<MTLBuffer> hdBuf = [g_device newBufferWithBytes:&uhd   length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> nhBuf = [g_device newBufferWithBytes:&unh   length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> thBuf = [g_device newBufferWithBytes:&theta length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> stBuf = [g_device newBufferWithBytes:&ust   length:4 options:MTLResourceStorageModeShared];
-    [g_fused_enc[g_active_fused_slot] setComputePipelineState:g_ps_rope_fwd];
+    float absTheta = theta < 0 ? -theta : theta;
+    id<MTLBuffer> hdBuf = [g_device newBufferWithBytes:&uhd      length:4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> nhBuf = [g_device newBufferWithBytes:&unh      length:4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> thBuf = [g_device newBufferWithBytes:&absTheta length:4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> stBuf = [g_device newBufferWithBytes:&ust      length:4 options:MTLResourceStorageModeShared];
+    id<MTLComputePipelineState> ps = (theta < 0) ? g_ps_rope_bwd : g_ps_rope_fwd;
+    [g_fused_enc[g_active_fused_slot] setComputePipelineState:ps];
     [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)xRef offset:0 atIndex:0];
     [g_fused_enc[g_active_fused_slot] setBuffer:hdBuf offset:0 atIndex:1];
     [g_fused_enc[g_active_fused_slot] setBuffer:nhBuf offset:0 atIndex:2];
@@ -3975,6 +4010,149 @@ void mtl_dequant_int8_q(void* srcRef, void* scalesRef, void* dstRef, int n, int 
     [cmd commit];
     [cmd waitUntilCompleted];
     } // @autoreleasepool
+}
+
+// === Fused training dispatch: gradient clipping + needle optimizer ===
+// These encode into the active fused compute encoder (g_fused_enc[slot]).
+
+void mtl_fused_zero_scalar(void* bufRef) {
+    [g_fused_enc[g_active_fused_slot] setComputePipelineState:g_ps_zero_mem];
+    [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)bufRef offset:0 atIndex:0];
+    [g_fused_enc[g_active_fused_slot] dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+}
+
+void mtl_fused_barrier_buffers(void) {
+    [g_fused_enc[g_active_fused_slot] memoryBarrierWithScope:MTLBarrierScopeBuffers];
+}
+
+void mtl_fused_grad_norm_sq(void* gradRef, void* sumSqRef, int n) {
+    [g_fused_enc[g_active_fused_slot] setComputePipelineState:g_ps_grad_norm];
+    [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)gradRef  offset:0 atIndex:0];
+    [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)sumSqRef offset:0 atIndex:1];
+    NSUInteger tpg = g_ps_grad_norm.maxTotalThreadsPerThreadgroup;
+    if (tpg > 1024) tpg = 1024;
+    [g_fused_enc[g_active_fused_slot] dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+}
+
+void mtl_fused_grad_clip_scale(void* gradRef, void* sumSqRef, float maxNorm, int n) {
+    [g_fused_enc[g_active_fused_slot] setComputePipelineState:g_ps_grad_clip];
+    [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)gradRef  offset:0 atIndex:0];
+    [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)sumSqRef offset:0 atIndex:1];
+    [g_fused_enc[g_active_fused_slot] setBytes:&maxNorm length:sizeof(float) atIndex:2];
+    NSUInteger tpg = g_ps_grad_clip.maxTotalThreadsPerThreadgroup;
+    if (tpg > 1024) tpg = 1024;
+    [g_fused_enc[g_active_fused_slot] dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+}
+
+// Fused dequant INT8 + delta → FP32 live weight buffer.
+void mtl_fused_dequant_delta(void* srcRef, void* scalesRef, void* deltaRef, void* dstRef, int n, int cols) {
+    uint32_t ucols = (uint32_t)cols;
+    [g_fused_enc[g_active_fused_slot] setComputePipelineState:g_ps_dequant_delta];
+    [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)srcRef    offset:0 atIndex:0];
+    [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)scalesRef offset:0 atIndex:1];
+    [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)deltaRef  offset:0 atIndex:2];
+    [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)dstRef    offset:0 atIndex:3];
+    [g_fused_enc[g_active_fused_slot] setBytes:&ucols length:sizeof(uint32_t) atIndex:4];
+    NSUInteger tpg = g_ps_dequant_delta.maxTotalThreadsPerThreadgroup;
+    if (tpg > 1024) tpg = 1024;
+    [g_fused_enc[g_active_fused_slot] dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+}
+
+// Async commit: end encoding and commit but don't wait. Returns immediately.
+void mtl_fused_end_async(void) {
+    int s = g_active_fused_slot;
+    if (!g_fused_enc[s]) return;
+    [g_fused_enc[s] endEncoding];
+    [g_fused_cmd[s] commit];
+    g_fused_enc[s] = nil;
+    // Keep g_fused_cmd[s] alive for mtl_fused_wait
+}
+
+// Wait for the most recently committed fused command buffer.
+void mtl_fused_wait(void) {
+    int s = g_active_fused_slot;
+    if (g_fused_cmd[s]) {
+        [g_fused_cmd[s] waitUntilCompleted];
+        g_fused_cmd[s] = nil;
+    }
+}
+
+// Fused needle: encode helix_needle into the active fused encoder.
+void mtl_fused_needle(
+    void* dataRef, void* scalesRef, void* gradRef,
+    void* momRef, void* velRef, void* maskRef, void* deltaRef,
+    float lr, float beta1, float beta2, float bc1, float bc2,
+    float eps, float wd, int n, int cols) {
+    id<MTLComputeCommandEncoder> enc = g_fused_enc[g_active_fused_slot];
+    [enc setComputePipelineState:g_ps_needle];
+    [enc setBuffer:(__bridge id<MTLBuffer>)dataRef   offset:0 atIndex:0];
+    [enc setBuffer:(__bridge id<MTLBuffer>)scalesRef offset:0 atIndex:1];
+    [enc setBuffer:(__bridge id<MTLBuffer>)gradRef   offset:0 atIndex:2];
+    [enc setBuffer:(__bridge id<MTLBuffer>)momRef    offset:0 atIndex:3];
+    [enc setBuffer:(__bridge id<MTLBuffer>)velRef    offset:0 atIndex:4];
+    [enc setBuffer:(__bridge id<MTLBuffer>)maskRef   offset:0 atIndex:5];
+    [enc setBuffer:(__bridge id<MTLBuffer>)deltaRef  offset:0 atIndex:6];
+    [enc setBytes:&lr    length:sizeof(float) atIndex:7];
+    [enc setBytes:&beta1 length:sizeof(float) atIndex:8];
+    [enc setBytes:&beta2 length:sizeof(float) atIndex:9];
+    [enc setBytes:&bc1   length:sizeof(float) atIndex:10];
+    [enc setBytes:&bc2   length:sizeof(float) atIndex:11];
+    [enc setBytes:&eps   length:sizeof(float) atIndex:12];
+    [enc setBytes:&wd    length:sizeof(float) atIndex:13];
+    uint32_t ucols = (uint32_t)cols;
+    [enc setBytes:&ucols length:sizeof(uint32_t) atIndex:14];
+    NSUInteger tpg = g_ps_needle.maxTotalThreadsPerThreadgroup;
+    if (tpg > 1024) tpg = 1024;
+    [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+}
+
+// Fused needle paired: encode helix_needle_paired into the active fused encoder.
+void mtl_fused_needle_paired(
+    void* d1Ref, void* d2Ref,
+    void* s1Ref, void* s2Ref,
+    void* g1Ref, void* g2Ref,
+    void* m1Ref, void* m2Ref,
+    void* v1Ref, void* v2Ref,
+    void* maskRef, void* delta1Ref, void* delta2Ref,
+    float lr, float beta1, float beta2, float bc1, float bc2,
+    float eps, float wd,
+    float backbone1, float glyco1, float hbond1,
+    float hbond2, float glyco2, float backbone2,
+    float bondStrength, int n, int cols) {
+    id<MTLComputeCommandEncoder> enc = g_fused_enc[g_active_fused_slot];
+    [enc setComputePipelineState:g_ps_needle_paired];
+    [enc setBuffer:(__bridge id<MTLBuffer>)d1Ref     offset:0 atIndex:0];
+    [enc setBuffer:(__bridge id<MTLBuffer>)d2Ref     offset:0 atIndex:1];
+    [enc setBuffer:(__bridge id<MTLBuffer>)s1Ref     offset:0 atIndex:2];
+    [enc setBuffer:(__bridge id<MTLBuffer>)s2Ref     offset:0 atIndex:3];
+    [enc setBuffer:(__bridge id<MTLBuffer>)g1Ref     offset:0 atIndex:4];
+    [enc setBuffer:(__bridge id<MTLBuffer>)g2Ref     offset:0 atIndex:5];
+    [enc setBuffer:(__bridge id<MTLBuffer>)m1Ref     offset:0 atIndex:6];
+    [enc setBuffer:(__bridge id<MTLBuffer>)m2Ref     offset:0 atIndex:7];
+    [enc setBuffer:(__bridge id<MTLBuffer>)v1Ref     offset:0 atIndex:8];
+    [enc setBuffer:(__bridge id<MTLBuffer>)v2Ref     offset:0 atIndex:9];
+    [enc setBuffer:(__bridge id<MTLBuffer>)maskRef   offset:0 atIndex:10];
+    [enc setBuffer:(__bridge id<MTLBuffer>)delta1Ref offset:0 atIndex:11];
+    [enc setBuffer:(__bridge id<MTLBuffer>)delta2Ref offset:0 atIndex:12];
+    [enc setBytes:&lr          length:sizeof(float) atIndex:13];
+    [enc setBytes:&beta1       length:sizeof(float) atIndex:14];
+    [enc setBytes:&beta2       length:sizeof(float) atIndex:15];
+    [enc setBytes:&bc1         length:sizeof(float) atIndex:16];
+    [enc setBytes:&bc2         length:sizeof(float) atIndex:17];
+    [enc setBytes:&eps         length:sizeof(float) atIndex:18];
+    [enc setBytes:&wd          length:sizeof(float) atIndex:19];
+    [enc setBytes:&backbone1   length:sizeof(float) atIndex:20];
+    [enc setBytes:&glyco1      length:sizeof(float) atIndex:21];
+    [enc setBytes:&hbond1      length:sizeof(float) atIndex:22];
+    [enc setBytes:&hbond2      length:sizeof(float) atIndex:23];
+    [enc setBytes:&glyco2      length:sizeof(float) atIndex:24];
+    [enc setBytes:&backbone2   length:sizeof(float) atIndex:25];
+    [enc setBytes:&bondStrength length:sizeof(float) atIndex:26];
+    uint32_t ucols = (uint32_t)cols;
+    [enc setBytes:&ucols       length:sizeof(uint32_t) atIndex:27];
+    NSUInteger tpg = g_ps_needle_paired.maxTotalThreadsPerThreadgroup;
+    if (tpg > 1024) tpg = 1024;
+    [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
 }
 
 // Inference compute-shader stubs — satisfy linker.
