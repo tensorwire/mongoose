@@ -17,9 +17,20 @@ int tw_cuda_initialized = 0;
 static void* tw_cublas_workspace = NULL;
 static size_t tw_cublas_workspace_size = 32 * 1024 * 1024; // 32 MiB
 
-int tw_cuda_init() {
+static int tw_cuda_device_idx = 0;
+
+int tw_cuda_init() { return tw_cuda_init_device(0); }
+
+int tw_cuda_device_count() {
+    int count = 0;
+    cudaGetDeviceCount(&count);
+    return count;
+}
+
+int tw_cuda_init_device(int deviceIdx) {
     if (tw_cuda_initialized) return 0;
-    cudaError_t cerr = cudaSetDevice(0);
+    tw_cuda_device_idx = deviceIdx;
+    cudaError_t cerr = cudaSetDevice(deviceIdx);
     if (cerr != cudaSuccess) return -1;
     cublasStatus_t serr = cublasCreate(&tw_cublas_handle);
     if (serr != CUBLAS_STATUS_SUCCESS) return -2;
@@ -28,6 +39,19 @@ int tw_cuda_init() {
     cudaMalloc(&tw_cublas_workspace, tw_cublas_workspace_size);
     cublasSetWorkspace(tw_cublas_handle, tw_cublas_workspace, tw_cublas_workspace_size);
     tw_cuda_initialized = 1;
+
+    // Enable peer access for NVLink multi-GPU
+    int nDevices = 0;
+    cudaGetDeviceCount(&nDevices);
+    for (int i = 0; i < nDevices; i++) {
+        if (i == deviceIdx) continue;
+        int canAccess = 0;
+        cudaDeviceCanAccessPeer(&canAccess, deviceIdx, i);
+        if (canAccess) {
+            cudaDeviceEnablePeerAccess(i, 0);
+        }
+    }
+
     return 0;
 }
 
@@ -166,17 +190,19 @@ type CUDA struct {
 	Arena      *GPUArena                // arena allocator — replaces pool when active
 }
 
-// NewCUDA initializes the CUDA backend.
-// Returns nil if CUDA is not available.
-func NewCUDA() *CUDA {
-	ret := C.tw_cuda_init()
+// NewCUDA initializes the CUDA backend on device 0.
+func NewCUDA() *CUDA { return NewCUDADevice(0) }
+
+// NewCUDADevice initializes CUDA on a specific GPU device index.
+func NewCUDADevice(deviceIdx int) *CUDA {
+	ret := C.tw_cuda_init_device(C.int(deviceIdx))
 	if ret != 0 {
-		log.Printf("WARN compute => CUDA init failed (code %d)", ret)
+		log.Printf("WARN compute => CUDA init failed (device %d, code %d)", deviceIdx, ret)
 		return nil
 	}
 
 	name := C.GoString(C.tw_cuda_device_name())
-	log.Printf("[compute] CUDA initialized: %s", name)
+	log.Printf("[compute] CUDA initialized: %s (device %d)", name, deviceIdx)
 
 	return &CUDA{deviceName: name, pool: make(map[int][]unsafe.Pointer)}
 }
