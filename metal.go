@@ -117,6 +117,7 @@ void mtl_fused_barrier_buffers(void);
 void mtl_fused_grad_norm_sq(void* grad, void* sumSq, int n);
 void mtl_fused_grad_clip_scale(void* grad, void* sumSq, float maxNorm, int n);
 void mtl_fused_dequant_delta(void* src, void* scales, void* delta, void* dst, int n, int cols);
+void mtl_fused_dequant_delta_sparse(void* src, void* scales, void* delta, void* dst, void* mask, int n, int cols);
 void mtl_fused_end_async(void);
 void mtl_fused_wait(void);
 void mtl_fused_needle(void* data, void* scales, void* grad, void* mom, void* vel, void* mask, void* delta, float lr, float beta1, float beta2, float bc1, float bc2, float eps, float wd, int n, int cols);
@@ -687,6 +688,10 @@ func (m *Metal) FusedGradClipScale(grad, sumSq *Tensor, maxNorm float32, n int) 
 
 func (m *Metal) FusedDequantDelta(src, scales, delta, dst *Tensor, n, cols int) {
 	C.mtl_fused_dequant_delta(MtlBufPtr(src), MtlBufPtr(scales), MtlBufPtr(delta), MtlBufPtr(dst), C.int(n), C.int(cols))
+}
+
+func (m *Metal) FusedDequantDeltaSparse(src, scales, delta, dst *Tensor, mask *HotRowMask, n, cols int) {
+	C.mtl_fused_dequant_delta_sparse(MtlBufPtr(src), MtlBufPtr(scales), MtlBufPtr(delta), MtlBufPtr(dst), mask.BufPtr(), C.int(n), C.int(cols))
 }
 
 func (m *Metal) FusedNeedle(data, scales, grad, mom, vel *Tensor, mask *HotRowMask, delta *Tensor,

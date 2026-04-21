@@ -1846,6 +1846,22 @@ static NSString* const g_kernel_source = @"\n"
 "    dst[i] = float(src[i]) * scale;\n"
 "}\n"
 "\n"
+"// Sparse dequant: only update rows where mask[row] != 0.\n"
+"kernel void dequant_int8_delta_sparse(\n"
+"    device const char* src      [[buffer(0)]],\n"
+"    device const float* scales  [[buffer(1)]],\n"
+"    device const float* delta   [[buffer(2)]],\n"
+"    device float* dst           [[buffer(3)]],\n"
+"    device const char* mask     [[buffer(4)]],\n"
+"    constant uint& cols        [[buffer(5)]],\n"
+"    uint i [[thread_position_in_grid]])\n"
+"{\n"
+"    uint row = i / cols;\n"
+"    if (mask[row] == 0) return;\n"
+"    float scale = scales[row] / 127.0f;\n"
+"    dst[i] = float(src[i]) * scale + delta[i];\n"
+"}\n"
+"\n"
 "// Dequant INT8 → FP32 with delta residual.\n"
 "// effective_weight = int8 * scale + delta\n"
 "// The delta accumulates sub-quant-level precision from the optimizer.\n"
@@ -2069,6 +2085,7 @@ static id<MTLComputePipelineState> g_ps_needle = nil;
 static id<MTLComputePipelineState> g_ps_needle_paired = nil;
 static id<MTLComputePipelineState> g_ps_dequant_int8 = nil;
 static id<MTLComputePipelineState> g_ps_dequant_delta = nil;
+static id<MTLComputePipelineState> g_ps_dequant_delta_sparse = nil;
 static id<MTLComputePipelineState> g_ps_needle_inline = nil;
 static id<MTLComputePipelineState> g_ps_ce_loss = nil;
 static id<MTLComputePipelineState> g_ps_rmsnorm_bwd = nil;
@@ -2140,6 +2157,7 @@ int mtl_init_compute(void) {
     g_ps_needle_paired = make_ps(@"helix_needle_paired");
     g_ps_dequant_int8 = make_ps(@"dequant_int8_fp32");
     g_ps_dequant_delta = make_ps(@"dequant_int8_delta");
+    g_ps_dequant_delta_sparse = make_ps(@"dequant_int8_delta_sparse");
     g_ps_needle_inline = make_ps(@"helix_needle_inline");
     g_ps_ce_loss = make_ps(@"ce_loss");
     g_ps_rmsnorm_bwd = make_ps(@"rmsnorm_backward");
@@ -4054,6 +4072,21 @@ void mtl_fused_dequant_delta(void* srcRef, void* scalesRef, void* deltaRef, void
     [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)dstRef    offset:0 atIndex:3];
     [g_fused_enc[g_active_fused_slot] setBytes:&ucols length:sizeof(uint32_t) atIndex:4];
     NSUInteger tpg = g_ps_dequant_delta.maxTotalThreadsPerThreadgroup;
+    if (tpg > 1024) tpg = 1024;
+    [g_fused_enc[g_active_fused_slot] dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+}
+
+// Sparse dequant: only updates rows where mask[row] != 0.
+void mtl_fused_dequant_delta_sparse(void* srcRef, void* scalesRef, void* deltaRef, void* dstRef, void* maskRef, int n, int cols) {
+    uint32_t ucols = (uint32_t)cols;
+    [g_fused_enc[g_active_fused_slot] setComputePipelineState:g_ps_dequant_delta_sparse];
+    [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)srcRef    offset:0 atIndex:0];
+    [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)scalesRef offset:0 atIndex:1];
+    [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)deltaRef  offset:0 atIndex:2];
+    [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)dstRef    offset:0 atIndex:3];
+    [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)maskRef   offset:0 atIndex:4];
+    [g_fused_enc[g_active_fused_slot] setBytes:&ucols length:sizeof(uint32_t) atIndex:5];
+    NSUInteger tpg = g_ps_dequant_delta_sparse.maxTotalThreadsPerThreadgroup;
     if (tpg > 1024) tpg = 1024;
     [g_fused_enc[g_active_fused_slot] dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
 }
