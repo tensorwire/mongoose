@@ -118,31 +118,32 @@ void mtl_fused_grad_norm_sq(void* grad, void* sumSq, int n);
 void mtl_fused_compute_clip_scale(void* sumSq, void* clipScale, float maxNorm);
 
 // ICB training
-int mtl_icb_build_training(
-    int dim, int kvDim, int headDim, int nHeads, int nKVHeads, int ffnDim, int vocabSize, int seqLen, int nLayers,
-    void* hidden, void* normedFinal, void* finalNorm, void* finalScales,
-    void* lmMaxLogit, void* lmSumExp, void* lmLoss, void* targetsGPU,
-    void* dHidden, void* dScratch, void* dEmbed,
-    void* gradSumSq, void* clipScaleBuf, void* scores,
-    void* embed, void* embedData, void* embedScales, void* embedDelta,
-    void* embedMom, void* embedVel, void* embedMask, void* embedLive,
-    void** norm1, void** norm2,
-    void** a_xIn, void** a_normed, void** a_Q, void** a_K, void** a_V, void** a_attnOut,
-    void** a_xMid, void** a_normed2, void** a_gatePre, void** a_upOut, void** a_ffnMid,
-    void** a_rmsScale1, void** a_rmsScale2, void** a_gateAct,
-    void** wq_data, void** wq_scales, void** wq_delta, void** wq_mom, void** wq_vel, void** wq_live, void** wq_mask,
-    void** wk_data, void** wk_scales, void** wk_delta, void** wk_mom, void** wk_vel, void** wk_live, void** wk_mask,
-    void** wv_data, void** wv_scales, void** wv_delta, void** wv_mom, void** wv_vel, void** wv_live, void** wv_mask,
-    void** wo_data, void** wo_scales, void** wo_delta, void** wo_mom, void** wo_vel, void** wo_live, void** wo_mask,
-    void** gate_data, void** gate_scales, void** gate_delta, void** gate_mom, void** gate_vel, void** gate_live, void** gate_mask,
-    void** up_data, void** up_scales, void** up_delta, void** up_mom, void** up_vel, void** up_live, void** up_mask,
-    void** down_data, void** down_scales, void** down_delta, void** down_mom, void** down_vel, void** down_live, void** down_mask,
-    void** b_dFfnMid, void** b_dGate, void** b_dUp, void** b_dN2, void** b_dx,
-    void** b_dAttnOut, void** b_dQ, void** b_dK, void** b_dV, void** b_dN1,
-    void** b_dWDown, void** b_dWGate, void** b_dWUp, void** b_dWO, void** b_dWQ, void** b_dWK, void** b_dWV,
-    void* lrBuf, void* bc1Buf, void* bc2Buf, void* maxNormBuf,
-    void* bb1Buf, void* gly1Buf, void* hb1Buf, void* hb2Buf, void* gly2Buf, void* bb2Buf, void* bondStrBuf
-);
+typedef struct {
+    int dim, kvDim, headDim, nHeads, nKVHeads, ffnDim, vocabSize, seqLen, nLayers;
+    void* hidden; void* normedFinal; void* finalNorm; void* finalScales;
+    void* lmMaxLogit; void* lmSumExp; void* lmLoss; void* targetsGPU;
+    void* dHidden; void* dScratch; void* dEmbed;
+    void* gradSumSq; void* clipScaleBuf; void* scores;
+    void* embed; void* embedData; void* embedScales; void* embedDelta;
+    void* embedMom; void* embedVel; void* embedMask; void* embedLive;
+    void** norm1; void** norm2;
+    void** a_xIn; void** a_normed; void** a_Q; void** a_K; void** a_V; void** a_attnOut;
+    void** a_xMid; void** a_normed2; void** a_gatePre; void** a_upOut; void** a_ffnMid;
+    void** a_rmsScale1; void** a_rmsScale2; void** a_gateAct;
+    void** wq_data; void** wq_scales; void** wq_delta; void** wq_mom; void** wq_vel; void** wq_live; void** wq_mask;
+    void** wk_data; void** wk_scales; void** wk_delta; void** wk_mom; void** wk_vel; void** wk_live; void** wk_mask;
+    void** wv_data; void** wv_scales; void** wv_delta; void** wv_mom; void** wv_vel; void** wv_live; void** wv_mask;
+    void** wo_data; void** wo_scales; void** wo_delta; void** wo_mom; void** wo_vel; void** wo_live; void** wo_mask;
+    void** gate_data; void** gate_scales; void** gate_delta; void** gate_mom; void** gate_vel; void** gate_live; void** gate_mask;
+    void** up_data; void** up_scales; void** up_delta; void** up_mom; void** up_vel; void** up_live; void** up_mask;
+    void** down_data; void** down_scales; void** down_delta; void** down_mom; void** down_vel; void** down_live; void** down_mask;
+    void** b_dFfnMid; void** b_dGate; void** b_dUp; void** b_dN2; void** b_dx;
+    void** b_dAttnOut; void** b_dQ; void** b_dK; void** b_dV; void** b_dN1;
+    void** b_dWDown; void** b_dWGate; void** b_dWUp; void** b_dWO; void** b_dWQ; void** b_dWK; void** b_dWV;
+    void* lrBuf; void* bc1Buf; void* bc2Buf; void* maxNormBuf;
+    void* bb1Buf; void* gly1Buf; void* hb1Buf; void* hb2Buf; void* gly2Buf; void* bb2Buf; void* bondStrBuf;
+} ICBBuildParams;
+int mtl_icb_build_training(ICBBuildParams* p);
 void mtl_icb_execute_fwd(void);
 void mtl_icb_execute_full(void);
 void mtl_fused_grad_clip_scale(void* grad, void* sumSq, float maxNorm, int n);
@@ -760,12 +761,12 @@ func (m *Metal) ICBBuildTraining(
 ) int {
 	nL := nLayers
 	mkArr := func(tensors []*Tensor) *unsafe.Pointer {
-		arr := make([]unsafe.Pointer, len(tensors))
+		arr := (*[64]unsafe.Pointer)(C.malloc(C.size_t(len(tensors) * 8)))
 		for i, t := range tensors { arr[i] = MtlBufPtr(t) }
 		return &arr[0]
 	}
 	mkMaskArr := func(masks []*HotRowMask) *unsafe.Pointer {
-		arr := make([]unsafe.Pointer, len(masks))
+		arr := (*[64]unsafe.Pointer)(C.malloc(C.size_t(len(masks) * 8)))
 		for i, m := range masks { arr[i] = m.BufPtr() }
 		return &arr[0]
 	}
@@ -826,33 +827,53 @@ func (m *Metal) ICBBuildTraining(
 		bDWQ[i]=b.DWQ; bDWK[i]=b.DWK; bDWV[i]=b.DWV
 	}
 
-	return int(C.mtl_icb_build_training(
-		C.int(dim), C.int(kvDim), C.int(headDim), C.int(nHeads), C.int(nKVHeads),
-		C.int(ffnDim), C.int(vocabSize), C.int(seqLen), C.int(nLayers),
-		MtlBufPtr(hidden), MtlBufPtr(normedFinal), MtlBufPtr(finalNorm), MtlBufPtr(finalScales),
-		MtlBufPtr(lmMaxLogit), MtlBufPtr(lmSumExp), MtlBufPtr(lmLoss), MtlBufPtr(targetsGPU),
-		MtlBufPtr(dHidden), MtlBufPtr(dScratch), MtlBufPtr(dEmbed),
-		MtlBufPtr(gradSumSq), MtlBufPtr(clipScaleBuf), MtlBufPtr(scores),
-		MtlBufPtr(embed), MtlBufPtr(embedInt8.Data), MtlBufPtr(embedInt8.Scales), MtlBufPtr(embedInt8.Delta),
-		MtlBufPtr(embedInt8.Mom), MtlBufPtr(embedInt8.Vel), embedInt8.Mask.BufPtr(), MtlBufPtr(embedInt8.Live),
-		mkArr(norm1s), mkArr(norm2s),
-		mkArr(aXIn), mkArr(aNormed), mkArr(aQ), mkArr(aK), mkArr(aV), mkArr(aAttnOut),
-		mkArr(aXMid), mkArr(aNormed2), mkArr(aGatePre), mkArr(aUpOut), mkArr(aFfnMid),
-		mkArr(aRmsScale1), mkArr(aRmsScale2), mkArr(aGateAct),
-		mkArr(wqD), mkArr(wqS), mkArr(wqDl), mkArr(wqM), mkArr(wqV), mkArr(wqL), mkMaskArr(wqMk),
-		mkArr(wkD), mkArr(wkS), mkArr(wkDl), mkArr(wkM), mkArr(wkV), mkArr(wkL), mkMaskArr(wkMk),
-		mkArr(wvD), mkArr(wvS), mkArr(wvDl), mkArr(wvM), mkArr(wvV), mkArr(wvL), mkMaskArr(wvMk),
-		mkArr(woD), mkArr(woS), mkArr(woDl), mkArr(woM), mkArr(woV), mkArr(woL), mkMaskArr(woMk),
-		mkArr(gD), mkArr(gS), mkArr(gDl), mkArr(gM), mkArr(gV), mkArr(gL), mkMaskArr(gMk),
-		mkArr(uD), mkArr(uS), mkArr(uDl), mkArr(uM), mkArr(uV), mkArr(uL), mkMaskArr(uMk),
-		mkArr(dD), mkArr(dS), mkArr(dDl), mkArr(dM), mkArr(dV2), mkArr(dL), mkMaskArr(dMk),
-		mkArr(bDFfn), mkArr(bDGate), mkArr(bDUp), mkArr(bDN2), mkArr(bDx),
-		mkArr(bDAttn), mkArr(bDQ), mkArr(bDK), mkArr(bDV), mkArr(bDN1),
-		mkArr(bDWD), mkArr(bDWG), mkArr(bDWU), mkArr(bDWO), mkArr(bDWQ), mkArr(bDWK), mkArr(bDWV),
-		MtlBufPtr(lrBuf), MtlBufPtr(bc1Buf), MtlBufPtr(bc2Buf), MtlBufPtr(maxNormBuf),
-		MtlBufPtr(bb1Buf), MtlBufPtr(gly1Buf), MtlBufPtr(hb1Buf), MtlBufPtr(hb2Buf),
-		MtlBufPtr(gly2Buf), MtlBufPtr(bb2Buf), MtlBufPtr(bondStrBuf),
-	))
+	p := C.ICBBuildParams{
+		dim: C.int(dim), kvDim: C.int(kvDim), headDim: C.int(headDim),
+		nHeads: C.int(nHeads), nKVHeads: C.int(nKVHeads), ffnDim: C.int(ffnDim),
+		vocabSize: C.int(vocabSize), seqLen: C.int(seqLen), nLayers: C.int(nLayers),
+		hidden: MtlBufPtr(hidden), normedFinal: MtlBufPtr(normedFinal),
+		finalNorm: MtlBufPtr(finalNorm), finalScales: MtlBufPtr(finalScales),
+		lmMaxLogit: MtlBufPtr(lmMaxLogit), lmSumExp: MtlBufPtr(lmSumExp),
+		lmLoss: MtlBufPtr(lmLoss), targetsGPU: MtlBufPtr(targetsGPU),
+		dHidden: MtlBufPtr(dHidden), dScratch: MtlBufPtr(dScratch), dEmbed: MtlBufPtr(dEmbed),
+		gradSumSq: MtlBufPtr(gradSumSq), clipScaleBuf: MtlBufPtr(clipScaleBuf), scores: MtlBufPtr(scores),
+		embed: MtlBufPtr(embed),
+		embedData: MtlBufPtr(embedInt8.Data), embedScales: MtlBufPtr(embedInt8.Scales),
+		embedDelta: MtlBufPtr(embedInt8.Delta), embedMom: MtlBufPtr(embedInt8.Mom),
+		embedVel: MtlBufPtr(embedInt8.Vel), embedMask: embedInt8.Mask.BufPtr(),
+		embedLive: MtlBufPtr(embedInt8.Live),
+		norm1: mkArr(norm1s), norm2: mkArr(norm2s),
+		a_xIn: mkArr(aXIn), a_normed: mkArr(aNormed), a_Q: mkArr(aQ), a_K: mkArr(aK),
+		a_V: mkArr(aV), a_attnOut: mkArr(aAttnOut), a_xMid: mkArr(aXMid),
+		a_normed2: mkArr(aNormed2), a_gatePre: mkArr(aGatePre), a_upOut: mkArr(aUpOut),
+		a_ffnMid: mkArr(aFfnMid), a_rmsScale1: mkArr(aRmsScale1), a_rmsScale2: mkArr(aRmsScale2),
+		a_gateAct: mkArr(aGateAct),
+		wq_data: mkArr(wqD), wq_scales: mkArr(wqS), wq_delta: mkArr(wqDl),
+		wq_mom: mkArr(wqM), wq_vel: mkArr(wqV), wq_live: mkArr(wqL), wq_mask: mkMaskArr(wqMk),
+		wk_data: mkArr(wkD), wk_scales: mkArr(wkS), wk_delta: mkArr(wkDl),
+		wk_mom: mkArr(wkM), wk_vel: mkArr(wkV), wk_live: mkArr(wkL), wk_mask: mkMaskArr(wkMk),
+		wv_data: mkArr(wvD), wv_scales: mkArr(wvS), wv_delta: mkArr(wvDl),
+		wv_mom: mkArr(wvM), wv_vel: mkArr(wvV), wv_live: mkArr(wvL), wv_mask: mkMaskArr(wvMk),
+		wo_data: mkArr(woD), wo_scales: mkArr(woS), wo_delta: mkArr(woDl),
+		wo_mom: mkArr(woM), wo_vel: mkArr(woV), wo_live: mkArr(woL), wo_mask: mkMaskArr(woMk),
+		gate_data: mkArr(gD), gate_scales: mkArr(gS), gate_delta: mkArr(gDl),
+		gate_mom: mkArr(gM), gate_vel: mkArr(gV), gate_live: mkArr(gL), gate_mask: mkMaskArr(gMk),
+		up_data: mkArr(uD), up_scales: mkArr(uS), up_delta: mkArr(uDl),
+		up_mom: mkArr(uM), up_vel: mkArr(uV), up_live: mkArr(uL), up_mask: mkMaskArr(uMk),
+		down_data: mkArr(dD), down_scales: mkArr(dS), down_delta: mkArr(dDl),
+		down_mom: mkArr(dM), down_vel: mkArr(dV2), down_live: mkArr(dL), down_mask: mkMaskArr(dMk),
+		b_dFfnMid: mkArr(bDFfn), b_dGate: mkArr(bDGate), b_dUp: mkArr(bDUp),
+		b_dN2: mkArr(bDN2), b_dx: mkArr(bDx), b_dAttnOut: mkArr(bDAttn),
+		b_dQ: mkArr(bDQ), b_dK: mkArr(bDK), b_dV: mkArr(bDV), b_dN1: mkArr(bDN1),
+		b_dWDown: mkArr(bDWD), b_dWGate: mkArr(bDWG), b_dWUp: mkArr(bDWU),
+		b_dWO: mkArr(bDWO), b_dWQ: mkArr(bDWQ), b_dWK: mkArr(bDWK), b_dWV: mkArr(bDWV),
+		lrBuf: MtlBufPtr(lrBuf), bc1Buf: MtlBufPtr(bc1Buf), bc2Buf: MtlBufPtr(bc2Buf),
+		maxNormBuf: MtlBufPtr(maxNormBuf),
+		bb1Buf: MtlBufPtr(bb1Buf), gly1Buf: MtlBufPtr(gly1Buf), hb1Buf: MtlBufPtr(hb1Buf),
+		hb2Buf: MtlBufPtr(hb2Buf), gly2Buf: MtlBufPtr(gly2Buf), bb2Buf: MtlBufPtr(bb2Buf),
+		bondStrBuf: MtlBufPtr(bondStrBuf),
+	}
+	return int(C.mtl_icb_build_training(&p))
 }
 
 func (m *Metal) FusedComputeClipScale(sumSq, clipScale *Tensor, maxNorm float32) {

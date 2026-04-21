@@ -4503,43 +4503,77 @@ static void icb_add(void* a, void* b, int n) {
     g_icb_cursor++;
 }
 
-// Build the training ICB. Called once at init.
-// layers: array of per-layer buffer structs.
-// Returns number of forward-only commands (for step-1 noop range).
-int mtl_icb_build_training(
-    // Model shape
-    int dim, int kvDim, int headDim, int nHeads, int nKVHeads, int ffnDim, int vocabSize, int seqLen, int nLayers,
-    // Top-level buffers
-    void* hidden, void* normedFinal, void* finalNorm, void* finalScales,
-    void* lmMaxLogit, void* lmSumExp, void* lmLoss, void* targetsGPU,
-    void* dHidden, void* dScratch, void* dEmbed,
-    void* gradSumSq, void* clipScaleBuf, void* scores,
-    void* embed, void* embedData, void* embedScales, void* embedDelta,
-    void* embedMom, void* embedVel, void* embedMask, void* embedLive,
-    // Per-layer arrays (nLayers elements each)
-    void** norm1, void** norm2,
-    // Per-layer forward activation arrays
-    void** a_xIn, void** a_normed, void** a_Q, void** a_K, void** a_V, void** a_attnOut,
-    void** a_xMid, void** a_normed2, void** a_gatePre, void** a_upOut, void** a_ffnMid,
-    void** a_rmsScale1, void** a_rmsScale2, void** a_gateAct,
-    // Per-layer INT8 param arrays (data, scales, delta, mom, vel, live, mask)
-    void** wq_data, void** wq_scales, void** wq_delta, void** wq_mom, void** wq_vel, void** wq_live, void** wq_mask,
-    void** wk_data, void** wk_scales, void** wk_delta, void** wk_mom, void** wk_vel, void** wk_live, void** wk_mask,
-    void** wv_data, void** wv_scales, void** wv_delta, void** wv_mom, void** wv_vel, void** wv_live, void** wv_mask,
-    void** wo_data, void** wo_scales, void** wo_delta, void** wo_mom, void** wo_vel, void** wo_live, void** wo_mask,
-    void** gate_data, void** gate_scales, void** gate_delta, void** gate_mom, void** gate_vel, void** gate_live, void** gate_mask,
-    void** up_data, void** up_scales, void** up_delta, void** up_mom, void** up_vel, void** up_live, void** up_mask,
-    void** down_data, void** down_scales, void** down_delta, void** down_mom, void** down_vel, void** down_live, void** down_mask,
-    // Per-layer backward scratch arrays
-    void** b_dFfnMid, void** b_dGate, void** b_dUp, void** b_dN2, void** b_dx,
-    void** b_dAttnOut, void** b_dQ, void** b_dK, void** b_dV, void** b_dN1,
-    void** b_dWDown, void** b_dWGate, void** b_dWUp, void** b_dWO, void** b_dWQ, void** b_dWK, void** b_dWV,
-    // Mutable per-step constants buffer pointers
-    void* lrBuf, void* bc1Buf, void* bc2Buf,
-    void* maxNormBuf,
-    // Rung constants buffers
-    void* bb1Buf, void* gly1Buf, void* hb1Buf, void* hb2Buf, void* gly2Buf, void* bb2Buf, void* bondStrBuf
-) {
+// ICB build parameter struct — avoids 120+ CGo params.
+typedef struct {
+    int dim, kvDim, headDim, nHeads, nKVHeads, ffnDim, vocabSize, seqLen, nLayers;
+    void* hidden; void* normedFinal; void* finalNorm; void* finalScales;
+    void* lmMaxLogit; void* lmSumExp; void* lmLoss; void* targetsGPU;
+    void* dHidden; void* dScratch; void* dEmbed;
+    void* gradSumSq; void* clipScaleBuf; void* scores;
+    void* embed; void* embedData; void* embedScales; void* embedDelta;
+    void* embedMom; void* embedVel; void* embedMask; void* embedLive;
+    void** norm1; void** norm2;
+    void** a_xIn; void** a_normed; void** a_Q; void** a_K; void** a_V; void** a_attnOut;
+    void** a_xMid; void** a_normed2; void** a_gatePre; void** a_upOut; void** a_ffnMid;
+    void** a_rmsScale1; void** a_rmsScale2; void** a_gateAct;
+    void** wq_data; void** wq_scales; void** wq_delta; void** wq_mom; void** wq_vel; void** wq_live; void** wq_mask;
+    void** wk_data; void** wk_scales; void** wk_delta; void** wk_mom; void** wk_vel; void** wk_live; void** wk_mask;
+    void** wv_data; void** wv_scales; void** wv_delta; void** wv_mom; void** wv_vel; void** wv_live; void** wv_mask;
+    void** wo_data; void** wo_scales; void** wo_delta; void** wo_mom; void** wo_vel; void** wo_live; void** wo_mask;
+    void** gate_data; void** gate_scales; void** gate_delta; void** gate_mom; void** gate_vel; void** gate_live; void** gate_mask;
+    void** up_data; void** up_scales; void** up_delta; void** up_mom; void** up_vel; void** up_live; void** up_mask;
+    void** down_data; void** down_scales; void** down_delta; void** down_mom; void** down_vel; void** down_live; void** down_mask;
+    void** b_dFfnMid; void** b_dGate; void** b_dUp; void** b_dN2; void** b_dx;
+    void** b_dAttnOut; void** b_dQ; void** b_dK; void** b_dV; void** b_dN1;
+    void** b_dWDown; void** b_dWGate; void** b_dWUp; void** b_dWO; void** b_dWQ; void** b_dWK; void** b_dWV;
+    void* lrBuf; void* bc1Buf; void* bc2Buf; void* maxNormBuf;
+    void* bb1Buf; void* gly1Buf; void* hb1Buf; void* hb2Buf; void* gly2Buf; void* bb2Buf; void* bondStrBuf;
+} ICBBuildParams;
+
+int mtl_icb_build_training(ICBBuildParams* p) {
+    // Unpack for readability
+    int dim = p->dim, kvDim = p->kvDim, headDim = p->headDim;
+    int nHeads = p->nHeads, nKVHeads = p->nKVHeads, ffnDim = p->ffnDim;
+    int vocabSize = p->vocabSize, seqLen = p->seqLen, nLayers = p->nLayers;
+    void* hidden = p->hidden; void* normedFinal = p->normedFinal;
+    void* finalNorm = p->finalNorm; void* finalScales = p->finalScales;
+    void* lmMaxLogit = p->lmMaxLogit; void* lmSumExp = p->lmSumExp;
+    void* lmLoss = p->lmLoss; void* targetsGPU = p->targetsGPU;
+    void* dHidden = p->dHidden; void* dScratch = p->dScratch; void* dEmbed = p->dEmbed;
+    void* gradSumSq = p->gradSumSq; void* clipScaleBuf = p->clipScaleBuf; void* scores = p->scores;
+    void* embed = p->embed;
+    void* embedData = p->embedData; void* embedScales = p->embedScales; void* embedDelta = p->embedDelta;
+    void* embedMom = p->embedMom; void* embedVel = p->embedVel; void* embedMask = p->embedMask; void* embedLive = p->embedLive;
+    void** norm1 = p->norm1; void** norm2 = p->norm2;
+    void** a_xIn = p->a_xIn; void** a_normed = p->a_normed; void** a_Q = p->a_Q; void** a_K = p->a_K;
+    void** a_V = p->a_V; void** a_attnOut = p->a_attnOut; void** a_xMid = p->a_xMid;
+    void** a_normed2 = p->a_normed2; void** a_gatePre = p->a_gatePre; void** a_upOut = p->a_upOut;
+    void** a_ffnMid = p->a_ffnMid; void** a_rmsScale1 = p->a_rmsScale1; void** a_rmsScale2 = p->a_rmsScale2;
+    void** a_gateAct = p->a_gateAct;
+    void** wq_data=p->wq_data; void** wq_scales=p->wq_scales; void** wq_delta=p->wq_delta;
+    void** wq_mom=p->wq_mom; void** wq_vel=p->wq_vel; void** wq_live=p->wq_live; void** wq_mask=p->wq_mask;
+    void** wk_data=p->wk_data; void** wk_scales=p->wk_scales; void** wk_delta=p->wk_delta;
+    void** wk_mom=p->wk_mom; void** wk_vel=p->wk_vel; void** wk_live=p->wk_live; void** wk_mask=p->wk_mask;
+    void** wv_data=p->wv_data; void** wv_scales=p->wv_scales; void** wv_delta=p->wv_delta;
+    void** wv_mom=p->wv_mom; void** wv_vel=p->wv_vel; void** wv_live=p->wv_live; void** wv_mask=p->wv_mask;
+    void** wo_data=p->wo_data; void** wo_scales=p->wo_scales; void** wo_delta=p->wo_delta;
+    void** wo_mom=p->wo_mom; void** wo_vel=p->wo_vel; void** wo_live=p->wo_live; void** wo_mask=p->wo_mask;
+    void** gate_data=p->gate_data; void** gate_scales=p->gate_scales; void** gate_delta=p->gate_delta;
+    void** gate_mom=p->gate_mom; void** gate_vel=p->gate_vel; void** gate_live=p->gate_live; void** gate_mask=p->gate_mask;
+    void** up_data=p->up_data; void** up_scales=p->up_scales; void** up_delta=p->up_delta;
+    void** up_mom=p->up_mom; void** up_vel=p->up_vel; void** up_live=p->up_live; void** up_mask=p->up_mask;
+    void** down_data=p->down_data; void** down_scales=p->down_scales; void** down_delta=p->down_delta;
+    void** down_mom=p->down_mom; void** down_vel=p->down_vel; void** down_live=p->down_live; void** down_mask=p->down_mask;
+    void** b_dFfnMid=p->b_dFfnMid; void** b_dGate=p->b_dGate; void** b_dUp=p->b_dUp;
+    void** b_dN2=p->b_dN2; void** b_dx=p->b_dx;
+    void** b_dAttnOut=p->b_dAttnOut; void** b_dQ=p->b_dQ; void** b_dK=p->b_dK;
+    void** b_dV=p->b_dV; void** b_dN1=p->b_dN1;
+    void** b_dWDown=p->b_dWDown; void** b_dWGate=p->b_dWGate; void** b_dWUp=p->b_dWUp;
+    void** b_dWO=p->b_dWO; void** b_dWQ=p->b_dWQ; void** b_dWK=p->b_dWK; void** b_dWV=p->b_dWV;
+    void* lrBuf=p->lrBuf; void* bc1Buf=p->bc1Buf; void* bc2Buf=p->bc2Buf; void* maxNormBuf=p->maxNormBuf;
+    void* bb1Buf=p->bb1Buf; void* gly1Buf=p->gly1Buf; void* hb1Buf=p->hb1Buf;
+    void* hb2Buf=p->hb2Buf; void* gly2Buf=p->gly2Buf; void* bb2Buf=p->bb2Buf; void* bondStrBuf=p->bondStrBuf;
+
     int n = seqLen;
 
     // Pre-cache all constant buffers
@@ -4580,6 +4614,11 @@ int mtl_icb_build_training(
     desc.inheritPipelineState = NO;
     desc.maxKernelBufferBindCount = 31;
     g_train_icb = [g_device newIndirectCommandBufferWithDescriptor:desc maxCommandCount:ICB_MAX_CMDS options:MTLResourceStorageModeShared];
+    if (!g_train_icb) {
+        NSLog(@"ICB allocation failed! device=%@", g_device);
+        return -1;
+    }
+    NSLog(@"ICB allocated: %lu max commands", (unsigned long)g_train_icb.size);
     g_icb_cursor = 0;
 
     // ============ FORWARD ============
