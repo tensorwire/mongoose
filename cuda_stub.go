@@ -58,6 +58,8 @@ func (c *CUDA) ReLUBackwardT(dOut, fwdInput *Tensor) *Tensor    { return nil }
 func (c *CUDA) TransposeT(a *Tensor, rows, cols int) *Tensor    { return nil }
 func (c *CUDA) CopyT(src *Tensor) *Tensor                       { return nil }
 func (c *CUDA) CopyInto(dst, src *Tensor)                       {}
+func (c *CUDA) UploadInto(dst *Tensor, data []float32)           {}
+func (c *CUDA) UploadSlice(dst *Tensor, offsetFloats int, data []float32) {}
 func (c *CUDA) ZerosBF16(shape []int) *Tensor                   { return nil }
 
 // INT8 stubs

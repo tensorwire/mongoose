@@ -806,6 +806,15 @@ func (c *CUDA) CopyInto(dst, src *Tensor) {
 	C.tw_gpu_copy_d2d(dst.device.(*cuPtr).ptr, src.device.(*cuPtr).ptr, C.size_t(src.Size*4))
 }
 
+func (c *CUDA) UploadInto(dst *Tensor, data []float32) {
+	C.tw_gpu_upload(dst.device.(*cuPtr).ptr, unsafe.Pointer(&data[0]), C.size_t(len(data)*4))
+}
+
+func (c *CUDA) UploadSlice(dst *Tensor, offsetFloats int, data []float32) {
+	dstPtr := unsafe.Add(dst.device.(*cuPtr).ptr, offsetFloats*4)
+	C.tw_gpu_upload(dstPtr, unsafe.Pointer(&data[0]), C.size_t(len(data)*4))
+}
+
 func (c *CUDA) AddT(a, b *Tensor) *Tensor {
 	result := c.Zeros([]int{a.Size})
 	cuA := a.device.(*cuPtr)

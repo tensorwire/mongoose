@@ -1993,7 +1993,7 @@ static NSString* const g_kernel_source = @"\n"
 "    constant float& wd           [[buffer(13)]],\n"
 "    constant uint& cols          [[buffer(14)]],\n"
 "    device float* live            [[buffer(15)]],\n"
-"    constant float& clipScale    [[buffer(16)]],\n"
+"    device const float* clipBuf  [[buffer(16)]],\n"
 "    uint i [[thread_position_in_grid]])\n"
 "{\n"
 "    uint row = i / cols;\n"
@@ -2004,7 +2004,7 @@ static NSString* const g_kernel_source = @"\n"
 "    float mi = float(mom[i]);\n"
 "    float vi = float(vel[i]);\n"
 "\n"
-"    float g = grad[i] * clipScale;\n"
+"    float g = grad[i] * clipBuf[0];\n"
 "    float ob1 = 1.0f - beta1, ob2 = 1.0f - beta2;\n"
 "    mi = beta1 * mi + ob1 * g;\n"
 "    vi = beta2 * vi + ob2 * g * g;\n"
@@ -2053,12 +2053,13 @@ static NSString* const g_kernel_source = @"\n"
 "    constant uint& cols          [[buffer(27)]],\n"
 "    device float* live1           [[buffer(28)]],\n"
 "    device float* live2           [[buffer(29)]],\n"
-"    constant float& clipScale    [[buffer(30)]],\n"
+"    device const float* clipBuf  [[buffer(30)]],\n"
 "    uint i [[thread_position_in_grid]])\n"
 "{\n"
 "    uint row = i / cols;\n"
 "    if (mask[row] == 0) return;\n"
 "\n"
+"    float cs = clipBuf[0];\n"
 "    float scale1 = s1[row] / 127.0f;\n"
 "    float scale2 = s2[row] / 127.0f;\n"
 "    float w1 = float(d1_int8[i]) * scale1 + delta1[i];\n"
@@ -2067,15 +2068,15 @@ static NSString* const g_kernel_source = @"\n"
 "    float mi2 = float(m2[i]), vi2 = float(v2[i]);\n"
 "    float ob1 = 1.0f - beta1, ob2 = 1.0f - beta2;\n"
 "\n"
-"    float signal1 = g1[i] * clipScale * glyco1;\n"
-"    float crossMom = g2[i] * clipScale * hbond1 * bondStrength;\n"
+"    float signal1 = g1[i] * cs * glyco1;\n"
+"    float crossMom = g2[i] * cs * hbond1 * bondStrength;\n"
 "    float effGrad1 = signal1 + crossMom;\n"
 "    mi1 = beta1 * mi1 + ob1 * effGrad1;\n"
 "    vi1 = beta2 * vi1 + ob2 * effGrad1 * effGrad1;\n"
 "    w1 -= lr * (mi1 / bc1 / (sqrt(vi1 / bc2) + eps) + wd * backbone1 * w1);\n"
 "\n"
-"    float signal2 = g2[i] * clipScale * glyco2;\n"
-"    float crossVel = g1[i] * clipScale * hbond2 * bondStrength;\n"
+"    float signal2 = g2[i] * cs * glyco2;\n"
+"    float crossVel = g1[i] * cs * hbond2 * bondStrength;\n"
 "    float effGrad2 = signal2 + crossVel;\n"
 "    mi2 = beta1 * mi2 + ob1 * effGrad2;\n"
 "    vi2 = beta2 * vi2 + ob2 * effGrad2 * effGrad2;\n"
@@ -4256,7 +4257,7 @@ void mtl_fused_needle(
     void* momRef, void* velRef, void* maskRef, void* deltaRef,
     float lr, float beta1, float beta2, float bc1, float bc2,
     float eps, float wd, int n, int cols,
-    void* liveRef, float clipScale) {
+    void* liveRef, void* clipBufRef) {
     id<MTLComputeCommandEncoder> enc = g_fused_enc[g_active_fused_slot];
     [enc setComputePipelineState:g_ps_needle];
     [enc setBuffer:(__bridge id<MTLBuffer>)dataRef   offset:0 atIndex:0];
@@ -4275,8 +4276,8 @@ void mtl_fused_needle(
     [enc setBytes:&wd    length:sizeof(float) atIndex:13];
     uint32_t ucols = (uint32_t)cols;
     [enc setBytes:&ucols length:sizeof(uint32_t) atIndex:14];
-    [enc setBuffer:(__bridge id<MTLBuffer>)liveRef offset:0 atIndex:15];
-    [enc setBytes:&clipScale length:sizeof(float) atIndex:16];
+    [enc setBuffer:(__bridge id<MTLBuffer>)liveRef    offset:0 atIndex:15];
+    [enc setBuffer:(__bridge id<MTLBuffer>)clipBufRef offset:0 atIndex:16];
     NSUInteger tpg = g_ps_needle.maxTotalThreadsPerThreadgroup;
     if (tpg > 1024) tpg = 1024;
     [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
@@ -4295,7 +4296,7 @@ void mtl_fused_needle_paired(
     float backbone1, float glyco1, float hbond1,
     float hbond2, float glyco2, float backbone2,
     float bondStrength, int n, int cols,
-    void* live1Ref, void* live2Ref, float clipScale) {
+    void* live1Ref, void* live2Ref, void* clipBufRef) {
     id<MTLComputeCommandEncoder> enc = g_fused_enc[g_active_fused_slot];
     [enc setComputePipelineState:g_ps_needle_paired];
     [enc setBuffer:(__bridge id<MTLBuffer>)d1Ref     offset:0 atIndex:0];
@@ -4327,9 +4328,9 @@ void mtl_fused_needle_paired(
     [enc setBytes:&bondStrength length:sizeof(float) atIndex:26];
     uint32_t ucols = (uint32_t)cols;
     [enc setBytes:&ucols       length:sizeof(uint32_t) atIndex:27];
-    [enc setBuffer:(__bridge id<MTLBuffer>)live1Ref offset:0 atIndex:28];
-    [enc setBuffer:(__bridge id<MTLBuffer>)live2Ref offset:0 atIndex:29];
-    [enc setBytes:&clipScale   length:sizeof(float) atIndex:30];
+    [enc setBuffer:(__bridge id<MTLBuffer>)live1Ref   offset:0 atIndex:28];
+    [enc setBuffer:(__bridge id<MTLBuffer>)live2Ref   offset:0 atIndex:29];
+    [enc setBuffer:(__bridge id<MTLBuffer>)clipBufRef offset:0 atIndex:30];
     NSUInteger tpg = g_ps_needle_paired.maxTotalThreadsPerThreadgroup;
     if (tpg > 1024) tpg = 1024;
     [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];

@@ -45,6 +45,12 @@ typedef void (*fn_dequant_int8_fp16)(const void*, const float*, void*, int, int,
 typedef void (*fn_dequant_int8_fp32)(const void*, const float*, float*, int, int, cudaStream_t);
 typedef void (*fn_fp32_to_fp16)(const float*, void*, int, cudaStream_t);
 typedef void (*fn_fp16_to_fp32)(const void*, float*, int, cudaStream_t);
+typedef void (*fn_rmsnorm_wgrad)(const float*, const float*, const float*, float*, int, int, cudaStream_t);
+typedef void (*fn_grad_sumsq)(const float*, float*, int, cudaStream_t);
+typedef void (*fn_grad_scale)(float*, float, int, cudaStream_t);
+typedef void (*fn_q8_matvec)(const float*, const void*, const float*, float*, int, int, cudaStream_t);
+typedef void (*fn_q4_matvec)(const float*, const void*, const float*, float*, int, int, cudaStream_t);
+typedef void (*fn_kv_cache_write)(float*, const float*, int, int, cudaStream_t);
 
 static void* kernel_lib = NULL;
 static fn_rmsnorm           k_rmsnorm = NULL;
@@ -86,6 +92,12 @@ static fn_dequant_int8_fp16 k_dequant_int8_fp16 = NULL;
 static fn_dequant_int8_fp32 k_dequant_int8_fp32 = NULL;
 static fn_fp32_to_fp16     k_fp32_to_fp16 = NULL;
 static fn_fp16_to_fp32     k_fp16_to_fp32 = NULL;
+static fn_rmsnorm_wgrad    k_rmsnorm_wgrad = NULL;
+static fn_grad_sumsq       k_grad_sumsq = NULL;
+static fn_grad_scale       k_grad_scale = NULL;
+static fn_q8_matvec        k_q8_matvec = NULL;
+static fn_q4_matvec        k_q4_matvec = NULL;
+static fn_kv_cache_write   k_kv_cache_write = NULL;
 
 int tw_load_kernels(const char* path) {
     kernel_lib = dlopen(path, RTLD_NOW);
@@ -130,6 +142,12 @@ int tw_load_kernels(const char* path) {
     k_dequant_int8_fp32   = (fn_dequant_int8_fp32)dlsym(kernel_lib, "mongoose_dequant_int8_to_fp32");
     k_fp32_to_fp16        = (fn_fp32_to_fp16)dlsym(kernel_lib, "mongoose_fp32_to_fp16");
     k_fp16_to_fp32        = (fn_fp16_to_fp32)dlsym(kernel_lib, "mongoose_fp16_to_fp32");
+    k_rmsnorm_wgrad       = (fn_rmsnorm_wgrad)dlsym(kernel_lib, "mongoose_rmsnorm_wgrad");
+    k_grad_sumsq          = (fn_grad_sumsq)dlsym(kernel_lib, "mongoose_grad_sumsq");
+    k_grad_scale          = (fn_grad_scale)dlsym(kernel_lib, "mongoose_grad_scale");
+    k_q8_matvec           = (fn_q8_matvec)dlsym(kernel_lib, "mongoose_q8_matvec");
+    k_q4_matvec           = (fn_q4_matvec)dlsym(kernel_lib, "mongoose_q4_matvec");
+    k_kv_cache_write      = (fn_kv_cache_write)dlsym(kernel_lib, "mongoose_kv_cache_write");
 
     if (!k_rmsnorm || !k_relu || !k_add_inplace || !k_embedding_gather) return -2;
     return 0;
@@ -185,6 +203,26 @@ void tw_k_helix_dna_step(float* d1, float* d2, const float* g1, const float* g2,
     if (k_helix_dna_step) k_helix_dna_step(d1, d2, g1, g2, m1, m2, v1, v2,
         lr, beta1, beta2, bc1, bc2, eps, wd, bb1, gly1, hb1, hb2, gly2, bb2, bs, n, 0);
 }
+void tw_k_grad_sumsq(const float* grad, float* sumsq, int n) {
+    if (k_grad_sumsq) k_grad_sumsq(grad, sumsq, n, 0);
+}
+void tw_k_grad_scale(float* grad, float scale, int n) {
+    if (k_grad_scale) k_grad_scale(grad, scale, n, 0);
+}
+void tw_k_rmsnorm_wgrad(const float* dOut, const float* normed, const float* weight, float* dW, int nPos, int dim) {
+    if (k_rmsnorm_wgrad) k_rmsnorm_wgrad(dOut, normed, weight, dW, nPos, dim, 0);
+}
+void tw_k_q8_matvec(const float* act, const void* weight, const float* scales, float* out, int N, int K) {
+    if (k_q8_matvec) k_q8_matvec(act, weight, scales, out, N, K, 0);
+}
+void tw_k_q4_matvec(const float* act, const void* weight, const float* scales, float* out, int N, int K) {
+    if (k_q4_matvec) k_q4_matvec(act, weight, scales, out, N, K, 0);
+}
+void tw_k_kv_cache_write(float* cache, const float* src, int pos, int kvDim) {
+    if (k_kv_cache_write) k_kv_cache_write(cache, src, pos, kvDim, 0);
+}
+int tw_k_has_q8_matvec() { return k_q8_matvec != NULL ? 1 : 0; }
+int tw_k_has_q4_matvec() { return k_q4_matvec != NULL ? 1 : 0; }
 int tw_helix_dna_loaded() { return k_helix_dna_step != NULL ? 1 : 0; }
 int tw_helix_needle_loaded() { return (k_helix_needle != NULL && k_helix_needle_paired != NULL) ? 1 : 0; }
 void tw_k_helix_needle(void* data, float* scales, const float* grad,
@@ -591,6 +629,23 @@ func KRMSNormBackward(dOutPtr, xInPtr, weightPtr, scalesPtr, dxPtr unsafe.Pointe
 		(*C.float)(scalesPtr), (*C.float)(dxPtr), C.int(seqLen), C.int(dim))
 }
 
+// KGradSumSq accumulates sum-of-squares of gradient elements into sumsq[0] via atomicAdd.
+func KGradSumSq(gradPtr, sumsqPtr unsafe.Pointer, n int) {
+	C.tw_k_grad_sumsq((*C.float)(gradPtr), (*C.float)(sumsqPtr), C.int(n))
+}
+
+// KGradScale multiplies all gradient elements by scale.
+func KGradScale(gradPtr unsafe.Pointer, scale float32, n int) {
+	C.tw_k_grad_scale((*C.float)(gradPtr), C.float(scale), C.int(n))
+}
+
+// KRMSNormWeightGrad: dW[d] = sum_pos(dOut[pos,d] * normed[pos,d] / weight[d]).
+// All GPU, no sync. normed is the output of KRMSNormOutSave (includes weight multiply).
+func KRMSNormWeightGrad(dOutPtr, normedPtr, weightPtr, dWPtr unsafe.Pointer, seqLen, dim int) {
+	C.tw_k_rmsnorm_wgrad((*C.float)(dOutPtr), (*C.float)(normedPtr), (*C.float)(weightPtr),
+		(*C.float)(dWPtr), C.int(seqLen), C.int(dim))
+}
+
 // KDecodeAttention: single-query attention against full KV cache. GQA-aware.
 // Q[1,dim], K_cache[cacheLen,kvDim], V_cache[cacheLen,kvDim], out[1,dim].
 func KDecodeAttention(qPtr, kCachePtr, vCachePtr, outPtr unsafe.Pointer,
@@ -674,3 +729,24 @@ func KFP32ToFP16(inPtr, outPtr unsafe.Pointer, n int) {
 func KFP16ToFP32(inPtr, outPtr unsafe.Pointer, n int) {
 	C.tw_k_fp16_to_fp32(inPtr, (*C.float)(outPtr), C.int(n))
 }
+
+// KQ8Matvec: fused INT8 dequant + matvec. out[N] = act[K] @ dequant(weight[N,K]).
+func KQ8Matvec(actPtr, weightPtr, scalesPtr, outPtr unsafe.Pointer, N, K int) {
+	C.tw_k_q8_matvec((*C.float)(actPtr), weightPtr, (*C.float)(scalesPtr), (*C.float)(outPtr), C.int(N), C.int(K))
+}
+
+// KQ4Matvec: fused 4-bit dequant + matvec. out[N] = act[K] @ dequant(weight[N,K/2]).
+func KQ4Matvec(actPtr, weightPtr, scalesPtr, outPtr unsafe.Pointer, N, K int) {
+	C.tw_k_q4_matvec((*C.float)(actPtr), weightPtr, (*C.float)(scalesPtr), (*C.float)(outPtr), C.int(N), C.int(K))
+}
+
+// KKVCacheWrite writes a vector into the KV cache at position pos.
+func KKVCacheWrite(cachePtr, srcPtr unsafe.Pointer, pos, kvDim int) {
+	C.tw_k_kv_cache_write((*C.float)(cachePtr), (*C.float)(srcPtr), C.int(pos), C.int(kvDim))
+}
+
+// HasQ8Matvec returns true if the fused Q8 matvec kernel is loaded.
+func HasQ8Matvec() bool { return C.tw_k_has_q8_matvec() != 0 }
+
+// HasQ4Matvec returns true if the fused Q4 matvec kernel is loaded.
+func HasQ4Matvec() bool { return C.tw_k_has_q4_matvec() != 0 }

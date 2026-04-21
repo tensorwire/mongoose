@@ -100,3 +100,15 @@ func AsTensorEngine(eng Engine) TensorEngine {
 	te, _ := eng.(TensorEngine)
 	return te
 }
+
+// ResidentWeightEngine provides fast matmul with pre-uploaded weight tensors.
+// The weight stays on GPU; only the small activation vector round-trips per call.
+type ResidentWeightEngine interface {
+	MatVecResidentW(W *Tensor, x []float32, rows, cols int) []float32
+}
+
+// AsResidentWeightEngine casts an Engine to ResidentWeightEngine, or nil.
+func AsResidentWeightEngine(eng Engine) ResidentWeightEngine {
+	rw, _ := eng.(ResidentWeightEngine)
+	return rw
+}

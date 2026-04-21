@@ -36,6 +36,9 @@ func KScaleOut(xPtr, outPtr unsafe.Pointer, alpha float32, n int) {}
 func KEmbedGather2(outPtr, embedPtr, tokensPtr unsafe.Pointer, seqLen, dim int) {}
 func KRMSNormOutSave(inputPtr, outPtr, weightPtr, scalesPtr unsafe.Pointer, seqLen, dim int) {}
 func KRMSNormBackward(dOutPtr, xInPtr, weightPtr, scalesPtr, dxPtr unsafe.Pointer, seqLen, dim int) {}
+func KRMSNormWeightGrad(dOutPtr, normedPtr, weightPtr, dWPtr unsafe.Pointer, seqLen, dim int)      {}
+func KGradSumSq(gradPtr, sumsqPtr unsafe.Pointer, n int)                                          {}
+func KGradScale(gradPtr unsafe.Pointer, scale float32, n int)                                     {}
 func KDecodeAttention(qPtr, kCachePtr, vCachePtr, outPtr unsafe.Pointer, cacheLen, dim, kvDim, numHeads, numKVHeads int) {}
 func KCausalAttentionGQA(qPtr, kPtr, vPtr, outPtr unsafe.Pointer, seqLen, dim, kvDim, numHeads, numKVHeads int) {}
 func AttnBackwardLoaded() bool { return false }
@@ -54,3 +57,8 @@ func HelixNeedleLoaded() bool { return false }
 func KHelixNeedle(dataPtr, scalesPtr, gradPtr, momPtr, velPtr, maskPtr unsafe.Pointer, lr, beta1, beta2 float32, step int, eps, wd float32, n, cols int) {}
 func KHelixNeedlePaired(d1Ptr, d2Ptr, s1Ptr, s2Ptr, g1Ptr, g2Ptr, m1Ptr, m2Ptr, v1Ptr, v2Ptr, maskPtr unsafe.Pointer, lr, beta1, beta2 float32, step int, eps, wd float32, bb1, gly1, hb1, hb2, gly2, bb2, bondStrength float32, n, cols int) {}
 func CUDACheck() string { return "" }
+func KQ8Matvec(actPtr, weightPtr, scalesPtr, outPtr unsafe.Pointer, N, K int) {}
+func KQ4Matvec(actPtr, weightPtr, scalesPtr, outPtr unsafe.Pointer, N, K int) {}
+func KKVCacheWrite(cachePtr, srcPtr unsafe.Pointer, pos, kvDim int) {}
+func HasQ8Matvec() bool { return false }
+func HasQ4Matvec() bool { return false }

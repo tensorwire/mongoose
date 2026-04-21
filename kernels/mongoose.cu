@@ -6,6 +6,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <stdint.h>
 #include <math.h>
 
 extern "C" {
@@ -446,6 +447,60 @@ void mongoose_adamw(
     int n, cudaStream_t stream
 ) {
     adamw_kernel<<<(n+255)/256, 256, 0, stream>>>(param, grad, m, v, lr, wd, beta1, beta2, bc1, bc2, n);
+}
+
+// === Gradient clipping (GPU-only) ===
+// Pass 1: accumulate sum-of-squares into a single float via atomicAdd
+__global__ void grad_sumsq_kernel(const float* grad, float* sumsq, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float g = grad[i];
+    atomicAdd(sumsq, g * g);
+}
+
+// Pass 2: scale all elements by factor if needed
+__global__ void grad_scale_kernel(float* grad, float scale, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    grad[i] *= scale;
+}
+
+void mongoose_grad_sumsq(const float* grad, float* sumsq, int n, cudaStream_t stream) {
+    grad_sumsq_kernel<<<(n+255)/256, 256, 0, stream>>>(grad, sumsq, n);
+}
+
+void mongoose_grad_scale(float* grad, float scale, int n, cudaStream_t stream) {
+    grad_scale_kernel<<<(n+255)/256, 256, 0, stream>>>(grad, scale, n);
+}
+
+// === RMSNorm weight gradient ===
+// dW[d] = sum_pos(dOut[pos,d] * normed[pos,d])
+// normed = x / rms (the output of RMSNormOutSave before weight multiply)
+// One thread per dim element, reduces across sequence positions.
+__global__ void rmsnorm_wgrad_kernel(
+    const float* __restrict__ dOut,     // [nPos, dim]
+    const float* __restrict__ normed,   // [nPos, dim] — x/rms (pre-weight)
+    const float* __restrict__ weight,   // [dim] — current norm weights
+    float* __restrict__ dW,             // [dim] — output gradient
+    int nPos, int dim
+) {
+    int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= dim) return;
+    float sum = 0.0f;
+    float w = weight[d];
+    for (int p = 0; p < nPos; p++) {
+        // normed stored by KRMSNormOutSave is (x/rms)*w, so x/rms = normed/w
+        float xnorm = (w != 0.0f) ? normed[p * dim + d] / w : 0.0f;
+        sum += dOut[p * dim + d] * xnorm;
+    }
+    dW[d] = sum;
+}
+
+void mongoose_rmsnorm_wgrad(
+    const float* dOut, const float* normed, const float* weight, float* dW,
+    int nPos, int dim, cudaStream_t stream
+) {
+    rmsnorm_wgrad_kernel<<<(dim+255)/256, 256, 0, stream>>>(dOut, normed, weight, dW, nPos, dim);
 }
 
 // === Sparse FFN Kernels ===
@@ -1438,6 +1493,107 @@ void mongoose_dequant_int8_to_fp32(
     int threads = cols < 256 ? cols : 256;
     dequant_int8_to_fp32_kernel<<<rows, threads, 0, stream>>>(
         (const int8_t*)data_int8, scales, out_fp32, rows, cols);
+}
+
+// === Fused Q8 matvec: out[row] = sum_k(act[k] * int8_weight[row,k] * scale[row]/127) ===
+// One block per output row. Threads cooperatively reduce the dot product.
+__global__ void q8_matvec_kernel(
+    const float* act, const int8_t* weight, const float* scales,
+    float* out, int K
+) {
+    int row = blockIdx.x;
+    float scale = scales[row] / 127.0f;
+    const int8_t* wRow = weight + row * K;
+
+    float sum = 0.0f;
+    for (int k = threadIdx.x; k < K; k += blockDim.x) {
+        sum += act[k] * float(wRow[k]) * scale;
+    }
+
+    // Warp reduce
+    for (int offset = warpSize/2; offset > 0; offset /= 2)
+        sum += __shfl_down_sync(0xffffffff, sum, offset);
+
+    __shared__ float shared[32];
+    int lane = threadIdx.x % warpSize;
+    int wid = threadIdx.x / warpSize;
+    if (lane == 0) shared[wid] = sum;
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        int nWarps = (blockDim.x + warpSize - 1) / warpSize;
+        float total = 0.0f;
+        for (int i = 0; i < nWarps; i++) total += shared[i];
+        out[row] = total;
+    }
+}
+
+void mongoose_q8_matvec(
+    const float* act, const void* weight_int8, const float* scales,
+    float* out, int N, int K, cudaStream_t stream
+) {
+    int threads = K < 1024 ? ((K + 31) / 32) * 32 : 1024;
+    if (threads < 32) threads = 32;
+    q8_matvec_kernel<<<N, threads, 0, stream>>>(
+        act, (const int8_t*)weight_int8, scales, out, K);
+}
+
+// === Fused Q4 matvec: out[row] = sum_k(act[k] * dequant4(packed[row,k/2])) ===
+__global__ void q4_matvec_kernel(
+    const float* act, const uint8_t* weight, const float* scales,
+    float* out, int K
+) {
+    int row = blockIdx.x;
+    float scale = scales[row] / 7.0f;
+    int halfK = K / 2;
+    const uint8_t* wRow = weight + row * halfK;
+
+    float sum = 0.0f;
+    for (int k = threadIdx.x; k < halfK; k += blockDim.x) {
+        uint8_t packed = wRow[k];
+        float w0 = float(int(packed & 0xF) - 8) * scale;
+        float w1 = float(int(packed >> 4) - 8) * scale;
+        sum += act[k * 2] * w0 + act[k * 2 + 1] * w1;
+    }
+
+    for (int offset = warpSize/2; offset > 0; offset /= 2)
+        sum += __shfl_down_sync(0xffffffff, sum, offset);
+
+    __shared__ float shared[32];
+    int lane = threadIdx.x % warpSize;
+    int wid = threadIdx.x / warpSize;
+    if (lane == 0) shared[wid] = sum;
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        int nWarps = (blockDim.x + warpSize - 1) / warpSize;
+        float total = 0.0f;
+        for (int i = 0; i < nWarps; i++) total += shared[i];
+        out[row] = total;
+    }
+}
+
+void mongoose_q4_matvec(
+    const float* act, const void* weight_packed, const float* scales,
+    float* out, int N, int K, cudaStream_t stream
+) {
+    int halfK = K / 2;
+    int threads = halfK < 1024 ? ((halfK + 31) / 32) * 32 : 1024;
+    if (threads < 32) threads = 32;
+    q4_matvec_kernel<<<N, threads, 0, stream>>>(
+        act, (const uint8_t*)weight_packed, scales, out, K);
+}
+
+// === KV cache write: cache[pos*kvDim .. (pos+1)*kvDim] = src ===
+__global__ void kv_cache_write_kernel(float* cache, const float* src, int pos, int kvDim) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < kvDim) cache[pos * kvDim + i] = src[i];
+}
+
+void mongoose_kv_cache_write(float* cache, const float* src, int pos, int kvDim, cudaStream_t stream) {
+    int threads = kvDim < 256 ? kvDim : 256;
+    int blocks = (kvDim + threads - 1) / threads;
+    kv_cache_write_kernel<<<blocks, threads, 0, stream>>>(cache, src, pos, kvDim);
 }
 
 } // extern "C"
