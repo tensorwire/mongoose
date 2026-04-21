@@ -4370,18 +4370,47 @@ void mtl_fused_needle_paired(
     [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
 }
 
+// ICB build parameter struct.
+typedef struct {
+    int dim, kvDim, headDim, nHeads, nKVHeads, ffnDim, vocabSize, seqLen, nLayers;
+    void* hidden; void* normedFinal; void* finalNorm; void* finalScales;
+    void* lmMaxLogit; void* lmSumExp; void* lmLoss; void* targetsGPU;
+    void* dHidden; void* dScratch; void* dEmbed;
+    void* gradSumSq; void* clipScaleBuf; void* scores;
+    void* embed; void* embedData; void* embedScales; void* embedDelta;
+    void* embedMom; void* embedVel; void* embedMask; void* embedLive;
+    void** norm1; void** norm2;
+    void** a_xIn; void** a_normed; void** a_Q; void** a_K; void** a_V; void** a_attnOut;
+    void** a_xMid; void** a_normed2; void** a_gatePre; void** a_upOut; void** a_ffnMid;
+    void** a_rmsScale1; void** a_rmsScale2; void** a_gateAct;
+    void** wq_data; void** wq_scales; void** wq_delta; void** wq_mom; void** wq_vel; void** wq_live; void** wq_mask;
+    void** wk_data; void** wk_scales; void** wk_delta; void** wk_mom; void** wk_vel; void** wk_live; void** wk_mask;
+    void** wv_data; void** wv_scales; void** wv_delta; void** wv_mom; void** wv_vel; void** wv_live; void** wv_mask;
+    void** wo_data; void** wo_scales; void** wo_delta; void** wo_mom; void** wo_vel; void** wo_live; void** wo_mask;
+    void** gate_data; void** gate_scales; void** gate_delta; void** gate_mom; void** gate_vel; void** gate_live; void** gate_mask;
+    void** up_data; void** up_scales; void** up_delta; void** up_mom; void** up_vel; void** up_live; void** up_mask;
+    void** down_data; void** down_scales; void** down_delta; void** down_mom; void** down_vel; void** down_live; void** down_mask;
+    void** b_dFfnMid; void** b_dGate; void** b_dUp; void** b_dN2; void** b_dx;
+    void** b_dAttnOut; void** b_dQ; void** b_dK; void** b_dV; void** b_dN1;
+    void** b_dWDown; void** b_dWGate; void** b_dWUp; void** b_dWO; void** b_dWQ; void** b_dWK; void** b_dWV;
+    void* lrBuf; void* bc1Buf; void* bc2Buf; void* maxNormBuf;
+    void* bb1Buf; void* gly1Buf; void* hb1Buf; void* hb2Buf; void* gly2Buf; void* bb2Buf; void* bondStrBuf;
+} ICBBuildParams;
+
 // === Indirect Command Buffer (ICB) for training ===
-// Pre-encode the full training step dispatch sequence once at init.
-// Per step: CPU writes tokens/masks/constants to shared memory, then
-// executes the ICB with one executeCommandsInBuffer call.
+// Apple8+ (M2+): pre-encode into ICB, replay per step.
+// Apple7 (M1): batch-encode into regular compute encoder per step (one CGo call).
 
 #define ICB_MAX_CMDS 512
 
+static bool g_use_icb = false;
 static id<MTLIndirectCommandBuffer> g_train_icb = nil;
-static int g_train_icb_fwd_count = 0;   // forward + LM head commands
-static int g_train_icb_total_count = 0;  // full step commands
-
+static int g_train_icb_fwd_count = 0;
+static int g_train_icb_total_count = 0;
 static int g_icb_cursor = 0;
+
+// Saved params for batch-encode fallback (Apple7).
+static ICBBuildParams* g_batch_params = nil;
 
 // Helper: encode a 1D dispatch into the ICB
 static void icb_1d(id<MTLComputePipelineState> ps, int n, void* bufs[], int bufCount) {
@@ -4503,34 +4532,23 @@ static void icb_add(void* a, void* b, int n) {
     g_icb_cursor++;
 }
 
-// ICB build parameter struct — avoids 120+ CGo params.
-typedef struct {
-    int dim, kvDim, headDim, nHeads, nKVHeads, ffnDim, vocabSize, seqLen, nLayers;
-    void* hidden; void* normedFinal; void* finalNorm; void* finalScales;
-    void* lmMaxLogit; void* lmSumExp; void* lmLoss; void* targetsGPU;
-    void* dHidden; void* dScratch; void* dEmbed;
-    void* gradSumSq; void* clipScaleBuf; void* scores;
-    void* embed; void* embedData; void* embedScales; void* embedDelta;
-    void* embedMom; void* embedVel; void* embedMask; void* embedLive;
-    void** norm1; void** norm2;
-    void** a_xIn; void** a_normed; void** a_Q; void** a_K; void** a_V; void** a_attnOut;
-    void** a_xMid; void** a_normed2; void** a_gatePre; void** a_upOut; void** a_ffnMid;
-    void** a_rmsScale1; void** a_rmsScale2; void** a_gateAct;
-    void** wq_data; void** wq_scales; void** wq_delta; void** wq_mom; void** wq_vel; void** wq_live; void** wq_mask;
-    void** wk_data; void** wk_scales; void** wk_delta; void** wk_mom; void** wk_vel; void** wk_live; void** wk_mask;
-    void** wv_data; void** wv_scales; void** wv_delta; void** wv_mom; void** wv_vel; void** wv_live; void** wv_mask;
-    void** wo_data; void** wo_scales; void** wo_delta; void** wo_mom; void** wo_vel; void** wo_live; void** wo_mask;
-    void** gate_data; void** gate_scales; void** gate_delta; void** gate_mom; void** gate_vel; void** gate_live; void** gate_mask;
-    void** up_data; void** up_scales; void** up_delta; void** up_mom; void** up_vel; void** up_live; void** up_mask;
-    void** down_data; void** down_scales; void** down_delta; void** down_mom; void** down_vel; void** down_live; void** down_mask;
-    void** b_dFfnMid; void** b_dGate; void** b_dUp; void** b_dN2; void** b_dx;
-    void** b_dAttnOut; void** b_dQ; void** b_dK; void** b_dV; void** b_dN1;
-    void** b_dWDown; void** b_dWGate; void** b_dWUp; void** b_dWO; void** b_dWQ; void** b_dWK; void** b_dWV;
-    void* lrBuf; void* bc1Buf; void* bc2Buf; void* maxNormBuf;
-    void* bb1Buf; void* gly1Buf; void* hb1Buf; void* hb2Buf; void* gly2Buf; void* bb2Buf; void* bondStrBuf;
-} ICBBuildParams;
+// Batch-encode helper: encode the full step into the active fused encoder.
+// Same dispatch sequence as the ICB, but using the existing mtl_fused_* functions.
+static void batch_encode_fwd(ICBBuildParams* p);
+static void batch_encode_bwd(ICBBuildParams* p);
 
 int mtl_icb_build_training(ICBBuildParams* p) {
+    // Detect GPU family
+    g_use_icb = [g_device supportsFamily:MTLGPUFamilyApple8];
+    if (g_use_icb) {
+        NSLog(@"ICB: Apple8+ detected, using indirect command buffers");
+    } else {
+        NSLog(@"ICB: Apple7 (M1), using batch-encode fallback");
+        // Save params for batch-encode per step
+        g_batch_params = (ICBBuildParams*)malloc(sizeof(ICBBuildParams));
+        memcpy(g_batch_params, p, sizeof(ICBBuildParams));
+        return 0;
+    }
     // Unpack for readability
     int dim = p->dim, kvDim = p->kvDim, headDim = p->headDim;
     int nHeads = p->nHeads, nKVHeads = p->nKVHeads, ffnDim = p->ffnDim;
@@ -5037,25 +5055,217 @@ int mtl_icb_build_training(ICBBuildParams* p) {
 
 // Execute the forward-only portion (step 1 noop).
 void mtl_icb_execute_fwd(void) {
-    // Zero loss scalar before execute
-    float zero = 0.0f;
-    // (caller must zero lmLoss before calling)
-    id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
-    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-    [enc executeCommandsInBuffer:g_train_icb withRange:NSMakeRange(0, g_train_icb_fwd_count)];
-    [enc endEncoding];
-    [cmd commit];
-    [cmd waitUntilCompleted];
+    if (g_use_icb) {
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc executeCommandsInBuffer:g_train_icb withRange:NSMakeRange(0, g_train_icb_fwd_count)];
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+    } else {
+        mtl_fused_begin();
+        batch_encode_fwd(g_batch_params);
+        mtl_fused_end();
+    }
 }
 
 // Execute the full training step (forward + backward + needle).
 void mtl_icb_execute_full(void) {
-    id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
-    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-    [enc executeCommandsInBuffer:g_train_icb withRange:NSMakeRange(0, g_train_icb_total_count)];
-    [enc endEncoding];
-    [cmd commit];
-    [cmd waitUntilCompleted];
+    if (g_use_icb) {
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc executeCommandsInBuffer:g_train_icb withRange:NSMakeRange(0, g_train_icb_total_count)];
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+    } else {
+        mtl_fused_begin();
+        batch_encode_fwd(g_batch_params);
+        batch_encode_bwd(g_batch_params);
+        mtl_fused_end();
+    }
+}
+
+// Batch-encode forward pass into active fused encoder.
+static void batch_encode_fwd(ICBBuildParams* p) {
+    int dim=p->dim, kvDim=p->kvDim, headDim=p->headDim, nHeads=p->nHeads;
+    int nKVHeads=p->nKVHeads, ffnDim=p->ffnDim, vocabSize=p->vocabSize, n=p->seqLen, nLayers=p->nLayers;
+
+    for (int li = 0; li < nLayers; li++) {
+        mtl_fused_copy(p->a_xIn[li], p->hidden, n*dim);
+        mtl_fused_rmsnorm(p->hidden, p->norm1[li], p->a_rmsScale1[li], n, dim);
+        mtl_fused_copy(p->a_normed[li], p->hidden, n*dim);
+        mtl_fused_copy(p->hidden, p->a_xIn[li], n*dim);
+
+        mtl_fused_gemm_f32_bt(p->a_normed[li], p->wq_live[li], p->a_Q[li], n, dim, dim);
+        mtl_fused_gemm_f32_bt(p->a_normed[li], p->wk_live[li], p->a_K[li], n, dim, kvDim);
+        mtl_fused_gemm_f32_bt(p->a_normed[li], p->wv_live[li], p->a_V[li], n, dim, kvDim);
+
+        mtl_fused_rope(p->a_Q[li], headDim, nHeads, 10000.0f, dim, n);
+        mtl_fused_rope(p->a_K[li], headDim, nKVHeads, 10000.0f, kvDim, n);
+
+        mtl_fused_attn(p->a_Q[li], p->a_K[li], p->a_V[li], p->a_attnOut[li], p->scores,
+                       dim, kvDim, headDim, nHeads, nKVHeads, n);
+
+        mtl_fused_gemm_f32_bt(p->a_attnOut[li], p->wo_live[li], p->dScratch, n, dim, dim);
+        mtl_fused_add_inplace(p->hidden, p->dScratch, n*dim);
+
+        mtl_fused_copy(p->a_xMid[li], p->hidden, n*dim);
+        mtl_fused_rmsnorm(p->hidden, p->norm2[li], p->a_rmsScale2[li], n, dim);
+        mtl_fused_copy(p->a_normed2[li], p->hidden, n*dim);
+        mtl_fused_copy(p->hidden, p->a_xMid[li], n*dim);
+
+        mtl_fused_gemm_f32_bt(p->a_normed2[li], p->gate_live[li], p->a_gatePre[li], n, dim, ffnDim);
+        mtl_fused_gemm_f32_bt(p->a_normed2[li], p->up_live[li], p->a_upOut[li], n, dim, ffnDim);
+
+        mtl_fused_silu_gate_mul(p->a_gatePre[li], p->a_upOut[li], p->a_ffnMid[li], n*ffnDim);
+
+        mtl_fused_gemm_f32_bt(p->a_ffnMid[li], p->down_live[li], p->dScratch, n, ffnDim, dim);
+        mtl_fused_add_inplace(p->hidden, p->dScratch, n*dim);
+    }
+
+    mtl_fused_rmsnorm(p->hidden, p->finalNorm, p->finalScales, n, dim);
+    mtl_fused_copy(p->normedFinal, p->hidden, n*dim);
+
+    mtl_fused_lm_head_pass1(p->normedFinal, p->embed, p->lmMaxLogit, p->lmSumExp, dim, vocabSize, n);
+    mtl_fused_barrier_buffers();
+    mtl_fused_lm_head_pass2(p->normedFinal, p->embed, p->lmMaxLogit, p->lmSumExp,
+                            p->targetsGPU, p->dHidden, p->lmLoss, dim, vocabSize, n);
+    mtl_fused_barrier_buffers();
+}
+
+// Batch-encode backward + clip + needle into active fused encoder.
+static void batch_encode_bwd(ICBBuildParams* p) {
+    int dim=p->dim, kvDim=p->kvDim, headDim=p->headDim, nHeads=p->nHeads;
+    int nKVHeads=p->nKVHeads, ffnDim=p->ffnDim, n=p->seqLen, nLayers=p->nLayers;
+
+    mtl_fused_rmsnorm_bwd(p->dHidden, p->hidden, p->finalNorm, p->finalScales, p->dScratch, n, dim);
+    mtl_fused_copy(p->dHidden, p->dScratch, n*dim);
+
+    for (int li = nLayers - 1; li >= 0; li--) {
+        mtl_fused_gemm_f32_nn(p->dHidden, p->down_live[li], p->b_dFfnMid[li], n, dim, ffnDim);
+        mtl_fused_gemm_tn_sparse(p->dHidden, p->a_ffnMid[li], p->b_dWDown[li], p->down_mask[li], dim, n, ffnDim);
+
+        mtl_silu_gate_backward_gpu(p->b_dFfnMid[li], p->a_gatePre[li], p->a_upOut[li],
+                                    p->a_gateAct[li], p->b_dGate[li], p->b_dUp[li], n*ffnDim);
+
+        mtl_fused_gemm_f32_nn(p->b_dGate[li], p->gate_live[li], p->b_dN2[li], n, ffnDim, dim);
+        mtl_fused_gemm_f32_nn(p->b_dUp[li], p->up_live[li], p->b_dx[li], n, ffnDim, dim);
+        mtl_fused_add_inplace(p->b_dN2[li], p->b_dx[li], n*dim);
+
+        mtl_fused_gemm_tn_sparse(p->b_dGate[li], p->a_normed2[li], p->b_dWGate[li], p->gate_mask[li], ffnDim, n, dim);
+        mtl_fused_gemm_tn_sparse(p->b_dUp[li], p->a_normed2[li], p->b_dWUp[li], p->up_mask[li], ffnDim, n, dim);
+
+        mtl_fused_rmsnorm_bwd(p->b_dN2[li], p->a_xMid[li], p->norm2[li], p->a_rmsScale2[li], p->b_dx[li], n, dim);
+        mtl_fused_add_inplace(p->dHidden, p->b_dx[li], n*dim);
+
+        mtl_fused_gemm_f32_nn(p->dHidden, p->wo_live[li], p->b_dAttnOut[li], n, dim, dim);
+        mtl_fused_gemm_tn_sparse(p->dHidden, p->a_attnOut[li], p->b_dWO[li], p->wo_mask[li], dim, n, dim);
+
+        mtl_fused_attention_bwd_q(p->b_dAttnOut[li], p->a_Q[li], p->a_K[li], p->a_V[li], p->scores,
+                                  p->b_dQ[li], p->b_dK[li], p->b_dV[li], dim, kvDim, headDim, nHeads, nKVHeads, n, n);
+
+        mtl_fused_rope(p->b_dQ[li], headDim, nHeads, -10000.0f, dim, n);
+        mtl_fused_rope(p->b_dK[li], headDim, nKVHeads, -10000.0f, kvDim, n);
+
+        mtl_fused_gemm_f32_nn(p->b_dQ[li], p->wq_live[li], p->b_dN1[li], n, dim, dim);
+        mtl_fused_gemm_f32_nn(p->b_dK[li], p->wk_live[li], p->b_dx[li], n, kvDim, dim);
+        mtl_fused_gemm_f32_nn(p->b_dV[li], p->wv_live[li], p->b_dN2[li], n, kvDim, dim);
+        mtl_fused_add_inplace(p->b_dN1[li], p->b_dx[li], n*dim);
+        mtl_fused_add_inplace(p->b_dN1[li], p->b_dN2[li], n*dim);
+
+        mtl_fused_gemm_tn_sparse(p->b_dQ[li], p->a_normed[li], p->b_dWQ[li], p->wq_mask[li], dim, n, dim);
+        mtl_fused_gemm_tn_sparse(p->b_dK[li], p->a_normed[li], p->b_dWK[li], p->wk_mask[li], kvDim, n, dim);
+        mtl_fused_gemm_tn_sparse(p->b_dV[li], p->a_normed[li], p->b_dWV[li], p->wv_mask[li], kvDim, n, dim);
+
+        mtl_fused_rmsnorm_bwd(p->b_dN1[li], p->a_xIn[li], p->norm1[li], p->a_rmsScale1[li], p->b_dx[li], n, dim);
+        mtl_fused_add_inplace(p->dHidden, p->b_dx[li], n*dim);
+    }
+
+    // Grad norm
+    mtl_fused_zero_scalar(p->gradSumSq);
+    mtl_fused_barrier_buffers();
+    for (int li = 0; li < nLayers; li++) {
+        mtl_fused_grad_norm_sq(p->b_dWQ[li], p->gradSumSq, dim*dim);
+        mtl_fused_grad_norm_sq(p->b_dWK[li], p->gradSumSq, kvDim*dim);
+        mtl_fused_grad_norm_sq(p->b_dWV[li], p->gradSumSq, kvDim*dim);
+        mtl_fused_grad_norm_sq(p->b_dWO[li], p->gradSumSq, dim*dim);
+        mtl_fused_grad_norm_sq(p->b_dWGate[li], p->gradSumSq, ffnDim*dim);
+        mtl_fused_grad_norm_sq(p->b_dWUp[li], p->gradSumSq, ffnDim*dim);
+        mtl_fused_grad_norm_sq(p->b_dWDown[li], p->gradSumSq, dim*ffnDim);
+    }
+    mtl_fused_barrier_buffers();
+    mtl_fused_compute_clip_scale(p->gradSumSq, p->clipScaleBuf, 1.0f);
+    mtl_fused_barrier_buffers();
+
+    // Needle — encode directly into fused encoder using buffer pointers for constants.
+    // The mutable buffers (lr, bc1, bc2, rung) were written by CPU before this call.
+    float beta1=0.9f, beta2=0.95f, eps=1e-8f, wd=0.1f;
+    id<MTLComputeCommandEncoder> enc = g_fused_enc[g_active_fused_slot];
+
+    for (int li = 0; li < nLayers; li++) {
+        void* sd[] = {p->wq_data[li], p->wk_data[li], p->wv_data[li], p->wo_data[li], p->gate_data[li], p->up_data[li], p->down_data[li]};
+        void* ss[] = {p->wq_scales[li], p->wk_scales[li], p->wv_scales[li], p->wo_scales[li], p->gate_scales[li], p->up_scales[li], p->down_scales[li]};
+        void* sg[] = {p->b_dWQ[li], p->b_dWK[li], p->b_dWV[li], p->b_dWO[li], p->b_dWGate[li], p->b_dWUp[li], p->b_dWDown[li]};
+        void* sm[] = {p->wq_mom[li], p->wk_mom[li], p->wv_mom[li], p->wo_mom[li], p->gate_mom[li], p->up_mom[li], p->down_mom[li]};
+        void* sv[] = {p->wq_vel[li], p->wk_vel[li], p->wv_vel[li], p->wo_vel[li], p->gate_vel[li], p->up_vel[li], p->down_vel[li]};
+        void* sk[] = {p->wq_mask[li], p->wk_mask[li], p->wv_mask[li], p->wo_mask[li], p->gate_mask[li], p->up_mask[li], p->down_mask[li]};
+        void* sdl[] = {p->wq_delta[li], p->wk_delta[li], p->wv_delta[li], p->wo_delta[li], p->gate_delta[li], p->up_delta[li], p->down_delta[li]};
+        void* sl[] = {p->wq_live[li], p->wk_live[li], p->wv_live[li], p->wo_live[li], p->gate_live[li], p->up_live[li], p->down_live[li]};
+        int sn[] = {dim*dim, kvDim*dim, kvDim*dim, dim*dim, ffnDim*dim, ffnDim*dim, dim*ffnDim};
+        int sc[] = {dim, dim, dim, dim, dim, dim, ffnDim};
+
+        for (int s = 0; s < 7; s++) {
+            uint32_t ucols = sc[s];
+            [enc setComputePipelineState:g_ps_needle];
+            [enc setBuffer:(__bridge id<MTLBuffer>)sd[s] offset:0 atIndex:0];
+            [enc setBuffer:(__bridge id<MTLBuffer>)ss[s] offset:0 atIndex:1];
+            [enc setBuffer:(__bridge id<MTLBuffer>)sg[s] offset:0 atIndex:2];
+            [enc setBuffer:(__bridge id<MTLBuffer>)sm[s] offset:0 atIndex:3];
+            [enc setBuffer:(__bridge id<MTLBuffer>)sv[s] offset:0 atIndex:4];
+            [enc setBuffer:(__bridge id<MTLBuffer>)sk[s] offset:0 atIndex:5];
+            [enc setBuffer:(__bridge id<MTLBuffer>)sdl[s] offset:0 atIndex:6];
+            [enc setBuffer:(__bridge id<MTLBuffer>)p->lrBuf offset:0 atIndex:7];
+            [enc setBuffer:const_buf(&beta1, 4) offset:0 atIndex:8];
+            [enc setBuffer:const_buf(&beta2, 4) offset:0 atIndex:9];
+            [enc setBuffer:(__bridge id<MTLBuffer>)p->bc1Buf offset:0 atIndex:10];
+            [enc setBuffer:(__bridge id<MTLBuffer>)p->bc2Buf offset:0 atIndex:11];
+            [enc setBuffer:const_buf(&eps, 4) offset:0 atIndex:12];
+            [enc setBuffer:const_buf(&wd, 4) offset:0 atIndex:13];
+            [enc setBuffer:const_buf(&ucols, 4) offset:0 atIndex:14];
+            [enc setBuffer:(__bridge id<MTLBuffer>)sl[s] offset:0 atIndex:15];
+            [enc setBuffer:(__bridge id<MTLBuffer>)p->clipScaleBuf offset:0 atIndex:16];
+            NSUInteger tpg = g_ps_needle.maxTotalThreadsPerThreadgroup;
+            if (tpg > 1024) tpg = 1024;
+            [enc dispatchThreads:MTLSizeMake(sn[s], 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+        }
+    }
+
+    // Embed needle
+    {
+        uint32_t ucols = dim;
+        [enc setComputePipelineState:g_ps_needle];
+        [enc setBuffer:(__bridge id<MTLBuffer>)p->embedData offset:0 atIndex:0];
+        [enc setBuffer:(__bridge id<MTLBuffer>)p->embedScales offset:0 atIndex:1];
+        [enc setBuffer:(__bridge id<MTLBuffer>)p->dEmbed offset:0 atIndex:2];
+        [enc setBuffer:(__bridge id<MTLBuffer>)p->embedMom offset:0 atIndex:3];
+        [enc setBuffer:(__bridge id<MTLBuffer>)p->embedVel offset:0 atIndex:4];
+        [enc setBuffer:(__bridge id<MTLBuffer>)p->embedMask offset:0 atIndex:5];
+        [enc setBuffer:(__bridge id<MTLBuffer>)p->embedDelta offset:0 atIndex:6];
+        [enc setBuffer:(__bridge id<MTLBuffer>)p->lrBuf offset:0 atIndex:7];
+        [enc setBuffer:const_buf(&beta1, 4) offset:0 atIndex:8];
+        [enc setBuffer:const_buf(&beta2, 4) offset:0 atIndex:9];
+        [enc setBuffer:(__bridge id<MTLBuffer>)p->bc1Buf offset:0 atIndex:10];
+        [enc setBuffer:(__bridge id<MTLBuffer>)p->bc2Buf offset:0 atIndex:11];
+        [enc setBuffer:const_buf(&eps, 4) offset:0 atIndex:12];
+        [enc setBuffer:const_buf(&wd, 4) offset:0 atIndex:13];
+        [enc setBuffer:const_buf(&ucols, 4) offset:0 atIndex:14];
+        [enc setBuffer:(__bridge id<MTLBuffer>)p->embedLive offset:0 atIndex:15];
+        [enc setBuffer:(__bridge id<MTLBuffer>)p->clipScaleBuf offset:0 atIndex:16];
+        NSUInteger tpg = g_ps_needle.maxTotalThreadsPerThreadgroup;
+        if (tpg > 1024) tpg = 1024;
+        [enc dispatchThreads:MTLSizeMake(p->vocabSize * dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+    }
 }
 
 // Inference compute-shader stubs — satisfy linker.
