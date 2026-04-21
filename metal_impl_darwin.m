@@ -4370,6 +4370,655 @@ void mtl_fused_needle_paired(
     [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
 }
 
+// === Indirect Command Buffer (ICB) for training ===
+// Pre-encode the full training step dispatch sequence once at init.
+// Per step: CPU writes tokens/masks/constants to shared memory, then
+// executes the ICB with one executeCommandsInBuffer call.
+
+#define ICB_MAX_CMDS 512
+
+static id<MTLIndirectCommandBuffer> g_train_icb = nil;
+static int g_train_icb_fwd_count = 0;   // forward + LM head commands
+static int g_train_icb_total_count = 0;  // full step commands
+
+static int g_icb_cursor = 0;
+
+// Helper: encode a 1D dispatch into the ICB
+static void icb_1d(id<MTLComputePipelineState> ps, int n, void* bufs[], int bufCount) {
+    id<MTLIndirectComputeCommand> cmd = [g_train_icb indirectComputeCommandAtIndex:g_icb_cursor];
+    [cmd setComputePipelineState:ps];
+    for (int i = 0; i < bufCount; i++) {
+        [cmd setKernelBuffer:(__bridge id<MTLBuffer>)bufs[i] offset:0 atIndex:i];
+    }
+    NSUInteger tpg = ps.maxTotalThreadsPerThreadgroup;
+    if (tpg > 1024) tpg = 1024;
+    [cmd concurrentDispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+    g_icb_cursor++;
+}
+
+// Helper: encode a threadgroup dispatch (for GEMM, attention, RMSNorm)
+static void icb_tg(id<MTLComputePipelineState> ps, int gx, int gy, int tx, int ty, void* bufs[], int bufCount) {
+    id<MTLIndirectComputeCommand> cmd = [g_train_icb indirectComputeCommandAtIndex:g_icb_cursor];
+    [cmd setComputePipelineState:ps];
+    for (int i = 0; i < bufCount; i++) {
+        [cmd setKernelBuffer:(__bridge id<MTLBuffer>)bufs[i] offset:0 atIndex:i];
+    }
+    [cmd concurrentDispatchThreadgroups:MTLSizeMake(gx, gy, 1) threadsPerThreadgroup:MTLSizeMake(tx, ty, 1)];
+    g_icb_cursor++;
+}
+
+// Helper: encode a GEMM (BT/NN/TN) — picks Metal4 or tiled fallback
+static void icb_gemm(id<MTLComputePipelineState> ps, id<MTLComputePipelineState> ps4,
+                     void* A, void* B, void* C, id<MTLBuffer> mBuf, id<MTLBuffer> kBuf, id<MTLBuffer> nBuf,
+                     int M, int K, int N) {
+    id<MTLIndirectComputeCommand> cmd = [g_train_icb indirectComputeCommandAtIndex:g_icb_cursor];
+    id<MTLComputePipelineState> use_ps = (g_use_metal4_gemm && ps4) ? ps4 : ps;
+    [cmd setComputePipelineState:use_ps];
+    [cmd setKernelBuffer:(__bridge id<MTLBuffer>)A offset:0 atIndex:0];
+    [cmd setKernelBuffer:(__bridge id<MTLBuffer>)B offset:0 atIndex:1];
+    [cmd setKernelBuffer:(__bridge id<MTLBuffer>)C offset:0 atIndex:2];
+    [cmd setKernelBuffer:mBuf offset:0 atIndex:3];
+    [cmd setKernelBuffer:kBuf offset:0 atIndex:4];
+    [cmd setKernelBuffer:nBuf offset:0 atIndex:5];
+    if (g_use_metal4_gemm && ps4) {
+        NSUInteger sw = ps4.threadExecutionWidth;
+        [cmd concurrentDispatchThreadgroups:MTLSizeMake((N+31)/32, (M+63)/64, 1) threadsPerThreadgroup:MTLSizeMake(sw*4, 1, 1)];
+    } else {
+        [cmd concurrentDispatchThreadgroups:MTLSizeMake((N+31)/32, (M+31)/32, 1) threadsPerThreadgroup:MTLSizeMake(32, 32, 1)];
+    }
+    g_icb_cursor++;
+}
+
+// Helper: encode sparse TN GEMM with mask
+static void icb_gemm_tn_sparse(void* A, void* B, void* C, void* mask,
+                                id<MTLBuffer> mBuf, id<MTLBuffer> kBuf, id<MTLBuffer> nBuf, int M, int N) {
+    id<MTLIndirectComputeCommand> cmd = [g_train_icb indirectComputeCommandAtIndex:g_icb_cursor];
+    [cmd setComputePipelineState:g_ps_gemm_tn_sparse];
+    [cmd setKernelBuffer:(__bridge id<MTLBuffer>)A offset:0 atIndex:0];
+    [cmd setKernelBuffer:(__bridge id<MTLBuffer>)B offset:0 atIndex:1];
+    [cmd setKernelBuffer:(__bridge id<MTLBuffer>)C offset:0 atIndex:2];
+    [cmd setKernelBuffer:mBuf offset:0 atIndex:3];
+    [cmd setKernelBuffer:kBuf offset:0 atIndex:4];
+    [cmd setKernelBuffer:nBuf offset:0 atIndex:5];
+    [cmd setKernelBuffer:(__bridge id<MTLBuffer>)mask offset:0 atIndex:6];
+    [cmd concurrentDispatchThreadgroups:MTLSizeMake((N+31)/32, (M+31)/32, 1) threadsPerThreadgroup:MTLSizeMake(32, 32, 1)];
+    g_icb_cursor++;
+}
+
+// Helper: encode copy_mem kernel
+static void icb_copy(void* dst, void* src, int n) {
+    id<MTLIndirectComputeCommand> cmd = [g_train_icb indirectComputeCommandAtIndex:g_icb_cursor];
+    [cmd setComputePipelineState:g_ps_copy_mem];
+    [cmd setKernelBuffer:(__bridge id<MTLBuffer>)src offset:0 atIndex:0];
+    [cmd setKernelBuffer:(__bridge id<MTLBuffer>)dst offset:0 atIndex:1];
+    NSUInteger tpg = g_ps_copy_mem.maxTotalThreadsPerThreadgroup;
+    if (tpg > 1024) tpg = 1024;
+    [cmd concurrentDispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+    g_icb_cursor++;
+}
+
+// Helper: encode RMSNorm (save variant)
+static void icb_rmsnorm(void* x, void* w, void* scale, id<MTLBuffer> dimBuf, id<MTLBuffer> epsBuf, int seqLen, int dim) {
+    id<MTLIndirectComputeCommand> cmd = [g_train_icb indirectComputeCommandAtIndex:g_icb_cursor];
+    [cmd setComputePipelineState:g_ps_rmsnorm_save];
+    [cmd setKernelBuffer:(__bridge id<MTLBuffer>)x offset:0 atIndex:0];
+    [cmd setKernelBuffer:(__bridge id<MTLBuffer>)w offset:0 atIndex:1];
+    [cmd setKernelBuffer:(__bridge id<MTLBuffer>)scale offset:0 atIndex:2];
+    [cmd setKernelBuffer:dimBuf offset:0 atIndex:3];
+    [cmd setKernelBuffer:epsBuf offset:0 atIndex:4];
+    NSUInteger tpg = g_ps_rmsnorm_save.maxTotalThreadsPerThreadgroup;
+    if (tpg > (NSUInteger)dim) tpg = (NSUInteger)dim;
+    tpg = (tpg / 32) * 32; if (tpg == 0) tpg = 32;
+    [cmd concurrentDispatchThreadgroups:MTLSizeMake(seqLen, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+    g_icb_cursor++;
+}
+
+// Helper: encode RMSNorm backward
+static void icb_rmsnorm_bwd(void* dOut, void* xIn, void* w, void* scale, void* dx,
+                             id<MTLBuffer> dimBuf, int seqLen, int dim) {
+    id<MTLIndirectComputeCommand> cmd = [g_train_icb indirectComputeCommandAtIndex:g_icb_cursor];
+    [cmd setComputePipelineState:g_ps_rmsnorm_bwd];
+    [cmd setKernelBuffer:(__bridge id<MTLBuffer>)dOut offset:0 atIndex:0];
+    [cmd setKernelBuffer:(__bridge id<MTLBuffer>)xIn offset:0 atIndex:1];
+    [cmd setKernelBuffer:(__bridge id<MTLBuffer>)w offset:0 atIndex:2];
+    [cmd setKernelBuffer:(__bridge id<MTLBuffer>)scale offset:0 atIndex:3];
+    [cmd setKernelBuffer:(__bridge id<MTLBuffer>)dx offset:0 atIndex:4];
+    [cmd setKernelBuffer:dimBuf offset:0 atIndex:5];
+    NSUInteger tpg = g_ps_rmsnorm_bwd.maxTotalThreadsPerThreadgroup;
+    if (tpg > (NSUInteger)dim) tpg = (NSUInteger)dim;
+    tpg = (tpg / 32) * 32; if (tpg == 0) tpg = 32;
+    [cmd concurrentDispatchThreadgroups:MTLSizeMake(seqLen, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+    g_icb_cursor++;
+}
+
+// Helper: encode add_inplace
+static void icb_add(void* a, void* b, int n) {
+    id<MTLIndirectComputeCommand> cmd = [g_train_icb indirectComputeCommandAtIndex:g_icb_cursor];
+    [cmd setComputePipelineState:g_ps_add_inplace];
+    [cmd setKernelBuffer:(__bridge id<MTLBuffer>)a offset:0 atIndex:0];
+    [cmd setKernelBuffer:(__bridge id<MTLBuffer>)b offset:0 atIndex:1];
+    NSUInteger tpg = g_ps_add_inplace.maxTotalThreadsPerThreadgroup;
+    if (tpg > 1024) tpg = 1024;
+    [cmd concurrentDispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+    g_icb_cursor++;
+}
+
+// Build the training ICB. Called once at init.
+// layers: array of per-layer buffer structs.
+// Returns number of forward-only commands (for step-1 noop range).
+int mtl_icb_build_training(
+    // Model shape
+    int dim, int kvDim, int headDim, int nHeads, int nKVHeads, int ffnDim, int vocabSize, int seqLen, int nLayers,
+    // Top-level buffers
+    void* hidden, void* normedFinal, void* finalNorm, void* finalScales,
+    void* lmMaxLogit, void* lmSumExp, void* lmLoss, void* targetsGPU,
+    void* dHidden, void* dScratch, void* dEmbed,
+    void* gradSumSq, void* clipScaleBuf, void* scores,
+    void* embed, void* embedData, void* embedScales, void* embedDelta,
+    void* embedMom, void* embedVel, void* embedMask, void* embedLive,
+    // Per-layer arrays (nLayers elements each)
+    void** norm1, void** norm2,
+    // Per-layer forward activation arrays
+    void** a_xIn, void** a_normed, void** a_Q, void** a_K, void** a_V, void** a_attnOut,
+    void** a_xMid, void** a_normed2, void** a_gatePre, void** a_upOut, void** a_ffnMid,
+    void** a_rmsScale1, void** a_rmsScale2, void** a_gateAct,
+    // Per-layer INT8 param arrays (data, scales, delta, mom, vel, live, mask)
+    void** wq_data, void** wq_scales, void** wq_delta, void** wq_mom, void** wq_vel, void** wq_live, void** wq_mask,
+    void** wk_data, void** wk_scales, void** wk_delta, void** wk_mom, void** wk_vel, void** wk_live, void** wk_mask,
+    void** wv_data, void** wv_scales, void** wv_delta, void** wv_mom, void** wv_vel, void** wv_live, void** wv_mask,
+    void** wo_data, void** wo_scales, void** wo_delta, void** wo_mom, void** wo_vel, void** wo_live, void** wo_mask,
+    void** gate_data, void** gate_scales, void** gate_delta, void** gate_mom, void** gate_vel, void** gate_live, void** gate_mask,
+    void** up_data, void** up_scales, void** up_delta, void** up_mom, void** up_vel, void** up_live, void** up_mask,
+    void** down_data, void** down_scales, void** down_delta, void** down_mom, void** down_vel, void** down_live, void** down_mask,
+    // Per-layer backward scratch arrays
+    void** b_dFfnMid, void** b_dGate, void** b_dUp, void** b_dN2, void** b_dx,
+    void** b_dAttnOut, void** b_dQ, void** b_dK, void** b_dV, void** b_dN1,
+    void** b_dWDown, void** b_dWGate, void** b_dWUp, void** b_dWO, void** b_dWQ, void** b_dWK, void** b_dWV,
+    // Mutable per-step constants buffer pointers
+    void* lrBuf, void* bc1Buf, void* bc2Buf,
+    void* maxNormBuf,
+    // Rung constants buffers
+    void* bb1Buf, void* gly1Buf, void* hb1Buf, void* hb2Buf, void* gly2Buf, void* bb2Buf, void* bondStrBuf
+) {
+    int n = seqLen;
+
+    // Pre-cache all constant buffers
+    uint32_t udim = dim, ukvDim = kvDim, uhdim = headDim, unHeads = nHeads;
+    uint32_t unKVH = nKVHeads, uffn = ffnDim, uvocab = vocabSize, un = seqLen;
+    id<MTLBuffer> dimBuf = const_buf(&udim, 4);
+    id<MTLBuffer> kvDimBuf = const_buf(&ukvDim, 4);
+    id<MTLBuffer> hdBuf = const_buf(&uhdim, 4);
+    id<MTLBuffer> nhBuf = const_buf(&unHeads, 4);
+    id<MTLBuffer> nkvBuf = const_buf(&unKVH, 4);
+    id<MTLBuffer> ffnBuf = const_buf(&uffn, 4);
+    id<MTLBuffer> vocabBuf = const_buf(&uvocab, 4);
+    id<MTLBuffer> nBuf = const_buf(&un, 4);
+    float epsVal = 1e-6f;
+    id<MTLBuffer> epsBuf = const_buf(&epsVal, 4);
+    float thetaFwd = 10000.0f, thetaBwd = 10000.0f; // backward uses rope_bwd kernel, same positive theta
+    id<MTLBuffer> thetaBuf = const_buf(&thetaFwd, 4);
+    float invN = 1.0f / (float)n;
+    id<MTLBuffer> invNBuf = const_buf(&invN, 4);
+
+    // GEMM dimension buffers for each unique (M,K,N) shape
+    uint32_t un_dim = n, udim_dim = dim, ukvDim_dim = kvDim, uffn_dim = ffnDim, uvocab_dim = vocabSize;
+    // Forward GEMMs: [n,dim]@[rows,dim]^T → shapes vary
+    id<MTLBuffer> gn = const_buf(&un_dim, 4);     // M=n for forward
+    id<MTLBuffer> gdim = const_buf(&udim_dim, 4);  // various K/N
+    id<MTLBuffer> gkv = const_buf(&ukvDim_dim, 4);
+    id<MTLBuffer> gffn = const_buf(&uffn_dim, 4);
+    id<MTLBuffer> gvocab = const_buf(&uvocab_dim, 4);
+
+    // Stride buffers for RoPE
+    id<MTLBuffer> strideDim = const_buf(&udim_dim, 4);
+    id<MTLBuffer> strideKv = const_buf(&ukvDim_dim, 4);
+
+    // Allocate ICB
+    MTLIndirectCommandBufferDescriptor *desc = [[MTLIndirectCommandBufferDescriptor alloc] init];
+    desc.commandTypes = MTLIndirectCommandTypeConcurrentDispatchThreads | MTLIndirectCommandTypeConcurrentDispatch;
+    desc.inheritBuffers = NO;
+    desc.inheritPipelineState = NO;
+    desc.maxKernelBufferBindCount = 31;
+    g_train_icb = [g_device newIndirectCommandBufferWithDescriptor:desc maxCommandCount:ICB_MAX_CMDS options:MTLResourceStorageModeShared];
+    g_icb_cursor = 0;
+
+    // ============ FORWARD ============
+    for (int li = 0; li < nLayers; li++) {
+        icb_copy(a_xIn[li], hidden, n*dim);
+        icb_rmsnorm(hidden, norm1[li], a_rmsScale1[li], dimBuf, epsBuf, n, dim);
+        icb_copy(a_normed[li], hidden, n*dim);
+        icb_copy(hidden, a_xIn[li], n*dim);
+
+        icb_gemm(g_ps_gemm_bt, g_ps_gemm4f_bt, a_normed[li], wq_live[li], a_Q[li], gn, gdim, gdim, n, dim, dim);
+        icb_gemm(g_ps_gemm_bt, g_ps_gemm4f_bt, a_normed[li], wk_live[li], a_K[li], gn, gdim, gkv, n, dim, kvDim);
+        icb_gemm(g_ps_gemm_bt, g_ps_gemm4f_bt, a_normed[li], wv_live[li], a_V[li], gn, gdim, gkv, n, dim, kvDim);
+
+        // RoPE forward Q
+        {
+            id<MTLIndirectComputeCommand> cmd = [g_train_icb indirectComputeCommandAtIndex:g_icb_cursor];
+            [cmd setComputePipelineState:g_ps_rope_fwd];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)a_Q[li] offset:0 atIndex:0];
+            [cmd setKernelBuffer:hdBuf offset:0 atIndex:1];
+            [cmd setKernelBuffer:nhBuf offset:0 atIndex:2];
+            [cmd setKernelBuffer:thetaBuf offset:0 atIndex:3];
+            [cmd setKernelBuffer:strideDim offset:0 atIndex:4];
+            int nPairs = nHeads * (headDim / 2);
+            [cmd concurrentDispatchThreads:MTLSizeMake(nPairs, n, 1) threadsPerThreadgroup:MTLSizeMake(nPairs < 256 ? nPairs : 256, 1, 1)];
+            g_icb_cursor++;
+        }
+        // RoPE forward K
+        {
+            id<MTLIndirectComputeCommand> cmd = [g_train_icb indirectComputeCommandAtIndex:g_icb_cursor];
+            [cmd setComputePipelineState:g_ps_rope_fwd];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)a_K[li] offset:0 atIndex:0];
+            [cmd setKernelBuffer:hdBuf offset:0 atIndex:1];
+            [cmd setKernelBuffer:nkvBuf offset:0 atIndex:2];
+            [cmd setKernelBuffer:thetaBuf offset:0 atIndex:3];
+            [cmd setKernelBuffer:strideKv offset:0 atIndex:4];
+            int nPairs = nKVHeads * (headDim / 2);
+            [cmd concurrentDispatchThreads:MTLSizeMake(nPairs, n, 1) threadsPerThreadgroup:MTLSizeMake(nPairs < 256 ? nPairs : 256, 1, 1)];
+            g_icb_cursor++;
+        }
+
+        // Attention
+        {
+            id<MTLIndirectComputeCommand> cmd = [g_train_icb indirectComputeCommandAtIndex:g_icb_cursor];
+            [cmd setComputePipelineState:g_ps_fused_attn];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)a_Q[li] offset:0 atIndex:0];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)a_K[li] offset:0 atIndex:1];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)a_V[li] offset:0 atIndex:2];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)a_attnOut[li] offset:0 atIndex:3];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)scores offset:0 atIndex:4];
+            [cmd setKernelBuffer:dimBuf offset:0 atIndex:5];
+            [cmd setKernelBuffer:kvDimBuf offset:0 atIndex:6];
+            [cmd setKernelBuffer:hdBuf offset:0 atIndex:7];
+            [cmd setKernelBuffer:nhBuf offset:0 atIndex:8];
+            [cmd setKernelBuffer:nkvBuf offset:0 atIndex:9];
+            [cmd setKernelBuffer:nBuf offset:0 atIndex:10];
+            NSUInteger tpg = (NSUInteger)n;
+            if (tpg > g_ps_fused_attn.maxTotalThreadsPerThreadgroup)
+                tpg = g_ps_fused_attn.maxTotalThreadsPerThreadgroup;
+            [cmd concurrentDispatchThreadgroups:MTLSizeMake(nHeads, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+            g_icb_cursor++;
+        }
+
+        icb_gemm(g_ps_gemm_bt, g_ps_gemm4f_bt, a_attnOut[li], wo_live[li], dScratch, gn, gdim, gdim, n, dim, dim);
+        icb_add(hidden, dScratch, n*dim);
+
+        icb_copy(a_xMid[li], hidden, n*dim);
+        icb_rmsnorm(hidden, norm2[li], a_rmsScale2[li], dimBuf, epsBuf, n, dim);
+        icb_copy(a_normed2[li], hidden, n*dim);
+        icb_copy(hidden, a_xMid[li], n*dim);
+
+        icb_gemm(g_ps_gemm_bt, g_ps_gemm4f_bt, a_normed2[li], gate_live[li], a_gatePre[li], gn, gdim, gffn, n, dim, ffnDim);
+        icb_gemm(g_ps_gemm_bt, g_ps_gemm4f_bt, a_normed2[li], up_live[li], a_upOut[li], gn, gdim, gffn, n, dim, ffnDim);
+
+        // SiLU gate mul
+        {
+            id<MTLIndirectComputeCommand> cmd = [g_train_icb indirectComputeCommandAtIndex:g_icb_cursor];
+            [cmd setComputePipelineState:g_ps_silu_gate_mul];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)a_gatePre[li] offset:0 atIndex:0];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)a_upOut[li] offset:0 atIndex:1];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)a_ffnMid[li] offset:0 atIndex:2];
+            NSUInteger tpg = g_ps_silu_gate_mul.maxTotalThreadsPerThreadgroup;
+            if (tpg > 1024) tpg = 1024;
+            [cmd concurrentDispatchThreads:MTLSizeMake(n*ffnDim, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+            g_icb_cursor++;
+        }
+
+        icb_gemm(g_ps_gemm_bt, g_ps_gemm4f_bt, a_ffnMid[li], down_live[li], dScratch, gn, gffn, gdim, n, ffnDim, dim);
+        icb_add(hidden, dScratch, n*dim);
+    }
+
+    // Final RMSNorm + copy + LM head
+    icb_rmsnorm(hidden, normedFinal /* wait - this is finalNorm not normedFinal */, finalScales, dimBuf, epsBuf, n, dim);
+
+    // Actually: forward does RMSNorm(hidden, finalNorm, finalScales) then copy(normedFinal, hidden)
+    // Let me fix: the rmsnorm operates in-place on hidden, saves scale. Then copy to normedFinal.
+    // I already encoded rmsnorm above but passed wrong weight buffer. Let me re-do:
+    // The rmsnorm helper encodes: ps=rmsnorm_save, buf0=x(hidden), buf1=w(finalNorm), buf2=scale(finalScales)
+    // That's correct if I pass finalNorm as the weight. Let me check the call above...
+    // icb_rmsnorm(hidden, normedFinal, finalScales, ...) — WRONG, should be finalNorm not normedFinal.
+    // I need to fix this. But I can't edit the ICB command after encoding. Let me redo.
+
+    // Ugh — I encoded the wrong buffer. The ICB cursor already advanced.
+    // I need to back up. Let me restructure: encode the final block after the loop correctly.
+
+    // Actually, I made the mistake in the code above. Let me just set the cursor back and re-encode.
+    g_icb_cursor--; // back up the bad rmsnorm
+
+    icb_rmsnorm(hidden, finalNorm, finalScales, dimBuf, epsBuf, n, dim);
+    icb_copy(normedFinal, hidden, n*dim);
+
+    // LM head pass 1
+    {
+        id<MTLIndirectComputeCommand> cmd = [g_train_icb indirectComputeCommandAtIndex:g_icb_cursor];
+        [cmd setComputePipelineState:g_ps_lm_pass1];
+        [cmd setKernelBuffer:(__bridge id<MTLBuffer>)normedFinal offset:0 atIndex:0];
+        [cmd setKernelBuffer:(__bridge id<MTLBuffer>)embed offset:0 atIndex:1];
+        [cmd setKernelBuffer:(__bridge id<MTLBuffer>)lmMaxLogit offset:0 atIndex:2];
+        [cmd setKernelBuffer:(__bridge id<MTLBuffer>)lmSumExp offset:0 atIndex:3];
+        [cmd setKernelBuffer:dimBuf offset:0 atIndex:4];
+        [cmd setKernelBuffer:vocabBuf offset:0 atIndex:5];
+        [cmd setKernelBuffer:nBuf offset:0 atIndex:6];
+        NSUInteger tpg = g_ps_lm_pass1.maxTotalThreadsPerThreadgroup;
+        tpg = (tpg / 32) * 32; if (tpg == 0) tpg = 32;
+        [cmd concurrentDispatchThreadgroups:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+        g_icb_cursor++;
+    }
+
+    // LM head pass 2
+    {
+        // Zero loss scalar — write directly to shared memory before execute
+        // (CPU does this before mtl_icb_execute_training)
+        id<MTLIndirectComputeCommand> cmd = [g_train_icb indirectComputeCommandAtIndex:g_icb_cursor];
+        [cmd setComputePipelineState:g_ps_lm_pass2];
+        [cmd setKernelBuffer:(__bridge id<MTLBuffer>)normedFinal offset:0 atIndex:0];
+        [cmd setKernelBuffer:(__bridge id<MTLBuffer>)embed offset:0 atIndex:1];
+        [cmd setKernelBuffer:(__bridge id<MTLBuffer>)lmMaxLogit offset:0 atIndex:2];
+        [cmd setKernelBuffer:(__bridge id<MTLBuffer>)lmSumExp offset:0 atIndex:3];
+        [cmd setKernelBuffer:(__bridge id<MTLBuffer>)targetsGPU offset:0 atIndex:4];
+        [cmd setKernelBuffer:(__bridge id<MTLBuffer>)dHidden offset:0 atIndex:5];
+        [cmd setKernelBuffer:(__bridge id<MTLBuffer>)lmLoss offset:0 atIndex:6];
+        [cmd setKernelBuffer:dimBuf offset:0 atIndex:7];
+        [cmd setKernelBuffer:vocabBuf offset:0 atIndex:8];
+        [cmd setKernelBuffer:nBuf offset:0 atIndex:9];
+        [cmd setKernelBuffer:invNBuf offset:0 atIndex:10];
+        NSUInteger tpg = g_ps_lm_pass2.maxTotalThreadsPerThreadgroup;
+        tpg = (tpg / 32) * 32; if (tpg == 0) tpg = 32;
+        [cmd concurrentDispatchThreadgroups:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+        g_icb_cursor++;
+    }
+
+    g_train_icb_fwd_count = g_icb_cursor;
+
+    // ============ BACKWARD ============
+    icb_rmsnorm_bwd(dHidden, hidden, finalNorm, finalScales, dScratch, dimBuf, n, dim);
+    icb_copy(dHidden, dScratch, n*dim);
+
+    for (int li = nLayers - 1; li >= 0; li--) {
+        icb_gemm(g_ps_gemm_nn, g_ps_gemm4f_nn, dHidden, down_live[li], b_dFfnMid[li], gn, gdim, gffn, n, dim, ffnDim);
+        icb_gemm_tn_sparse(dHidden, a_ffnMid[li], b_dWDown[li], down_mask[li], gdim, gn, gffn, dim, ffnDim);
+
+        // SiLU gate backward
+        {
+            id<MTLIndirectComputeCommand> cmd = [g_train_icb indirectComputeCommandAtIndex:g_icb_cursor];
+            [cmd setComputePipelineState:g_ps_silu_gate_backward];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)b_dFfnMid[li] offset:0 atIndex:0];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)a_gatePre[li] offset:0 atIndex:1];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)a_upOut[li] offset:0 atIndex:2];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)a_gateAct[li] offset:0 atIndex:3];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)b_dGate[li] offset:0 atIndex:4];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)b_dUp[li] offset:0 atIndex:5];
+            NSUInteger tpg = g_ps_silu_gate_backward.maxTotalThreadsPerThreadgroup;
+            if (tpg > 1024) tpg = 1024;
+            [cmd concurrentDispatchThreads:MTLSizeMake(n*ffnDim, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+            g_icb_cursor++;
+        }
+
+        icb_gemm(g_ps_gemm_nn, g_ps_gemm4f_nn, b_dGate[li], gate_live[li], b_dN2[li], gn, gffn, gdim, n, ffnDim, dim);
+        icb_gemm(g_ps_gemm_nn, g_ps_gemm4f_nn, b_dUp[li], up_live[li], b_dx[li], gn, gffn, gdim, n, ffnDim, dim);
+        icb_add(b_dN2[li], b_dx[li], n*dim);
+
+        icb_gemm_tn_sparse(b_dGate[li], a_normed2[li], b_dWGate[li], gate_mask[li], gffn, gn, gdim, ffnDim, dim);
+        icb_gemm_tn_sparse(b_dUp[li], a_normed2[li], b_dWUp[li], up_mask[li], gffn, gn, gdim, ffnDim, dim);
+
+        icb_rmsnorm_bwd(b_dN2[li], a_xMid[li], norm2[li], a_rmsScale2[li], b_dx[li], dimBuf, n, dim);
+        icb_add(dHidden, b_dx[li], n*dim);
+
+        icb_gemm(g_ps_gemm_nn, g_ps_gemm4f_nn, dHidden, wo_live[li], b_dAttnOut[li], gn, gdim, gdim, n, dim, dim);
+        icb_gemm_tn_sparse(dHidden, a_attnOut[li], b_dWO[li], wo_mask[li], gdim, gn, gdim, dim, dim);
+
+        // Attention backward
+        {
+            id<MTLIndirectComputeCommand> cmd = [g_train_icb indirectComputeCommandAtIndex:g_icb_cursor];
+            [cmd setComputePipelineState:g_ps_fused_attn_bwd];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)b_dAttnOut[li] offset:0 atIndex:0];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)a_Q[li] offset:0 atIndex:1];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)a_K[li] offset:0 atIndex:2];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)a_V[li] offset:0 atIndex:3];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)scores offset:0 atIndex:4];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)b_dQ[li] offset:0 atIndex:5];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)b_dK[li] offset:0 atIndex:6];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)b_dV[li] offset:0 atIndex:7];
+            [cmd setKernelBuffer:dimBuf offset:0 atIndex:8];
+            [cmd setKernelBuffer:kvDimBuf offset:0 atIndex:9];
+            [cmd setKernelBuffer:hdBuf offset:0 atIndex:10];
+            [cmd setKernelBuffer:nhBuf offset:0 atIndex:11];
+            [cmd setKernelBuffer:nkvBuf offset:0 atIndex:12];
+            [cmd setKernelBuffer:nBuf offset:0 atIndex:13];
+            NSUInteger tpg = (NSUInteger)n;
+            if (tpg > g_ps_fused_attn_bwd.maxTotalThreadsPerThreadgroup)
+                tpg = g_ps_fused_attn_bwd.maxTotalThreadsPerThreadgroup;
+            [cmd concurrentDispatchThreadgroups:MTLSizeMake(nHeads, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+            g_icb_cursor++;
+        }
+
+        // RoPE backward Q
+        {
+            id<MTLIndirectComputeCommand> cmd = [g_train_icb indirectComputeCommandAtIndex:g_icb_cursor];
+            [cmd setComputePipelineState:g_ps_rope_bwd];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)b_dQ[li] offset:0 atIndex:0];
+            [cmd setKernelBuffer:hdBuf offset:0 atIndex:1];
+            [cmd setKernelBuffer:nhBuf offset:0 atIndex:2];
+            [cmd setKernelBuffer:thetaBuf offset:0 atIndex:3];
+            [cmd setKernelBuffer:strideDim offset:0 atIndex:4];
+            int nPairs = nHeads * (headDim / 2);
+            [cmd concurrentDispatchThreads:MTLSizeMake(nPairs, n, 1) threadsPerThreadgroup:MTLSizeMake(nPairs < 256 ? nPairs : 256, 1, 1)];
+            g_icb_cursor++;
+        }
+        // RoPE backward K
+        {
+            id<MTLIndirectComputeCommand> cmd = [g_train_icb indirectComputeCommandAtIndex:g_icb_cursor];
+            [cmd setComputePipelineState:g_ps_rope_bwd];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)b_dK[li] offset:0 atIndex:0];
+            [cmd setKernelBuffer:hdBuf offset:0 atIndex:1];
+            [cmd setKernelBuffer:nkvBuf offset:0 atIndex:2];
+            [cmd setKernelBuffer:thetaBuf offset:0 atIndex:3];
+            [cmd setKernelBuffer:strideKv offset:0 atIndex:4];
+            int nPairs = nKVHeads * (headDim / 2);
+            [cmd concurrentDispatchThreads:MTLSizeMake(nPairs, n, 1) threadsPerThreadgroup:MTLSizeMake(nPairs < 256 ? nPairs : 256, 1, 1)];
+            g_icb_cursor++;
+        }
+
+        icb_gemm(g_ps_gemm_nn, g_ps_gemm4f_nn, b_dQ[li], wq_live[li], b_dN1[li], gn, gdim, gdim, n, dim, dim);
+        icb_gemm(g_ps_gemm_nn, g_ps_gemm4f_nn, b_dK[li], wk_live[li], b_dx[li], gn, gkv, gdim, n, kvDim, dim);
+        icb_gemm(g_ps_gemm_nn, g_ps_gemm4f_nn, b_dV[li], wv_live[li], b_dN2[li], gn, gkv, gdim, n, kvDim, dim);
+        icb_add(b_dN1[li], b_dx[li], n*dim);
+        icb_add(b_dN1[li], b_dN2[li], n*dim);
+
+        icb_gemm_tn_sparse(b_dQ[li], a_normed[li], b_dWQ[li], wq_mask[li], gdim, gn, gdim, dim, dim);
+        icb_gemm_tn_sparse(b_dK[li], a_normed[li], b_dWK[li], wk_mask[li], gkv, gn, gdim, kvDim, dim);
+        icb_gemm_tn_sparse(b_dV[li], a_normed[li], b_dWV[li], wv_mask[li], gkv, gn, gdim, kvDim, dim);
+
+        icb_rmsnorm_bwd(b_dN1[li], a_xIn[li], norm1[li], a_rmsScale1[li], b_dx[li], dimBuf, n, dim);
+        icb_add(dHidden, b_dx[li], n*dim);
+    }
+
+    // ============ GRAD NORM ============
+    // Zero gradSumSq
+    {
+        id<MTLIndirectComputeCommand> cmd = [g_train_icb indirectComputeCommandAtIndex:g_icb_cursor];
+        [cmd setComputePipelineState:g_ps_zero_mem];
+        [cmd setKernelBuffer:(__bridge id<MTLBuffer>)gradSumSq offset:0 atIndex:0];
+        [cmd concurrentDispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        g_icb_cursor++;
+    }
+
+    // Accumulate grad norm for all dW tensors
+    for (int li = 0; li < nLayers; li++) {
+        void* grads[] = {b_dWQ[li], b_dWK[li], b_dWV[li], b_dWO[li], b_dWGate[li], b_dWUp[li], b_dWDown[li]};
+        int sizes[] = {dim*dim, kvDim*dim, kvDim*dim, dim*dim, ffnDim*dim, ffnDim*dim, dim*ffnDim};
+        for (int g = 0; g < 7; g++) {
+            void* bufs2[] = {grads[g], gradSumSq};
+            icb_1d(g_ps_grad_norm, sizes[g], bufs2, 2);
+        }
+    }
+
+    // Compute clip scale
+    {
+        id<MTLIndirectComputeCommand> cmd = [g_train_icb indirectComputeCommandAtIndex:g_icb_cursor];
+        [cmd setComputePipelineState:g_ps_clip_scale_compute];
+        [cmd setKernelBuffer:(__bridge id<MTLBuffer>)gradSumSq offset:0 atIndex:0];
+        [cmd setKernelBuffer:(__bridge id<MTLBuffer>)clipScaleBuf offset:0 atIndex:1];
+        [cmd setKernelBuffer:(__bridge id<MTLBuffer>)maxNormBuf offset:0 atIndex:2];
+        [cmd concurrentDispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        g_icb_cursor++;
+    }
+
+    // ============ NEEDLE (per-layer) ============
+    // Needle constants: lr, beta1, beta2, bc1, bc2, eps, wd at buffer indices 7-13
+    // cols at 14, live at 15, clipBuf at 16
+    float beta1Val = 0.9f, beta2Val = 0.95f, epsNeedle = 1e-8f, wdVal = 0.1f;
+    id<MTLBuffer> beta1Buf = const_buf(&beta1Val, 4);
+    id<MTLBuffer> beta2Buf = const_buf(&beta2Val, 4);
+    id<MTLBuffer> epsNBuf = const_buf(&epsNeedle, 4);
+    id<MTLBuffer> wdBuf = const_buf(&wdVal, 4);
+
+    for (int li = 0; li < nLayers; li++) {
+        // Gate/Up: GC paired
+        {
+            uint32_t uc = dim;
+            id<MTLBuffer> colsBuf = const_buf(&uc, 4);
+            float bondGC = 3.0f/5.0f;
+            id<MTLBuffer> bondGCBuf = const_buf(&bondGC, 4);
+            id<MTLIndirectComputeCommand> cmd = [g_train_icb indirectComputeCommandAtIndex:g_icb_cursor];
+            [cmd setComputePipelineState:g_ps_needle_paired];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)gate_data[li] offset:0 atIndex:0];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)up_data[li] offset:0 atIndex:1];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)gate_scales[li] offset:0 atIndex:2];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)up_scales[li] offset:0 atIndex:3];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)b_dWGate[li] offset:0 atIndex:4];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)b_dWUp[li] offset:0 atIndex:5];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)gate_mom[li] offset:0 atIndex:6];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)up_mom[li] offset:0 atIndex:7];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)gate_vel[li] offset:0 atIndex:8];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)up_vel[li] offset:0 atIndex:9];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)gate_mask[li] offset:0 atIndex:10];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)gate_delta[li] offset:0 atIndex:11];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)up_delta[li] offset:0 atIndex:12];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)lrBuf offset:0 atIndex:13];
+            [cmd setKernelBuffer:beta1Buf offset:0 atIndex:14];
+            [cmd setKernelBuffer:beta2Buf offset:0 atIndex:15];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)bc1Buf offset:0 atIndex:16];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)bc2Buf offset:0 atIndex:17];
+            [cmd setKernelBuffer:epsNBuf offset:0 atIndex:18];
+            [cmd setKernelBuffer:wdBuf offset:0 atIndex:19];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)bb1Buf offset:0 atIndex:20];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)gly1Buf offset:0 atIndex:21];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)hb1Buf offset:0 atIndex:22];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)hb2Buf offset:0 atIndex:23];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)gly2Buf offset:0 atIndex:24];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)bb2Buf offset:0 atIndex:25];
+            [cmd setKernelBuffer:bondGCBuf offset:0 atIndex:26];
+            [cmd setKernelBuffer:colsBuf offset:0 atIndex:27];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)gate_live[li] offset:0 atIndex:28];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)up_live[li] offset:0 atIndex:29];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)clipScaleBuf offset:0 atIndex:30];
+            NSUInteger tpg = g_ps_needle_paired.maxTotalThreadsPerThreadgroup;
+            if (tpg > 1024) tpg = 1024;
+            [cmd concurrentDispatchThreads:MTLSizeMake(ffnDim*dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+            g_icb_cursor++;
+        }
+
+        // Singles: wq, wk, wv, wo, down
+        void* single_data[] = {wq_data[li], wk_data[li], wv_data[li], wo_data[li], down_data[li]};
+        void* single_scales[] = {wq_scales[li], wk_scales[li], wv_scales[li], wo_scales[li], down_scales[li]};
+        void* single_delta[] = {wq_delta[li], wk_delta[li], wv_delta[li], wo_delta[li], down_delta[li]};
+        void* single_mom[] = {wq_mom[li], wk_mom[li], wv_mom[li], wo_mom[li], down_mom[li]};
+        void* single_vel[] = {wq_vel[li], wk_vel[li], wv_vel[li], wo_vel[li], down_vel[li]};
+        void* single_live[] = {wq_live[li], wk_live[li], wv_live[li], wo_live[li], down_live[li]};
+        void* single_mask[] = {wq_mask[li], wk_mask[li], wv_mask[li], wo_mask[li], down_mask[li]};
+        void* single_grad[] = {b_dWQ[li], b_dWK[li], b_dWV[li], b_dWO[li], b_dWDown[li]};
+        int single_n[] = {dim*dim, kvDim*dim, kvDim*dim, dim*dim, dim*ffnDim};
+        int single_cols[] = {dim, dim, dim, dim, ffnDim};
+
+        for (int s = 0; s < 5; s++) {
+            uint32_t uc = single_cols[s];
+            id<MTLBuffer> colsBuf = const_buf(&uc, 4);
+            id<MTLIndirectComputeCommand> cmd = [g_train_icb indirectComputeCommandAtIndex:g_icb_cursor];
+            [cmd setComputePipelineState:g_ps_needle];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)single_data[s] offset:0 atIndex:0];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)single_scales[s] offset:0 atIndex:1];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)single_grad[s] offset:0 atIndex:2];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)single_mom[s] offset:0 atIndex:3];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)single_vel[s] offset:0 atIndex:4];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)single_mask[s] offset:0 atIndex:5];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)single_delta[s] offset:0 atIndex:6];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)lrBuf offset:0 atIndex:7];
+            [cmd setKernelBuffer:beta1Buf offset:0 atIndex:8];
+            [cmd setKernelBuffer:beta2Buf offset:0 atIndex:9];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)bc1Buf offset:0 atIndex:10];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)bc2Buf offset:0 atIndex:11];
+            [cmd setKernelBuffer:epsNBuf offset:0 atIndex:12];
+            [cmd setKernelBuffer:wdBuf offset:0 atIndex:13];
+            [cmd setKernelBuffer:colsBuf offset:0 atIndex:14];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)single_live[s] offset:0 atIndex:15];
+            [cmd setKernelBuffer:(__bridge id<MTLBuffer>)clipScaleBuf offset:0 atIndex:16];
+            NSUInteger tpg = g_ps_needle.maxTotalThreadsPerThreadgroup;
+            if (tpg > 1024) tpg = 1024;
+            [cmd concurrentDispatchThreads:MTLSizeMake(single_n[s], 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+            g_icb_cursor++;
+        }
+    }
+
+    // Embed needle
+    {
+        uint32_t uc = dim;
+        id<MTLBuffer> colsBuf = const_buf(&uc, 4);
+        id<MTLIndirectComputeCommand> cmd = [g_train_icb indirectComputeCommandAtIndex:g_icb_cursor];
+        [cmd setComputePipelineState:g_ps_needle];
+        [cmd setKernelBuffer:(__bridge id<MTLBuffer>)embedData offset:0 atIndex:0];
+        [cmd setKernelBuffer:(__bridge id<MTLBuffer>)embedScales offset:0 atIndex:1];
+        [cmd setKernelBuffer:(__bridge id<MTLBuffer>)dEmbed offset:0 atIndex:2];
+        [cmd setKernelBuffer:(__bridge id<MTLBuffer>)embedMom offset:0 atIndex:3];
+        [cmd setKernelBuffer:(__bridge id<MTLBuffer>)embedVel offset:0 atIndex:4];
+        [cmd setKernelBuffer:(__bridge id<MTLBuffer>)embedMask offset:0 atIndex:5];
+        [cmd setKernelBuffer:(__bridge id<MTLBuffer>)embedDelta offset:0 atIndex:6];
+        [cmd setKernelBuffer:(__bridge id<MTLBuffer>)lrBuf offset:0 atIndex:7];
+        [cmd setKernelBuffer:beta1Buf offset:0 atIndex:8];
+        [cmd setKernelBuffer:beta2Buf offset:0 atIndex:9];
+        [cmd setKernelBuffer:(__bridge id<MTLBuffer>)bc1Buf offset:0 atIndex:10];
+        [cmd setKernelBuffer:(__bridge id<MTLBuffer>)bc2Buf offset:0 atIndex:11];
+        [cmd setKernelBuffer:epsNBuf offset:0 atIndex:12];
+        [cmd setKernelBuffer:wdBuf offset:0 atIndex:13];
+        [cmd setKernelBuffer:colsBuf offset:0 atIndex:14];
+        [cmd setKernelBuffer:(__bridge id<MTLBuffer>)embedLive offset:0 atIndex:15];
+        [cmd setKernelBuffer:(__bridge id<MTLBuffer>)clipScaleBuf offset:0 atIndex:16];
+        NSUInteger tpg = g_ps_needle.maxTotalThreadsPerThreadgroup;
+        if (tpg > 1024) tpg = 1024;
+        [cmd concurrentDispatchThreads:MTLSizeMake(vocabSize*dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+        g_icb_cursor++;
+    }
+
+    g_train_icb_total_count = g_icb_cursor;
+    NSLog(@"ICB training: %d commands (%d fwd, %d bwd+opt)", g_train_icb_total_count, g_train_icb_fwd_count, g_train_icb_total_count - g_train_icb_fwd_count);
+    return g_train_icb_fwd_count;
+}
+
+// Execute the forward-only portion (step 1 noop).
+void mtl_icb_execute_fwd(void) {
+    // Zero loss scalar before execute
+    float zero = 0.0f;
+    // (caller must zero lmLoss before calling)
+    id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    [enc executeCommandsInBuffer:g_train_icb withRange:NSMakeRange(0, g_train_icb_fwd_count)];
+    [enc endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+}
+
+// Execute the full training step (forward + backward + needle).
+void mtl_icb_execute_full(void) {
+    id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    [enc executeCommandsInBuffer:g_train_icb withRange:NSMakeRange(0, g_train_icb_total_count)];
+    [enc endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+}
+
 // Inference compute-shader stubs — satisfy linker.
 // Real implementations will replace these.
 int mtl_fused_build(int dim, int kvDim, int headDim,

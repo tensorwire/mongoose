@@ -116,6 +116,35 @@ void mtl_fused_zero_scalar(void* buf);
 void mtl_fused_barrier_buffers(void);
 void mtl_fused_grad_norm_sq(void* grad, void* sumSq, int n);
 void mtl_fused_compute_clip_scale(void* sumSq, void* clipScale, float maxNorm);
+
+// ICB training
+int mtl_icb_build_training(
+    int dim, int kvDim, int headDim, int nHeads, int nKVHeads, int ffnDim, int vocabSize, int seqLen, int nLayers,
+    void* hidden, void* normedFinal, void* finalNorm, void* finalScales,
+    void* lmMaxLogit, void* lmSumExp, void* lmLoss, void* targetsGPU,
+    void* dHidden, void* dScratch, void* dEmbed,
+    void* gradSumSq, void* clipScaleBuf, void* scores,
+    void* embed, void* embedData, void* embedScales, void* embedDelta,
+    void* embedMom, void* embedVel, void* embedMask, void* embedLive,
+    void** norm1, void** norm2,
+    void** a_xIn, void** a_normed, void** a_Q, void** a_K, void** a_V, void** a_attnOut,
+    void** a_xMid, void** a_normed2, void** a_gatePre, void** a_upOut, void** a_ffnMid,
+    void** a_rmsScale1, void** a_rmsScale2, void** a_gateAct,
+    void** wq_data, void** wq_scales, void** wq_delta, void** wq_mom, void** wq_vel, void** wq_live, void** wq_mask,
+    void** wk_data, void** wk_scales, void** wk_delta, void** wk_mom, void** wk_vel, void** wk_live, void** wk_mask,
+    void** wv_data, void** wv_scales, void** wv_delta, void** wv_mom, void** wv_vel, void** wv_live, void** wv_mask,
+    void** wo_data, void** wo_scales, void** wo_delta, void** wo_mom, void** wo_vel, void** wo_live, void** wo_mask,
+    void** gate_data, void** gate_scales, void** gate_delta, void** gate_mom, void** gate_vel, void** gate_live, void** gate_mask,
+    void** up_data, void** up_scales, void** up_delta, void** up_mom, void** up_vel, void** up_live, void** up_mask,
+    void** down_data, void** down_scales, void** down_delta, void** down_mom, void** down_vel, void** down_live, void** down_mask,
+    void** b_dFfnMid, void** b_dGate, void** b_dUp, void** b_dN2, void** b_dx,
+    void** b_dAttnOut, void** b_dQ, void** b_dK, void** b_dV, void** b_dN1,
+    void** b_dWDown, void** b_dWGate, void** b_dWUp, void** b_dWO, void** b_dWQ, void** b_dWK, void** b_dWV,
+    void* lrBuf, void* bc1Buf, void* bc2Buf, void* maxNormBuf,
+    void* bb1Buf, void* gly1Buf, void* hb1Buf, void* hb2Buf, void* gly2Buf, void* bb2Buf, void* bondStrBuf
+);
+void mtl_icb_execute_fwd(void);
+void mtl_icb_execute_full(void);
 void mtl_fused_grad_clip_scale(void* grad, void* sumSq, float maxNorm, int n);
 void mtl_fused_commit_slot(int slot);
 void mtl_fused_wait_slot(int slot);
@@ -688,6 +717,142 @@ func (m *Metal) FusedWait()                  { C.mtl_fused_wait() }
 
 func (m *Metal) FusedGradNormSq(grad, sumSq *Tensor, n int) {
 	C.mtl_fused_grad_norm_sq(MtlBufPtr(grad), MtlBufPtr(sumSq), C.int(n))
+}
+
+func (m *Metal) ICBExecuteFwd()  { C.mtl_icb_execute_fwd() }
+func (m *Metal) ICBExecuteFull() { C.mtl_icb_execute_full() }
+
+type ICBLayerActs struct {
+	XIn, Normed, Q, K, V, AttnOut           *Tensor
+	XMid, Normed2, GatePre, UpOut, FfnMid   *Tensor
+	RmsScale1, RmsScale2, GateAct           *Tensor
+}
+
+type ICBLayerInt8 struct {
+	Data, Scales, Delta, Mom, Vel, Live *Tensor
+	Mask                                *HotRowMask
+}
+
+type ICBLayerBwd struct {
+	DFfnMid, DGate, DUp, DN2, Dx        *Tensor
+	DAttnOut, DQ, DK, DV, DN1           *Tensor
+	DWDown, DWGate, DWUp, DWO, DWQ, DWK, DWV *Tensor
+}
+
+type ICBLayerWeights struct {
+	WQ, WK, WV, WO, Gate, Up, Down ICBLayerInt8
+	Norm1, Norm2                    *Tensor
+}
+
+func (m *Metal) ICBBuildTraining(
+	dim, kvDim, headDim, nHeads, nKVHeads, ffnDim, vocabSize, seqLen, nLayers int,
+	hidden, normedFinal, finalNorm, finalScales *Tensor,
+	lmMaxLogit, lmSumExp, lmLoss, targetsGPU *Tensor,
+	dHidden, dScratch, dEmbed *Tensor,
+	gradSumSq, clipScaleBuf, scores *Tensor,
+	embed *Tensor,
+	embedInt8 ICBLayerInt8,
+	acts []ICBLayerActs,
+	weights []ICBLayerWeights,
+	bwds []ICBLayerBwd,
+	lrBuf, bc1Buf, bc2Buf, maxNormBuf *Tensor,
+	bb1Buf, gly1Buf, hb1Buf, hb2Buf, gly2Buf, bb2Buf, bondStrBuf *Tensor,
+) int {
+	nL := nLayers
+	mkArr := func(tensors []*Tensor) *unsafe.Pointer {
+		arr := make([]unsafe.Pointer, len(tensors))
+		for i, t := range tensors { arr[i] = MtlBufPtr(t) }
+		return &arr[0]
+	}
+	mkMaskArr := func(masks []*HotRowMask) *unsafe.Pointer {
+		arr := make([]unsafe.Pointer, len(masks))
+		for i, m := range masks { arr[i] = m.BufPtr() }
+		return &arr[0]
+	}
+
+	// Collect per-layer arrays
+	norm1s := make([]*Tensor, nL); norm2s := make([]*Tensor, nL)
+	aXIn := make([]*Tensor, nL); aNormed := make([]*Tensor, nL)
+	aQ := make([]*Tensor, nL); aK := make([]*Tensor, nL); aV := make([]*Tensor, nL)
+	aAttnOut := make([]*Tensor, nL); aXMid := make([]*Tensor, nL)
+	aNormed2 := make([]*Tensor, nL); aGatePre := make([]*Tensor, nL)
+	aUpOut := make([]*Tensor, nL); aFfnMid := make([]*Tensor, nL)
+	aRmsScale1 := make([]*Tensor, nL); aRmsScale2 := make([]*Tensor, nL)
+	aGateAct := make([]*Tensor, nL)
+
+	wqD := make([]*Tensor, nL); wqS := make([]*Tensor, nL); wqDl := make([]*Tensor, nL)
+	wqM := make([]*Tensor, nL); wqV := make([]*Tensor, nL); wqL := make([]*Tensor, nL); wqMk := make([]*HotRowMask, nL)
+	wkD := make([]*Tensor, nL); wkS := make([]*Tensor, nL); wkDl := make([]*Tensor, nL)
+	wkM := make([]*Tensor, nL); wkV := make([]*Tensor, nL); wkL := make([]*Tensor, nL); wkMk := make([]*HotRowMask, nL)
+	wvD := make([]*Tensor, nL); wvS := make([]*Tensor, nL); wvDl := make([]*Tensor, nL)
+	wvM := make([]*Tensor, nL); wvV := make([]*Tensor, nL); wvL := make([]*Tensor, nL); wvMk := make([]*HotRowMask, nL)
+	woD := make([]*Tensor, nL); woS := make([]*Tensor, nL); woDl := make([]*Tensor, nL)
+	woM := make([]*Tensor, nL); woV := make([]*Tensor, nL); woL := make([]*Tensor, nL); woMk := make([]*HotRowMask, nL)
+	gD := make([]*Tensor, nL); gS := make([]*Tensor, nL); gDl := make([]*Tensor, nL)
+	gM := make([]*Tensor, nL); gV := make([]*Tensor, nL); gL := make([]*Tensor, nL); gMk := make([]*HotRowMask, nL)
+	uD := make([]*Tensor, nL); uS := make([]*Tensor, nL); uDl := make([]*Tensor, nL)
+	uM := make([]*Tensor, nL); uV := make([]*Tensor, nL); uL := make([]*Tensor, nL); uMk := make([]*HotRowMask, nL)
+	dD := make([]*Tensor, nL); dS := make([]*Tensor, nL); dDl := make([]*Tensor, nL)
+	dM := make([]*Tensor, nL); dV2 := make([]*Tensor, nL); dL := make([]*Tensor, nL); dMk := make([]*HotRowMask, nL)
+
+	bDFfn := make([]*Tensor, nL); bDGate := make([]*Tensor, nL); bDUp := make([]*Tensor, nL)
+	bDN2 := make([]*Tensor, nL); bDx := make([]*Tensor, nL); bDAttn := make([]*Tensor, nL)
+	bDQ := make([]*Tensor, nL); bDK := make([]*Tensor, nL); bDV := make([]*Tensor, nL)
+	bDN1 := make([]*Tensor, nL); bDWD := make([]*Tensor, nL); bDWG := make([]*Tensor, nL)
+	bDWU := make([]*Tensor, nL); bDWO := make([]*Tensor, nL); bDWQ := make([]*Tensor, nL)
+	bDWK := make([]*Tensor, nL); bDWV := make([]*Tensor, nL)
+
+	for i := 0; i < nL; i++ {
+		norm1s[i] = weights[i].Norm1; norm2s[i] = weights[i].Norm2
+		a := acts[i]
+		aXIn[i] = a.XIn; aNormed[i] = a.Normed; aQ[i] = a.Q; aK[i] = a.K; aV[i] = a.V
+		aAttnOut[i] = a.AttnOut; aXMid[i] = a.XMid; aNormed2[i] = a.Normed2
+		aGatePre[i] = a.GatePre; aUpOut[i] = a.UpOut; aFfnMid[i] = a.FfnMid
+		aRmsScale1[i] = a.RmsScale1; aRmsScale2[i] = a.RmsScale2; aGateAct[i] = a.GateAct
+
+		w := weights[i]
+		wqD[i]=w.WQ.Data; wqS[i]=w.WQ.Scales; wqDl[i]=w.WQ.Delta; wqM[i]=w.WQ.Mom; wqV[i]=w.WQ.Vel; wqL[i]=w.WQ.Live; wqMk[i]=w.WQ.Mask
+		wkD[i]=w.WK.Data; wkS[i]=w.WK.Scales; wkDl[i]=w.WK.Delta; wkM[i]=w.WK.Mom; wkV[i]=w.WK.Vel; wkL[i]=w.WK.Live; wkMk[i]=w.WK.Mask
+		wvD[i]=w.WV.Data; wvS[i]=w.WV.Scales; wvDl[i]=w.WV.Delta; wvM[i]=w.WV.Mom; wvV[i]=w.WV.Vel; wvL[i]=w.WV.Live; wvMk[i]=w.WV.Mask
+		woD[i]=w.WO.Data; woS[i]=w.WO.Scales; woDl[i]=w.WO.Delta; woM[i]=w.WO.Mom; woV[i]=w.WO.Vel; woL[i]=w.WO.Live; woMk[i]=w.WO.Mask
+		gD[i]=w.Gate.Data; gS[i]=w.Gate.Scales; gDl[i]=w.Gate.Delta; gM[i]=w.Gate.Mom; gV[i]=w.Gate.Vel; gL[i]=w.Gate.Live; gMk[i]=w.Gate.Mask
+		uD[i]=w.Up.Data; uS[i]=w.Up.Scales; uDl[i]=w.Up.Delta; uM[i]=w.Up.Mom; uV[i]=w.Up.Vel; uL[i]=w.Up.Live; uMk[i]=w.Up.Mask
+		dD[i]=w.Down.Data; dS[i]=w.Down.Scales; dDl[i]=w.Down.Delta; dM[i]=w.Down.Mom; dV2[i]=w.Down.Vel; dL[i]=w.Down.Live; dMk[i]=w.Down.Mask
+
+		b := bwds[i]
+		bDFfn[i]=b.DFfnMid; bDGate[i]=b.DGate; bDUp[i]=b.DUp; bDN2[i]=b.DN2; bDx[i]=b.Dx
+		bDAttn[i]=b.DAttnOut; bDQ[i]=b.DQ; bDK[i]=b.DK; bDV[i]=b.DV; bDN1[i]=b.DN1
+		bDWD[i]=b.DWDown; bDWG[i]=b.DWGate; bDWU[i]=b.DWUp; bDWO[i]=b.DWO
+		bDWQ[i]=b.DWQ; bDWK[i]=b.DWK; bDWV[i]=b.DWV
+	}
+
+	return int(C.mtl_icb_build_training(
+		C.int(dim), C.int(kvDim), C.int(headDim), C.int(nHeads), C.int(nKVHeads),
+		C.int(ffnDim), C.int(vocabSize), C.int(seqLen), C.int(nLayers),
+		MtlBufPtr(hidden), MtlBufPtr(normedFinal), MtlBufPtr(finalNorm), MtlBufPtr(finalScales),
+		MtlBufPtr(lmMaxLogit), MtlBufPtr(lmSumExp), MtlBufPtr(lmLoss), MtlBufPtr(targetsGPU),
+		MtlBufPtr(dHidden), MtlBufPtr(dScratch), MtlBufPtr(dEmbed),
+		MtlBufPtr(gradSumSq), MtlBufPtr(clipScaleBuf), MtlBufPtr(scores),
+		MtlBufPtr(embed), MtlBufPtr(embedInt8.Data), MtlBufPtr(embedInt8.Scales), MtlBufPtr(embedInt8.Delta),
+		MtlBufPtr(embedInt8.Mom), MtlBufPtr(embedInt8.Vel), embedInt8.Mask.BufPtr(), MtlBufPtr(embedInt8.Live),
+		mkArr(norm1s), mkArr(norm2s),
+		mkArr(aXIn), mkArr(aNormed), mkArr(aQ), mkArr(aK), mkArr(aV), mkArr(aAttnOut),
+		mkArr(aXMid), mkArr(aNormed2), mkArr(aGatePre), mkArr(aUpOut), mkArr(aFfnMid),
+		mkArr(aRmsScale1), mkArr(aRmsScale2), mkArr(aGateAct),
+		mkArr(wqD), mkArr(wqS), mkArr(wqDl), mkArr(wqM), mkArr(wqV), mkArr(wqL), mkMaskArr(wqMk),
+		mkArr(wkD), mkArr(wkS), mkArr(wkDl), mkArr(wkM), mkArr(wkV), mkArr(wkL), mkMaskArr(wkMk),
+		mkArr(wvD), mkArr(wvS), mkArr(wvDl), mkArr(wvM), mkArr(wvV), mkArr(wvL), mkMaskArr(wvMk),
+		mkArr(woD), mkArr(woS), mkArr(woDl), mkArr(woM), mkArr(woV), mkArr(woL), mkMaskArr(woMk),
+		mkArr(gD), mkArr(gS), mkArr(gDl), mkArr(gM), mkArr(gV), mkArr(gL), mkMaskArr(gMk),
+		mkArr(uD), mkArr(uS), mkArr(uDl), mkArr(uM), mkArr(uV), mkArr(uL), mkMaskArr(uMk),
+		mkArr(dD), mkArr(dS), mkArr(dDl), mkArr(dM), mkArr(dV2), mkArr(dL), mkMaskArr(dMk),
+		mkArr(bDFfn), mkArr(bDGate), mkArr(bDUp), mkArr(bDN2), mkArr(bDx),
+		mkArr(bDAttn), mkArr(bDQ), mkArr(bDK), mkArr(bDV), mkArr(bDN1),
+		mkArr(bDWD), mkArr(bDWG), mkArr(bDWU), mkArr(bDWO), mkArr(bDWQ), mkArr(bDWK), mkArr(bDWV),
+		MtlBufPtr(lrBuf), MtlBufPtr(bc1Buf), MtlBufPtr(bc2Buf), MtlBufPtr(maxNormBuf),
+		MtlBufPtr(bb1Buf), MtlBufPtr(gly1Buf), MtlBufPtr(hb1Buf), MtlBufPtr(hb2Buf),
+		MtlBufPtr(gly2Buf), MtlBufPtr(bb2Buf), MtlBufPtr(bondStrBuf),
+	))
 }
 
 func (m *Metal) FusedComputeClipScale(sumSq, clipScale *Tensor, maxNorm float32) {
