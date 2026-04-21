@@ -1345,6 +1345,17 @@ static NSString* const g_kernel_source = @"\n"
 "    grad[id] *= scale;\n"
 "}\n"
 "\n"
+"// Compute clip scale: out[0] = min(1, maxNorm / sqrt(sumSq[0])).\n"
+"kernel void compute_clip_scale(\n"
+"    device const float* sumSq   [[buffer(0)]],\n"
+"    device float* clipScale     [[buffer(1)]],\n"
+"    constant float& maxNorm     [[buffer(2)]],\n"
+"    uint id [[thread_position_in_grid]])\n"
+"{\n"
+"    float norm = sqrt(sumSq[0]);\n"
+"    clipScale[0] = (norm > maxNorm) ? (maxNorm / norm) : 1.0f;\n"
+"}\n"
+"\n"
 "// Memory copy — compute kernel for use within a fused encoder.\n"
 "kernel void copy_mem(\n"
 "    device const float* src [[buffer(0)]],\n"
@@ -1963,14 +1974,16 @@ static NSString* const g_kernel_source = @"\n"
 "// Metal note: no native half on older devices, but Apple Silicon\n"
 "// has full FP16 support. We use half for momentum/velocity.\n"
 "\n"
+"// Fused: grad clip + Adam + requant + FP32 live writeback.\n"
+"// clipScale = min(1, maxNorm/sqrt(gradNormSq)) precomputed on CPU.\n"
 "kernel void helix_needle(\n"
-"    device char* data_int8        [[buffer(0)]],  // [n] INT8 weights\n"
-"    device float* scales          [[buffer(1)]],  // [nRows] per-row absmax scales\n"
-"    device const float* grad      [[buffer(2)]],  // [n] FP32 gradient\n"
-"    device half* mom              [[buffer(3)]],  // [n] FP16 momentum\n"
-"    device half* vel              [[buffer(4)]],  // [n] FP16 velocity\n"
-"    device const char* mask       [[buffer(5)]],  // [n] 0=frozen, 1=active\n"
-"    device float* delta           [[buffer(6)]],  // [n] FP32 delta residual\n"
+"    device char* data_int8        [[buffer(0)]],\n"
+"    device float* scales          [[buffer(1)]],\n"
+"    device const float* grad      [[buffer(2)]],\n"
+"    device half* mom              [[buffer(3)]],\n"
+"    device half* vel              [[buffer(4)]],\n"
+"    device const char* mask       [[buffer(5)]],\n"
+"    device float* delta           [[buffer(6)]],\n"
 "    constant float& lr           [[buffer(7)]],\n"
 "    constant float& beta1        [[buffer(8)]],\n"
 "    constant float& beta2        [[buffer(9)]],\n"
@@ -1979,48 +1992,36 @@ static NSString* const g_kernel_source = @"\n"
 "    constant float& eps          [[buffer(12)]],\n"
 "    constant float& wd           [[buffer(13)]],\n"
 "    constant uint& cols          [[buffer(14)]],\n"
+"    device float* live            [[buffer(15)]],\n"
+"    constant float& clipScale    [[buffer(16)]],\n"
 "    uint i [[thread_position_in_grid]])\n"
 "{\n"
 "    uint row = i / cols;\n"
 "    if (mask[row] == 0) return;\n"
 "\n"
 "    float scale = scales[row] / 127.0f;\n"
-"\n"
-"    // Effective weight = INT8 * scale + delta\n"
 "    float w = float(data_int8[i]) * scale + delta[i];\n"
-"\n"
-"    // Read momentum/velocity from FP16\n"
 "    float mi = float(mom[i]);\n"
 "    float vi = float(vel[i]);\n"
 "\n"
-"    // Adam update\n"
-"    float g = grad[i];\n"
+"    float g = grad[i] * clipScale;\n"
 "    float ob1 = 1.0f - beta1, ob2 = 1.0f - beta2;\n"
 "    mi = beta1 * mi + ob1 * g;\n"
 "    vi = beta2 * vi + ob2 * g * g;\n"
-"    float mhat = mi / bc1;\n"
-"    float vhat = vi / bc2;\n"
-"    w -= lr * (mhat / (sqrt(vhat) + eps) + wd * w);\n"
+"    w -= lr * (mi / bc1 / (sqrt(vi / bc2) + eps) + wd * w);\n"
 "\n"
-"    // Write back FP16 momentum/velocity\n"
 "    mom[i] = half(mi);\n"
 "    vel[i] = half(vi);\n"
 "\n"
-"    // Delta residual: compute what INT8 can represent vs what we want\n"
 "    float inv_scale = 127.0f / (scales[row] + 1e-10f);\n"
-"    float qi = w * inv_scale;\n"
-"    qi = clamp(qi, -127.0f, 127.0f);\n"
+"    float qi = clamp(w * inv_scale, -127.0f, 127.0f);\n"
 "    char q_int8 = char(rint(qi));\n"
-"    float w_quantized = float(q_int8) * scale;\n"
-"    delta[i] = w - w_quantized;  // sub-quant-level precision lives here\n"
+"    delta[i] = w - float(q_int8) * scale;\n"
 "    data_int8[i] = q_int8;\n"
-"\n"
-"    // Scale update deferred — delta residual handles sub-quant precision.\n"
-"    // Periodic scale refresh done on CPU between steps if needed.\n"
+"    live[i] = float(q_int8) * scale + delta[i];\n"
 "}\n"
 "\n"
-"// Paired-strand needle: DNA rung coupling for wq↔wk (AT), gate↔up (GC).\n"
-"// Both strands updated in one kernel — cross-gradient coupling through H-bonds.\n"
+"// Paired fused: clip + DNA rung + requant + FP32 live writeback.\n"
 "kernel void helix_needle_paired(\n"
 "    device char* d1_int8          [[buffer(0)]],\n"
 "    device char* d2_int8          [[buffer(1)]],\n"
@@ -2033,8 +2034,8 @@ static NSString* const g_kernel_source = @"\n"
 "    device half* v1               [[buffer(8)]],\n"
 "    device half* v2               [[buffer(9)]],\n"
 "    device const char* mask       [[buffer(10)]],\n"
-"    device float* delta1          [[buffer(11)]],  // FP32 delta residual strand 1\n"
-"    device float* delta2          [[buffer(12)]],  // FP32 delta residual strand 2\n"
+"    device float* delta1          [[buffer(11)]],\n"
+"    device float* delta2          [[buffer(12)]],\n"
 "    constant float& lr           [[buffer(13)]],\n"
 "    constant float& beta1        [[buffer(14)]],\n"
 "    constant float& beta2        [[buffer(15)]],\n"
@@ -2050,6 +2051,9 @@ static NSString* const g_kernel_source = @"\n"
 "    constant float& backbone2    [[buffer(25)]],\n"
 "    constant float& bondStrength [[buffer(26)]],\n"
 "    constant uint& cols          [[buffer(27)]],\n"
+"    device float* live1           [[buffer(28)]],\n"
+"    device float* live2           [[buffer(29)]],\n"
+"    constant float& clipScale    [[buffer(30)]],\n"
 "    uint i [[thread_position_in_grid]])\n"
 "{\n"
 "    uint row = i / cols;\n"
@@ -2057,27 +2061,21 @@ static NSString* const g_kernel_source = @"\n"
 "\n"
 "    float scale1 = s1[row] / 127.0f;\n"
 "    float scale2 = s2[row] / 127.0f;\n"
-"\n"
-"    // Effective weight = INT8 * scale + delta\n"
 "    float w1 = float(d1_int8[i]) * scale1 + delta1[i];\n"
 "    float w2 = float(d2_int8[i]) * scale2 + delta2[i];\n"
-"\n"
 "    float mi1 = float(m1[i]), vi1 = float(v1[i]);\n"
 "    float mi2 = float(m2[i]), vi2 = float(v2[i]);\n"
-"\n"
 "    float ob1 = 1.0f - beta1, ob2 = 1.0f - beta2;\n"
 "\n"
-"    // Strand 1: signal + cross-coupling from strand 2\n"
-"    float signal1 = g1[i] * glyco1;\n"
-"    float crossMom = g2[i] * hbond1 * bondStrength;\n"
+"    float signal1 = g1[i] * clipScale * glyco1;\n"
+"    float crossMom = g2[i] * clipScale * hbond1 * bondStrength;\n"
 "    float effGrad1 = signal1 + crossMom;\n"
 "    mi1 = beta1 * mi1 + ob1 * effGrad1;\n"
 "    vi1 = beta2 * vi1 + ob2 * effGrad1 * effGrad1;\n"
 "    w1 -= lr * (mi1 / bc1 / (sqrt(vi1 / bc2) + eps) + wd * backbone1 * w1);\n"
 "\n"
-"    // Strand 2: signal + cross-coupling from strand 1\n"
-"    float signal2 = g2[i] * glyco2;\n"
-"    float crossVel = g1[i] * hbond2 * bondStrength;\n"
+"    float signal2 = g2[i] * clipScale * glyco2;\n"
+"    float crossVel = g1[i] * clipScale * hbond2 * bondStrength;\n"
 "    float effGrad2 = signal2 + crossVel;\n"
 "    mi2 = beta1 * mi2 + ob1 * effGrad2;\n"
 "    vi2 = beta2 * vi2 + ob2 * effGrad2 * effGrad2;\n"
@@ -2086,17 +2084,15 @@ static NSString* const g_kernel_source = @"\n"
 "    m1[i] = half(mi1); v1[i] = half(vi1);\n"
 "    m2[i] = half(mi2); v2[i] = half(vi2);\n"
 "\n"
-"    // Delta residual + requant for both strands\n"
 "    float inv1 = 127.0f / (s1[row] + 1e-10f);\n"
 "    float inv2 = 127.0f / (s2[row] + 1e-10f);\n"
-"    float q1 = clamp(w1 * inv1, -127.0f, 127.0f);\n"
-"    float q2 = clamp(w2 * inv2, -127.0f, 127.0f);\n"
-"    char qi1 = char(rint(q1)), qi2 = char(rint(q2));\n"
+"    char qi1 = char(rint(clamp(w1 * inv1, -127.0f, 127.0f)));\n"
+"    char qi2 = char(rint(clamp(w2 * inv2, -127.0f, 127.0f)));\n"
 "    delta1[i] = w1 - float(qi1) * scale1;\n"
 "    delta2[i] = w2 - float(qi2) * scale2;\n"
-"    d1_int8[i] = qi1;\n"
-"    d2_int8[i] = qi2;\n"
-"    // Scale update deferred — delta handles sub-quant precision.\n"
+"    d1_int8[i] = qi1; d2_int8[i] = qi2;\n"
+"    live1[i] = float(qi1) * scale1 + delta1[i];\n"
+"    live2[i] = float(qi2) * scale2 + delta2[i];\n"
 "}\n"
 ;
 
@@ -2121,6 +2117,7 @@ static id<MTLComputePipelineState> g_ps_dna_rung = nil;
 static id<MTLComputePipelineState> g_ps_grad_norm = nil;
 static id<MTLComputePipelineState> g_ps_grad_clip = nil;
 static id<MTLComputePipelineState> g_ps_copy_mem = nil;
+static id<MTLComputePipelineState> g_ps_clip_scale_compute = nil;
 static id<MTLComputePipelineState> g_ps_lm_pass1 = nil;
 static id<MTLComputePipelineState> g_ps_lm_pass2 = nil;
 static id<MTLComputePipelineState> g_ps_lm_sparse1 = nil;
@@ -2194,6 +2191,7 @@ int mtl_init_compute(void) {
     g_ps_grad_norm = make_ps(@"grad_norm_sq");
     g_ps_grad_clip = make_ps(@"grad_clip_scale");
     g_ps_copy_mem = make_ps(@"copy_mem");
+    g_ps_clip_scale_compute = make_ps(@"compute_clip_scale");
     g_ps_lm_pass1 = make_ps(@"lm_head_pass1");
     g_ps_lm_pass2 = make_ps(@"lm_head_pass2");
     g_ps_lm_sparse1 = make_ps(@"lm_head_sparse_pass1");
@@ -4114,6 +4112,14 @@ void mtl_fused_grad_norm_sq(void* gradRef, void* sumSqRef, int n) {
     [g_fused_enc[g_active_fused_slot] dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
 }
 
+void mtl_fused_compute_clip_scale(void* sumSqRef, void* clipScaleRef, float maxNorm) {
+    [g_fused_enc[g_active_fused_slot] setComputePipelineState:g_ps_clip_scale_compute];
+    [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)sumSqRef     offset:0 atIndex:0];
+    [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)clipScaleRef offset:0 atIndex:1];
+    [g_fused_enc[g_active_fused_slot] setBytes:&maxNorm length:sizeof(float) atIndex:2];
+    [g_fused_enc[g_active_fused_slot] dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+}
+
 void mtl_fused_grad_clip_scale(void* gradRef, void* sumSqRef, float maxNorm, int n) {
     [g_fused_enc[g_active_fused_slot] setComputePipelineState:g_ps_grad_clip];
     [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)gradRef  offset:0 atIndex:0];
@@ -4249,7 +4255,8 @@ void mtl_fused_needle(
     void* dataRef, void* scalesRef, void* gradRef,
     void* momRef, void* velRef, void* maskRef, void* deltaRef,
     float lr, float beta1, float beta2, float bc1, float bc2,
-    float eps, float wd, int n, int cols) {
+    float eps, float wd, int n, int cols,
+    void* liveRef, float clipScale) {
     id<MTLComputeCommandEncoder> enc = g_fused_enc[g_active_fused_slot];
     [enc setComputePipelineState:g_ps_needle];
     [enc setBuffer:(__bridge id<MTLBuffer>)dataRef   offset:0 atIndex:0];
@@ -4268,6 +4275,8 @@ void mtl_fused_needle(
     [enc setBytes:&wd    length:sizeof(float) atIndex:13];
     uint32_t ucols = (uint32_t)cols;
     [enc setBytes:&ucols length:sizeof(uint32_t) atIndex:14];
+    [enc setBuffer:(__bridge id<MTLBuffer>)liveRef offset:0 atIndex:15];
+    [enc setBytes:&clipScale length:sizeof(float) atIndex:16];
     NSUInteger tpg = g_ps_needle.maxTotalThreadsPerThreadgroup;
     if (tpg > 1024) tpg = 1024;
     [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
@@ -4285,7 +4294,8 @@ void mtl_fused_needle_paired(
     float eps, float wd,
     float backbone1, float glyco1, float hbond1,
     float hbond2, float glyco2, float backbone2,
-    float bondStrength, int n, int cols) {
+    float bondStrength, int n, int cols,
+    void* live1Ref, void* live2Ref, float clipScale) {
     id<MTLComputeCommandEncoder> enc = g_fused_enc[g_active_fused_slot];
     [enc setComputePipelineState:g_ps_needle_paired];
     [enc setBuffer:(__bridge id<MTLBuffer>)d1Ref     offset:0 atIndex:0];
@@ -4317,6 +4327,9 @@ void mtl_fused_needle_paired(
     [enc setBytes:&bondStrength length:sizeof(float) atIndex:26];
     uint32_t ucols = (uint32_t)cols;
     [enc setBytes:&ucols       length:sizeof(uint32_t) atIndex:27];
+    [enc setBuffer:(__bridge id<MTLBuffer>)live1Ref offset:0 atIndex:28];
+    [enc setBuffer:(__bridge id<MTLBuffer>)live2Ref offset:0 atIndex:29];
+    [enc setBytes:&clipScale   length:sizeof(float) atIndex:30];
     NSUInteger tpg = g_ps_needle_paired.maxTotalThreadsPerThreadgroup;
     if (tpg > 1024) tpg = 1024;
     [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
