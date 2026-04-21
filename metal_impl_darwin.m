@@ -2159,7 +2159,10 @@ static id<MTLComputePipelineState> make_ps(NSString* name) {
     NSError* err = nil;
     id<MTLFunction> fn = [g_compute_lib newFunctionWithName:name];
     if (!fn) { NSLog(@"mongoose: kernel %@ not found", name); return nil; }
-    id<MTLComputePipelineState> ps = [g_device newComputePipelineStateWithFunction:fn error:&err];
+    MTLComputePipelineDescriptor* desc = [[MTLComputePipelineDescriptor alloc] init];
+    desc.computeFunction = fn;
+    desc.supportIndirectCommandBuffers = YES;
+    id<MTLComputePipelineState> ps = [g_device newComputePipelineStateWithDescriptor:desc options:0 reflection:nil error:&err];
     if (err) { NSLog(@"mongoose: pipeline %@: %@", name, err); return nil; }
     return ps;
 }
@@ -4409,6 +4412,21 @@ static int g_train_icb_fwd_count = 0;
 static int g_train_icb_total_count = 0;
 static int g_icb_cursor = 0;
 
+// Track all buffers the ICB touches for useResource calls.
+#define ICB_MAX_RESOURCES 1024
+static id<MTLResource> g_icb_resources[ICB_MAX_RESOURCES];
+static int g_icb_resource_count = 0;
+
+static void icb_track_buf(void* ref) {
+    if (!ref || g_icb_resource_count >= ICB_MAX_RESOURCES) return;
+    id<MTLBuffer> buf = (__bridge id<MTLBuffer>)ref;
+    // Deduplicate (simple linear scan — only at init)
+    for (int i = 0; i < g_icb_resource_count; i++) {
+        if (g_icb_resources[i] == buf) return;
+    }
+    g_icb_resources[g_icb_resource_count++] = buf;
+}
+
 // Saved params for batch-encode fallback (Apple7).
 static ICBBuildParams* g_batch_params = nil;
 
@@ -4627,7 +4645,7 @@ int mtl_icb_build_training(ICBBuildParams* p) {
 
     // Allocate ICB
     MTLIndirectCommandBufferDescriptor *desc = [[MTLIndirectCommandBufferDescriptor alloc] init];
-    desc.commandTypes = MTLIndirectCommandTypeConcurrentDispatchThreads | MTLIndirectCommandTypeConcurrentDispatch;
+    desc.commandTypes = MTLIndirectCommandTypeConcurrentDispatchThreads;
     desc.inheritBuffers = NO;
     desc.inheritPipelineState = NO;
     desc.maxKernelBufferBindCount = 31;
@@ -4636,11 +4654,15 @@ int mtl_icb_build_training(ICBBuildParams* p) {
         NSLog(@"ICB allocation failed! device=%@", g_device);
         return -1;
     }
-    NSLog(@"ICB allocated: %lu max commands", (unsigned long)g_train_icb.size);
+    NSLog(@"ICB allocated: %lu max commands, ps_copy_mem=%p supportICB=%d",
+          (unsigned long)g_train_icb.size, g_ps_copy_mem,
+          g_ps_copy_mem ? (int)g_ps_copy_mem.supportIndirectCommandBuffers : -1);
     g_icb_cursor = 0;
 
     // ============ FORWARD ============
+    NSLog(@"ICB: encoding forward, nLayers=%d", nLayers);
     for (int li = 0; li < nLayers; li++) {
+        NSLog(@"ICB: layer %d copy, cursor=%d, a_xIn=%p hidden=%p", li, g_icb_cursor, a_xIn[li], hidden);
         icb_copy(a_xIn[li], hidden, n*dim);
         icb_rmsnorm(hidden, norm1[li], a_rmsScale1[li], dimBuf, epsBuf, n, dim);
         icb_copy(a_normed[li], hidden, n*dim);
@@ -5049,7 +5071,50 @@ int mtl_icb_build_training(ICBBuildParams* p) {
     }
 
     g_train_icb_total_count = g_icb_cursor;
-    NSLog(@"ICB training: %d commands (%d fwd, %d bwd+opt)", g_train_icb_total_count, g_train_icb_fwd_count, g_train_icb_total_count - g_train_icb_fwd_count);
+
+    // Track all buffers for useResource calls
+    g_icb_resource_count = 0;
+    icb_track_buf(hidden); icb_track_buf(normedFinal); icb_track_buf(finalNorm); icb_track_buf(finalScales);
+    icb_track_buf(lmMaxLogit); icb_track_buf(lmSumExp); icb_track_buf(lmLoss); icb_track_buf(targetsGPU);
+    icb_track_buf(dHidden); icb_track_buf(dScratch); icb_track_buf(dEmbed);
+    icb_track_buf(gradSumSq); icb_track_buf(clipScaleBuf); icb_track_buf(scores);
+    icb_track_buf(embed); icb_track_buf(embedData); icb_track_buf(embedScales); icb_track_buf(embedDelta);
+    icb_track_buf(embedMom); icb_track_buf(embedVel); icb_track_buf(embedMask); icb_track_buf(embedLive);
+    icb_track_buf(lrBuf); icb_track_buf(bc1Buf); icb_track_buf(bc2Buf); icb_track_buf(maxNormBuf);
+    icb_track_buf(bb1Buf); icb_track_buf(gly1Buf); icb_track_buf(hb1Buf);
+    icb_track_buf(hb2Buf); icb_track_buf(gly2Buf); icb_track_buf(bb2Buf); icb_track_buf(bondStrBuf);
+    for (int li = 0; li < nLayers; li++) {
+        icb_track_buf(norm1[li]); icb_track_buf(norm2[li]);
+        icb_track_buf(a_xIn[li]); icb_track_buf(a_normed[li]); icb_track_buf(a_Q[li]); icb_track_buf(a_K[li]);
+        icb_track_buf(a_V[li]); icb_track_buf(a_attnOut[li]); icb_track_buf(a_xMid[li]); icb_track_buf(a_normed2[li]);
+        icb_track_buf(a_gatePre[li]); icb_track_buf(a_upOut[li]); icb_track_buf(a_ffnMid[li]);
+        icb_track_buf(a_rmsScale1[li]); icb_track_buf(a_rmsScale2[li]); icb_track_buf(a_gateAct[li]);
+        icb_track_buf(wq_data[li]); icb_track_buf(wq_scales[li]); icb_track_buf(wq_delta[li]);
+        icb_track_buf(wq_mom[li]); icb_track_buf(wq_vel[li]); icb_track_buf(wq_live[li]); icb_track_buf(wq_mask[li]);
+        icb_track_buf(wk_data[li]); icb_track_buf(wk_scales[li]); icb_track_buf(wk_delta[li]);
+        icb_track_buf(wk_mom[li]); icb_track_buf(wk_vel[li]); icb_track_buf(wk_live[li]); icb_track_buf(wk_mask[li]);
+        icb_track_buf(wv_data[li]); icb_track_buf(wv_scales[li]); icb_track_buf(wv_delta[li]);
+        icb_track_buf(wv_mom[li]); icb_track_buf(wv_vel[li]); icb_track_buf(wv_live[li]); icb_track_buf(wv_mask[li]);
+        icb_track_buf(wo_data[li]); icb_track_buf(wo_scales[li]); icb_track_buf(wo_delta[li]);
+        icb_track_buf(wo_mom[li]); icb_track_buf(wo_vel[li]); icb_track_buf(wo_live[li]); icb_track_buf(wo_mask[li]);
+        icb_track_buf(gate_data[li]); icb_track_buf(gate_scales[li]); icb_track_buf(gate_delta[li]);
+        icb_track_buf(gate_mom[li]); icb_track_buf(gate_vel[li]); icb_track_buf(gate_live[li]); icb_track_buf(gate_mask[li]);
+        icb_track_buf(up_data[li]); icb_track_buf(up_scales[li]); icb_track_buf(up_delta[li]);
+        icb_track_buf(up_mom[li]); icb_track_buf(up_vel[li]); icb_track_buf(up_live[li]); icb_track_buf(up_mask[li]);
+        icb_track_buf(down_data[li]); icb_track_buf(down_scales[li]); icb_track_buf(down_delta[li]);
+        icb_track_buf(down_mom[li]); icb_track_buf(down_vel[li]); icb_track_buf(down_live[li]); icb_track_buf(down_mask[li]);
+        icb_track_buf(b_dFfnMid[li]); icb_track_buf(b_dGate[li]); icb_track_buf(b_dUp[li]);
+        icb_track_buf(b_dN2[li]); icb_track_buf(b_dx[li]); icb_track_buf(b_dAttnOut[li]);
+        icb_track_buf(b_dQ[li]); icb_track_buf(b_dK[li]); icb_track_buf(b_dV[li]); icb_track_buf(b_dN1[li]);
+        icb_track_buf(b_dWDown[li]); icb_track_buf(b_dWGate[li]); icb_track_buf(b_dWUp[li]);
+        icb_track_buf(b_dWO[li]); icb_track_buf(b_dWQ[li]); icb_track_buf(b_dWK[li]); icb_track_buf(b_dWV[li]);
+    }
+    // Also track all cached constant buffers
+    for (int i = 0; i < g_const_cache_count; i++) {
+        if (g_icb_resource_count < ICB_MAX_RESOURCES)
+            g_icb_resources[g_icb_resource_count++] = g_const_cache[i].buf;
+    }
+    NSLog(@"ICB training: %d commands (%d fwd, %d bwd+opt), %d resources", g_train_icb_total_count, g_train_icb_fwd_count, g_train_icb_total_count - g_train_icb_fwd_count, g_icb_resource_count);
     return g_train_icb_fwd_count;
 }
 
@@ -5058,6 +5123,8 @@ void mtl_icb_execute_fwd(void) {
     if (g_use_icb) {
         id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        for (int i = 0; i < g_icb_resource_count; i++)
+            [enc useResource:g_icb_resources[i] usage:MTLResourceUsageRead | MTLResourceUsageWrite];
         [enc executeCommandsInBuffer:g_train_icb withRange:NSMakeRange(0, g_train_icb_fwd_count)];
         [enc endEncoding];
         [cmd commit];
@@ -5074,6 +5141,8 @@ void mtl_icb_execute_full(void) {
     if (g_use_icb) {
         id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        for (int i = 0; i < g_icb_resource_count; i++)
+            [enc useResource:g_icb_resources[i] usage:MTLResourceUsageRead | MTLResourceUsageWrite];
         [enc executeCommandsInBuffer:g_train_icb withRange:NSMakeRange(0, g_train_icb_total_count)];
         [enc endEncoding];
         [cmd commit];
