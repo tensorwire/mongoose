@@ -5261,8 +5261,11 @@ static void batch_encode_fwd(ICBBuildParams* p) {
     int dim=p->dim, kvDim=p->kvDim, headDim=p->headDim, nHeads=p->nHeads;
     int nKVHeads=p->nKVHeads, ffnDim=p->ffnDim, vocabSize=p->vocabSize, n=p->seqLen, nLayers=p->nLayers;
 
+    // Fused kernels win at dim<512 (dispatch-bound). Tiled GEMMs win at dim>=512 (compute-bound).
+    bool use_fused_fwd = g_use_fused_train && (dim < 512);
+
     for (int li = 0; li < nLayers; li++) {
-        if (g_use_fused_train) {
+        if (use_fused_fwd) {
             // 3 dispatches per layer instead of ~22
             mtl_fused_pre_attn(p->hidden, p->norm1[li], p->wq_live[li], p->wk_live[li], p->wv_live[li],
                               p->a_Q[li], p->a_K[li], p->a_V[li], p->a_normed[li], p->a_rmsScale1[li], p->a_xIn[li],
