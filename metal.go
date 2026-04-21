@@ -151,6 +151,9 @@ void mtl_fused_commit_slot(int slot);
 void mtl_fused_wait_slot(int slot);
 void mtl_fused_dequant_delta(void* src, void* scales, void* delta, void* dst, int n, int cols);
 void mtl_fused_dequant_delta_sparse(void* src, void* scales, void* delta, void* dst, void* mask, int n, int cols);
+void mtl_fused_pre_attn(void* hidden, void* normW, void* wq, void* wk, void* wv, void* Q, void* K, void* V, void* normedOut, void* rmsScale, void* xIn, int dim, int kvDim, int headDim, int nHeads, int nKVHeads, int ffnDim, int seqLen, float ropeTheta, float eps);
+void mtl_fused_post_attn(void* hidden, void* attnOut, void* wo, void* normW2, void* gate, void* up, void* down, void* xMid, void* normed2, void* rmsScale2, void* gatePre, void* upOut, void* ffnMid, int dim, int kvDim, int headDim, int nHeads, int nKVHeads, int ffnDim, int seqLen, float ropeTheta, float eps);
+int mtl_fused_train_available(void);
 void mtl_fused_lm_head_pass1(void* hidden, void* embed, void* maxBuf, void* sumExp, int dim, int vocabSize, int n);
 void mtl_fused_lm_head_pass2(void* hidden, void* embed, void* maxBuf, void* sumExp, void* targets, void* dHidden, void* loss, int dim, int vocabSize, int n);
 void mtl_fused_gemm_tn_sparse(void* a, void* b, void* c, void* mask, int M, int K, int N);
@@ -886,6 +889,25 @@ func (m *Metal) FusedGradClipScale(grad, sumSq *Tensor, maxNorm float32, n int) 
 
 func (m *Metal) FusedDequantDelta(src, scales, delta, dst *Tensor, n, cols int) {
 	C.mtl_fused_dequant_delta(MtlBufPtr(src), MtlBufPtr(scales), MtlBufPtr(delta), MtlBufPtr(dst), C.int(n), C.int(cols))
+}
+
+func (m *Metal) FusedTrainAvailable() bool { return C.mtl_fused_train_available() == 1 }
+
+func (m *Metal) FusedPreAttn(hidden, normW, wq, wk, wv, Q, K, V, normedOut, rmsScale, xIn *Tensor,
+	dim, kvDim, headDim, nHeads, nKVHeads, ffnDim, seqLen int, ropeTheta, eps float32) {
+	C.mtl_fused_pre_attn(MtlBufPtr(hidden), MtlBufPtr(normW), MtlBufPtr(wq), MtlBufPtr(wk), MtlBufPtr(wv),
+		MtlBufPtr(Q), MtlBufPtr(K), MtlBufPtr(V), MtlBufPtr(normedOut), MtlBufPtr(rmsScale), MtlBufPtr(xIn),
+		C.int(dim), C.int(kvDim), C.int(headDim), C.int(nHeads), C.int(nKVHeads), C.int(ffnDim), C.int(seqLen),
+		C.float(ropeTheta), C.float(eps))
+}
+
+func (m *Metal) FusedPostAttn(hidden, attnOut, wo, normW2, gate, up, down, xMid, normed2, rmsScale2, gatePre, upOut, ffnMid *Tensor,
+	dim, kvDim, headDim, nHeads, nKVHeads, ffnDim, seqLen int, ropeTheta, eps float32) {
+	C.mtl_fused_post_attn(MtlBufPtr(hidden), MtlBufPtr(attnOut), MtlBufPtr(wo), MtlBufPtr(normW2),
+		MtlBufPtr(gate), MtlBufPtr(up), MtlBufPtr(down),
+		MtlBufPtr(xMid), MtlBufPtr(normed2), MtlBufPtr(rmsScale2), MtlBufPtr(gatePre), MtlBufPtr(upOut), MtlBufPtr(ffnMid),
+		C.int(dim), C.int(kvDim), C.int(headDim), C.int(nHeads), C.int(nKVHeads), C.int(ffnDim), C.int(seqLen),
+		C.float(ropeTheta), C.float(eps))
 }
 
 func (m *Metal) FusedLMHeadPass1(hidden, embed, maxBuf, sumExp *Tensor, dim, vocabSize, n int) {

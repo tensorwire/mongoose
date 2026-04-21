@@ -2119,6 +2119,10 @@ static id<MTLComputePipelineState> g_ps_grad_norm = nil;
 static id<MTLComputePipelineState> g_ps_grad_clip = nil;
 static id<MTLComputePipelineState> g_ps_copy_mem = nil;
 static id<MTLComputePipelineState> g_ps_clip_scale_compute = nil;
+// Fused training kernels (from fused_train.metallib)
+static id<MTLComputePipelineState> g_ps_fused_pre_attn = nil;
+static id<MTLComputePipelineState> g_ps_fused_post_attn = nil;
+static bool g_use_fused_train = false;
 static id<MTLComputePipelineState> g_ps_lm_pass1 = nil;
 static id<MTLComputePipelineState> g_ps_lm_pass2 = nil;
 static id<MTLComputePipelineState> g_ps_lm_sparse1 = nil;
@@ -2300,6 +2304,38 @@ int mtl_init_compute(void) {
     }
     if (!g_use_metal4_gemm) {
         NSLog(@"mongoose: Metal 4 .metallib not found — using tiled GEMM fallback");
+    }
+
+    // Load fused training kernels from fused_train.metallib
+    g_use_fused_train = false;
+    for (NSString* dir in searchPaths) {
+        NSString* libPath = [dir stringByAppendingPathComponent:@"fused_train.metallib"];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:libPath]) {
+            NSURL* libURL = [NSURL fileURLWithPath:libPath];
+            NSError* ftErr = nil;
+            id<MTLLibrary> ftLib = [g_device newLibraryWithURL:libURL error:&ftErr];
+            if (ftLib) {
+                NSError* psErr = nil;
+                id<MTLFunction> fnPre = [ftLib newFunctionWithName:@"fused_pre_attn"];
+                id<MTLFunction> fnPost = [ftLib newFunctionWithName:@"fused_post_attn"];
+                if (fnPre && fnPost) {
+                    MTLComputePipelineDescriptor* pd = [[MTLComputePipelineDescriptor alloc] init];
+                    pd.supportIndirectCommandBuffers = YES;
+                    pd.computeFunction = fnPre;
+                    g_ps_fused_pre_attn = [g_device newComputePipelineStateWithDescriptor:pd options:0 reflection:nil error:&psErr];
+                    pd.computeFunction = fnPost;
+                    g_ps_fused_post_attn = [g_device newComputePipelineStateWithDescriptor:pd options:0 reflection:nil error:&psErr];
+                    if (g_ps_fused_pre_attn && g_ps_fused_post_attn) {
+                        g_use_fused_train = true;
+                        NSLog(@"mongoose: fused training kernels loaded from %@", libPath);
+                    }
+                }
+            }
+            if (g_use_fused_train) break;
+        }
+    }
+    if (!g_use_fused_train) {
+        NSLog(@"mongoose: fused_train.metallib not found — using per-op dispatch");
     }
 
     return 0;
@@ -4236,6 +4272,71 @@ void mtl_fused_lm_head_pass2(void* hiddenRef, void* embedRef, void* maxRef, void
     [enc dispatchThreadgroups:MTLSizeMake(nPositions, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
 }
 
+// Fused pre-attention dispatch.
+void mtl_fused_pre_attn(void* hidden, void* normW, void* wq, void* wk, void* wv,
+                        void* Q, void* K, void* V, void* normedOut, void* rmsScale, void* xIn,
+                        int dim, int kvDim, int headDim, int nHeads, int nKVHeads, int ffnDim, int seqLen,
+                        float ropeTheta, float eps) {
+    if (!g_ps_fused_pre_attn) return;
+    // Pack constants struct
+    struct { uint dim,kvDim,headDim,nHeads,nKVHeads,ffnDim,seqLen; float ropeTheta,eps; } C;
+    C.dim=dim; C.kvDim=kvDim; C.headDim=headDim; C.nHeads=nHeads; C.nKVHeads=nKVHeads;
+    C.ffnDim=ffnDim; C.seqLen=seqLen; C.ropeTheta=ropeTheta; C.eps=eps;
+    id<MTLBuffer> cBuf = [g_device newBufferWithBytes:&C length:sizeof(C) options:MTLResourceStorageModeShared];
+    id<MTLComputeCommandEncoder> enc = g_fused_enc[g_active_fused_slot];
+    [enc setComputePipelineState:g_ps_fused_pre_attn];
+    [enc setBuffer:(__bridge id<MTLBuffer>)hidden    offset:0 atIndex:0];
+    [enc setBuffer:(__bridge id<MTLBuffer>)normW     offset:0 atIndex:1];
+    [enc setBuffer:(__bridge id<MTLBuffer>)wq        offset:0 atIndex:2];
+    [enc setBuffer:(__bridge id<MTLBuffer>)wk        offset:0 atIndex:3];
+    [enc setBuffer:(__bridge id<MTLBuffer>)wv        offset:0 atIndex:4];
+    [enc setBuffer:(__bridge id<MTLBuffer>)Q         offset:0 atIndex:5];
+    [enc setBuffer:(__bridge id<MTLBuffer>)K         offset:0 atIndex:6];
+    [enc setBuffer:(__bridge id<MTLBuffer>)V         offset:0 atIndex:7];
+    [enc setBuffer:(__bridge id<MTLBuffer>)normedOut offset:0 atIndex:8];
+    [enc setBuffer:(__bridge id<MTLBuffer>)rmsScale  offset:0 atIndex:9];
+    [enc setBuffer:(__bridge id<MTLBuffer>)xIn       offset:0 atIndex:10];
+    [enc setBuffer:cBuf offset:0 atIndex:11];
+    NSUInteger tpg = dim;
+    if (tpg > g_ps_fused_pre_attn.maxTotalThreadsPerThreadgroup) tpg = g_ps_fused_pre_attn.maxTotalThreadsPerThreadgroup;
+    [enc dispatchThreadgroups:MTLSizeMake(seqLen, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+}
+
+// Fused post-attention dispatch.
+void mtl_fused_post_attn(void* hidden, void* attnOut, void* wo, void* normW2,
+                         void* gate, void* up, void* down,
+                         void* xMid, void* normed2, void* rmsScale2,
+                         void* gatePre, void* upOut, void* ffnMid,
+                         int dim, int kvDim, int headDim, int nHeads, int nKVHeads, int ffnDim, int seqLen,
+                         float ropeTheta, float eps) {
+    if (!g_ps_fused_post_attn) return;
+    struct { uint dim,kvDim,headDim,nHeads,nKVHeads,ffnDim,seqLen; float ropeTheta,eps; } C;
+    C.dim=dim; C.kvDim=kvDim; C.headDim=headDim; C.nHeads=nHeads; C.nKVHeads=nKVHeads;
+    C.ffnDim=ffnDim; C.seqLen=seqLen; C.ropeTheta=ropeTheta; C.eps=eps;
+    id<MTLBuffer> cBuf = [g_device newBufferWithBytes:&C length:sizeof(C) options:MTLResourceStorageModeShared];
+    id<MTLComputeCommandEncoder> enc = g_fused_enc[g_active_fused_slot];
+    [enc setComputePipelineState:g_ps_fused_post_attn];
+    [enc setBuffer:(__bridge id<MTLBuffer>)hidden    offset:0 atIndex:0];
+    [enc setBuffer:(__bridge id<MTLBuffer>)attnOut   offset:0 atIndex:1];
+    [enc setBuffer:(__bridge id<MTLBuffer>)wo        offset:0 atIndex:2];
+    [enc setBuffer:(__bridge id<MTLBuffer>)normW2    offset:0 atIndex:3];
+    [enc setBuffer:(__bridge id<MTLBuffer>)gate      offset:0 atIndex:4];
+    [enc setBuffer:(__bridge id<MTLBuffer>)up        offset:0 atIndex:5];
+    [enc setBuffer:(__bridge id<MTLBuffer>)down      offset:0 atIndex:6];
+    [enc setBuffer:(__bridge id<MTLBuffer>)xMid      offset:0 atIndex:7];
+    [enc setBuffer:(__bridge id<MTLBuffer>)normed2   offset:0 atIndex:8];
+    [enc setBuffer:(__bridge id<MTLBuffer>)rmsScale2 offset:0 atIndex:9];
+    [enc setBuffer:(__bridge id<MTLBuffer>)gatePre   offset:0 atIndex:10];
+    [enc setBuffer:(__bridge id<MTLBuffer>)upOut     offset:0 atIndex:11];
+    [enc setBuffer:(__bridge id<MTLBuffer>)ffnMid    offset:0 atIndex:12];
+    [enc setBuffer:cBuf offset:0 atIndex:13];
+    NSUInteger tpg = ffnDim > (uint)dim ? ffnDim : dim;
+    if (tpg > g_ps_fused_post_attn.maxTotalThreadsPerThreadgroup) tpg = g_ps_fused_post_attn.maxTotalThreadsPerThreadgroup;
+    [enc dispatchThreadgroups:MTLSizeMake(seqLen, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+}
+
+int mtl_fused_train_available(void) { return g_use_fused_train ? 1 : 0; }
+
 // Sparse TN GEMM: C = A^T @ B, skipping output rows where mask[row]==0.
 void mtl_fused_gemm_tn_sparse(void* aRef, void* bRef, void* cRef, void* maskRef, int M, int K, int N) {
     uint32_t um = M, uk = K, un = N;
@@ -5161,36 +5262,53 @@ static void batch_encode_fwd(ICBBuildParams* p) {
     int nKVHeads=p->nKVHeads, ffnDim=p->ffnDim, vocabSize=p->vocabSize, n=p->seqLen, nLayers=p->nLayers;
 
     for (int li = 0; li < nLayers; li++) {
-        mtl_fused_copy(p->a_xIn[li], p->hidden, n*dim);
-        mtl_fused_rmsnorm(p->hidden, p->norm1[li], p->a_rmsScale1[li], n, dim);
-        mtl_fused_copy(p->a_normed[li], p->hidden, n*dim);
-        mtl_fused_copy(p->hidden, p->a_xIn[li], n*dim);
+        if (g_use_fused_train) {
+            // 3 dispatches per layer instead of ~22
+            mtl_fused_pre_attn(p->hidden, p->norm1[li], p->wq_live[li], p->wk_live[li], p->wv_live[li],
+                              p->a_Q[li], p->a_K[li], p->a_V[li], p->a_normed[li], p->a_rmsScale1[li], p->a_xIn[li],
+                              dim, kvDim, headDim, nHeads, nKVHeads, ffnDim, n, 10000.0f, 1e-6f);
 
-        mtl_fused_gemm_f32_bt(p->a_normed[li], p->wq_live[li], p->a_Q[li], n, dim, dim);
-        mtl_fused_gemm_f32_bt(p->a_normed[li], p->wk_live[li], p->a_K[li], n, dim, kvDim);
-        mtl_fused_gemm_f32_bt(p->a_normed[li], p->wv_live[li], p->a_V[li], n, dim, kvDim);
+            mtl_fused_attn(p->a_Q[li], p->a_K[li], p->a_V[li], p->a_attnOut[li], p->scores,
+                          dim, kvDim, headDim, nHeads, nKVHeads, n);
 
-        mtl_fused_rope(p->a_Q[li], headDim, nHeads, 10000.0f, dim, n);
-        mtl_fused_rope(p->a_K[li], headDim, nKVHeads, 10000.0f, kvDim, n);
+            mtl_fused_post_attn(p->hidden, p->a_attnOut[li], p->wo_live[li], p->norm2[li],
+                               p->gate_live[li], p->up_live[li], p->down_live[li],
+                               p->a_xMid[li], p->a_normed2[li], p->a_rmsScale2[li],
+                               p->a_gatePre[li], p->a_upOut[li], p->a_ffnMid[li],
+                               dim, kvDim, headDim, nHeads, nKVHeads, ffnDim, n, 10000.0f, 1e-6f);
+        } else {
+            // Fallback: per-op dispatch (~22 per layer)
+            mtl_fused_copy(p->a_xIn[li], p->hidden, n*dim);
+            mtl_fused_rmsnorm(p->hidden, p->norm1[li], p->a_rmsScale1[li], n, dim);
+            mtl_fused_copy(p->a_normed[li], p->hidden, n*dim);
+            mtl_fused_copy(p->hidden, p->a_xIn[li], n*dim);
 
-        mtl_fused_attn(p->a_Q[li], p->a_K[li], p->a_V[li], p->a_attnOut[li], p->scores,
-                       dim, kvDim, headDim, nHeads, nKVHeads, n);
+            mtl_fused_gemm_f32_bt(p->a_normed[li], p->wq_live[li], p->a_Q[li], n, dim, dim);
+            mtl_fused_gemm_f32_bt(p->a_normed[li], p->wk_live[li], p->a_K[li], n, dim, kvDim);
+            mtl_fused_gemm_f32_bt(p->a_normed[li], p->wv_live[li], p->a_V[li], n, dim, kvDim);
 
-        mtl_fused_gemm_f32_bt(p->a_attnOut[li], p->wo_live[li], p->dScratch, n, dim, dim);
-        mtl_fused_add_inplace(p->hidden, p->dScratch, n*dim);
+            mtl_fused_rope(p->a_Q[li], headDim, nHeads, 10000.0f, dim, n);
+            mtl_fused_rope(p->a_K[li], headDim, nKVHeads, 10000.0f, kvDim, n);
 
-        mtl_fused_copy(p->a_xMid[li], p->hidden, n*dim);
-        mtl_fused_rmsnorm(p->hidden, p->norm2[li], p->a_rmsScale2[li], n, dim);
-        mtl_fused_copy(p->a_normed2[li], p->hidden, n*dim);
-        mtl_fused_copy(p->hidden, p->a_xMid[li], n*dim);
+            mtl_fused_attn(p->a_Q[li], p->a_K[li], p->a_V[li], p->a_attnOut[li], p->scores,
+                          dim, kvDim, headDim, nHeads, nKVHeads, n);
 
-        mtl_fused_gemm_f32_bt(p->a_normed2[li], p->gate_live[li], p->a_gatePre[li], n, dim, ffnDim);
-        mtl_fused_gemm_f32_bt(p->a_normed2[li], p->up_live[li], p->a_upOut[li], n, dim, ffnDim);
+            mtl_fused_gemm_f32_bt(p->a_attnOut[li], p->wo_live[li], p->dScratch, n, dim, dim);
+            mtl_fused_add_inplace(p->hidden, p->dScratch, n*dim);
 
-        mtl_fused_silu_gate_mul(p->a_gatePre[li], p->a_upOut[li], p->a_ffnMid[li], n*ffnDim);
+            mtl_fused_copy(p->a_xMid[li], p->hidden, n*dim);
+            mtl_fused_rmsnorm(p->hidden, p->norm2[li], p->a_rmsScale2[li], n, dim);
+            mtl_fused_copy(p->a_normed2[li], p->hidden, n*dim);
+            mtl_fused_copy(p->hidden, p->a_xMid[li], n*dim);
 
-        mtl_fused_gemm_f32_bt(p->a_ffnMid[li], p->down_live[li], p->dScratch, n, ffnDim, dim);
-        mtl_fused_add_inplace(p->hidden, p->dScratch, n*dim);
+            mtl_fused_gemm_f32_bt(p->a_normed2[li], p->gate_live[li], p->a_gatePre[li], n, dim, ffnDim);
+            mtl_fused_gemm_f32_bt(p->a_normed2[li], p->up_live[li], p->a_upOut[li], n, dim, ffnDim);
+
+            mtl_fused_silu_gate_mul(p->a_gatePre[li], p->a_upOut[li], p->a_ffnMid[li], n*ffnDim);
+
+            mtl_fused_gemm_f32_bt(p->a_ffnMid[li], p->down_live[li], p->dScratch, n, ffnDim, dim);
+            mtl_fused_add_inplace(p->hidden, p->dScratch, n*dim);
+        }
     }
 
     mtl_fused_rmsnorm(p->hidden, p->finalNorm, p->finalScales, n, dim);
