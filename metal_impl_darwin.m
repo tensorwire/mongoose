@@ -1722,6 +1722,50 @@ static NSString* const g_kernel_source = @"\n"
 "    if (row < M && col < N) C[row * N + col] = acc;\n"
 "}\n"
 "\n"
+"// Sparse TN GEMM: C[m,n] = A^T[m,k] @ B[k,n], skip output rows where mask[row]==0.\n"
+"// Threadgroup-level early exit: if no row in the tile is hot, skip entirely.\n"
+"kernel void gemm_tn_sparse(\n"
+"    device const float* A [[buffer(0)]],\n"
+"    device const float* B [[buffer(1)]],\n"
+"    device float* C       [[buffer(2)]],\n"
+"    constant uint& M     [[buffer(3)]],\n"
+"    constant uint& K     [[buffer(4)]],\n"
+"    constant uint& N     [[buffer(5)]],\n"
+"    device const char* mask [[buffer(6)]],\n"
+"    uint2 tid [[thread_position_in_threadgroup]],\n"
+"    uint2 gid [[threadgroup_position_in_grid]])\n"
+"{\n"
+"    // Check if ANY row in this tile is hot\n"
+"    uint baseRow = gid.y * TILE;\n"
+"    threadgroup bool tileHot;\n"
+"    if (tid.x == 0 && tid.y == 0) {\n"
+"        tileHot = false;\n"
+"        for (uint r = 0; r < TILE && baseRow + r < M; r++) {\n"
+"            if (mask[baseRow + r] != 0) { tileHot = true; break; }\n"
+"        }\n"
+"    }\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    if (!tileHot) return;\n"
+"\n"
+"    threadgroup float sA[TILE * TILE];\n"
+"    threadgroup float sB[TILE * TILE];\n"
+"\n"
+"    uint row = baseRow + tid.y;\n"
+"    uint col = gid.x * TILE + tid.x;\n"
+"    float acc = 0.0f;\n"
+"\n"
+"    for (uint t = 0; t < (K + TILE - 1) / TILE; t++) {\n"
+"        uint aRow = t * TILE + tid.x;\n"
+"        uint bRow = t * TILE + tid.y;\n"
+"        sA[tid.y * TILE + tid.x] = (row < M && aRow < K) ? A[aRow * M + row] : 0.0f;\n"
+"        sB[tid.y * TILE + tid.x] = (col < N && bRow < K) ? B[bRow * N + col] : 0.0f;\n"
+"        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"        for (uint i = 0; i < TILE; i++) acc += sA[tid.y * TILE + i] * sB[i * TILE + tid.x];\n"
+"        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    }\n"
+"    if (row < M && col < N && mask[row] != 0) C[row * N + col] = acc;\n"
+"}\n"
+"\n"
 "// GEMM: C = A @ B (no transpose). A[M,K], B[K,N] → C[M,N].\n"
 "kernel void gemm_nn(\n"
 "    device const float* A [[buffer(0)]],\n"
@@ -2096,6 +2140,7 @@ static id<MTLComputePipelineState> g_ps_gemm_bt = nil;
 static id<MTLComputePipelineState> g_ps_gemm_bt_acc = nil;
 static id<MTLComputePipelineState> g_ps_gemm_tn = nil;
 static id<MTLComputePipelineState> g_ps_gemm_nn = nil;
+static id<MTLComputePipelineState> g_ps_gemm_tn_sparse = nil;
 // Metal 4 matmul2d replacements (loaded from .metallib if available)
 static id<MTLComputePipelineState> g_ps_gemm4_bt = nil;
 static id<MTLComputePipelineState> g_ps_gemm4_nn = nil;
@@ -2168,6 +2213,7 @@ int mtl_init_compute(void) {
     g_ps_gemm_bt_acc = make_ps(@"gemm_bt_acc");
     g_ps_gemm_tn = make_ps(@"gemm_tn");
     g_ps_gemm_nn = make_ps(@"gemm_nn");
+    g_ps_gemm_tn_sparse = make_ps(@"gemm_tn_sparse");
     g_ps_rmsnorm_save = make_ps(@"rmsnorm_save");
     g_ps_fused_attn = make_ps(@"fused_causal_attention");
     g_ps_fused_attn_bwd = make_ps(@"fused_causal_attention_backward");
@@ -4074,6 +4120,24 @@ void mtl_fused_dequant_delta(void* srcRef, void* scalesRef, void* deltaRef, void
     NSUInteger tpg = g_ps_dequant_delta.maxTotalThreadsPerThreadgroup;
     if (tpg > 1024) tpg = 1024;
     [g_fused_enc[g_active_fused_slot] dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+}
+
+// Sparse TN GEMM: C = A^T @ B, skipping output rows where mask[row]==0.
+void mtl_fused_gemm_tn_sparse(void* aRef, void* bRef, void* cRef, void* maskRef, int M, int K, int N) {
+    uint32_t um = M, uk = K, un = N;
+    id<MTLBuffer> mBuf = [g_device newBufferWithBytes:&um length:4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> kBuf = [g_device newBufferWithBytes:&uk length:4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> nBuf = [g_device newBufferWithBytes:&un length:4 options:MTLResourceStorageModeShared];
+    [g_fused_enc[g_active_fused_slot] setComputePipelineState:g_ps_gemm_tn_sparse];
+    [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)aRef    offset:0 atIndex:0];
+    [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)bRef    offset:0 atIndex:1];
+    [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)cRef    offset:0 atIndex:2];
+    [g_fused_enc[g_active_fused_slot] setBuffer:mBuf offset:0 atIndex:3];
+    [g_fused_enc[g_active_fused_slot] setBuffer:kBuf offset:0 atIndex:4];
+    [g_fused_enc[g_active_fused_slot] setBuffer:nBuf offset:0 atIndex:5];
+    [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)maskRef offset:0 atIndex:6];
+    [g_fused_enc[g_active_fused_slot] dispatchThreadgroups:MTLSizeMake((N+31)/32, (M+31)/32, 1)
+                threadsPerThreadgroup:MTLSizeMake(32, 32, 1)];
 }
 
 // Sparse dequant: only updates rows where mask[row] != 0.
