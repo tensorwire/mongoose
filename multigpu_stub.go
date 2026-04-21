@@ -25,6 +25,7 @@ func (mc *MultiCUDA) Free(dev, size int, ptr unsafe.Pointer)         {}
 func (mc *MultiCUDA) Upload(dev int, data []float32) *DeviceTensor   { return nil }
 func (mc *MultiCUDA) Download(dt *DeviceTensor) []float32            { return nil }
 func (mc *MultiCUDA) Release(dt *DeviceTensor)                       {}
+func (mc *MultiCUDA) PeerCopyInto(srcDev int, src unsafe.Pointer, dstDev int, dst unsafe.Pointer, bytes int) {}
 func (mc *MultiCUDA) PeerCopy(src *DeviceTensor, dst int) *DeviceTensor { return nil }
 func (mc *MultiCUDA) MatMulOnDevice(dev int, a, b unsafe.Pointer, m, k, n int) unsafe.Pointer {
 	return nil
@@ -43,3 +44,12 @@ type ParallelOp struct {
 	A, B, C    unsafe.Pointer
 	M, K, N    int
 }
+
+type ParallelFP16Op struct {
+	DeviceID   int
+	A, B, C    unsafe.Pointer
+	M, K, N    int
+	TransB     bool
+}
+
+func (mc *MultiCUDA) ParallelMatMulFP16(ops []ParallelFP16Op) {}

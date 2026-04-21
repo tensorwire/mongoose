@@ -131,6 +131,18 @@ void tw_cuda_synchronize() {
     cudaDeviceSynchronize();
 }
 
+size_t tw_cuda_vram_total() {
+    size_t free, total;
+    cudaMemGetInfo(&free, &total);
+    return total;
+}
+
+size_t tw_cuda_vram_free() {
+    size_t free, total;
+    cudaMemGetInfo(&free, &total);
+    return free;
+}
+
 // CUDA event timing — GPU-side measurement, same as torch.cuda.Event
 typedef struct {
     cudaEvent_t start;
@@ -268,7 +280,7 @@ func (c *CUDA) ReLU(x []float32) {
 	}
 }
 
-func (c *CUDA) VRAM() uint64 { return 0 } // TODO: query cudaMemGetInfo
+func (c *CUDA) VRAM() uint64 { return uint64(C.tw_cuda_vram_total()) }
 
 // Sync forces all pending CUDA work on all streams to complete.
 func (c *CUDA) Sync() { C.tw_cuda_synchronize() }

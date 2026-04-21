@@ -371,9 +371,38 @@ int tw_gpu_sgemm_transB(const float* dA, const float* dB, float* dC, int m, int 
         CUBLAS_COMPUTE_32F_FAST_TF32, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 }
 
-// C = A @ B^T: FP16 inputs, FP32 output. A[m,k] FP16, B[n,k] FP16, C[m,n] FP32.
-// Uses cublasLtMatmul with explicit 32MB workspace cap to prevent cuBLAS from
-// allocating multi-GB internal buffers (seen on Blackwell with cublasGemmEx).
+// FP16 matmul: C = A @ B, all FP16. Single cublasGemmEx call, zero descriptor overhead.
+int tw_gpu_hgemm_fp16(const void* dA, const void* dB, void* dC, int m, int k, int n) {
+    float alpha = 1.0f, beta = 0.0f;
+    return (int)cublasGemmEx(tw_cublas_handle,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        n, m, k,
+        &alpha,
+        dB, CUDA_R_16F, n,
+        dA, CUDA_R_16F, k,
+        &beta,
+        dC, CUDA_R_16F, n,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+}
+
+// FP16 matmul: C = A @ B^T, all FP16. Single cublasGemmEx call.
+int tw_gpu_hgemm_fp16_transB(const void* dA, const void* dB, void* dC, int m, int k, int n) {
+    float alpha = 1.0f, beta = 0.0f;
+    return (int)cublasGemmEx(tw_cublas_handle,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        n, m, k,
+        &alpha,
+        dB, CUDA_R_16F, k,
+        dA, CUDA_R_16F, k,
+        &beta,
+        dC, CUDA_R_16F, n,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+}
+
+// C = A @ B^T: FP16 inputs, FP16 output. cublasLt path with workspace cap.
+// Kept for benchmarking — the cublasGemmEx versions above are faster for training.
 int tw_gpu_hgemm_transB(const void* dA, const void* dB, float* dC, int m, int k, int n) {
     if (!tw_lt_handle) tw_cublaslt_init();
 
@@ -609,7 +638,7 @@ func (c *CUDA) MatMulFP16T(a, b *Tensor, m, k, n int) *Tensor {
 }
 
 // MatMulFP16TransposeBT computes C[m,n] = A[m,k] @ B[n,k]^T.
-// A,B are FP16, C is FP32. Uses tensor cores for 2x throughput vs FP32.
+// A,B are FP16, C is FP32. FP16 tensor cores internally, FP32 accumulation.
 func (c *CUDA) MatMulFP16TransposeBT(a, b *Tensor, m, k, n int) *Tensor {
 	size := m * n
 	ptr := c.poolGet(size)
@@ -663,6 +692,31 @@ func (c *CUDA) MatMulFP16(a, b *Tensor, m, k, n int) *Tensor {
 		Size:   poolKey,
 		device: &cuPtr{ptr: ptr},
 		eng:    c,
+	}
+}
+
+// MatMulFP16Into computes C = A @ B where A,B are FP16, C is FP32, into existing buffer.
+// For backward dHidden chain GEMMs — FP16 tensor cores, FP32 accumulation.
+func (c *CUDA) MatMulFP16Into(out, a, b *Tensor, m, k, n int) {
+	C.tw_gpu_hgemm(
+		a.device.(*cuPtr).ptr,
+		b.device.(*cuPtr).ptr,
+		(*C.float)(out.device.(*cuPtr).ptr),
+		C.int(m), C.int(k), C.int(n),
+	)
+}
+
+// MatMulFP16TransposeBTInto computes C[m,n] = A[m,k] @ B[n,k]^T.
+// A,B are FP16, C is FP32, into existing buffer. For forward pass.
+func (c *CUDA) MatMulFP16TransposeBTInto(out, a, b *Tensor, m, k, n int) {
+	ret := C.tw_gpu_hgemm_transB(
+		a.DevicePtr(),
+		b.DevicePtr(),
+		(*C.float)(out.device.(*cuPtr).ptr),
+		C.int(m), C.int(k), C.int(n),
+	)
+	if ret != 0 {
+		log.Printf("[CUDA] hgemm_transB (into) FAILED: status=%d m=%d k=%d n=%d", ret, m, k, n)
 	}
 }
 

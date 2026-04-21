@@ -250,6 +250,79 @@ void tw_multi_matmul_parallel(multi_matmul_op_t* ops, int count) {
     tw_multi_matmul_batch(ops, count, 1);
 }
 
+// FP16 parallel op: all-FP16 via per-device cublasLt handles.
+typedef struct {
+    int dev;
+    const void* dA;
+    const void* dB;
+    void* dC;
+    int m, k, n;
+    int transB; // 1 = B^T, 0 = no transpose
+} multi_hgemm_op_t;
+
+// FP16 batch dispatch across devices — same zero-overhead pattern as FP32.
+// Each op uses the device's cublasLt handle + stream. No cudaSetDevice in hot loop.
+void tw_multi_hgemm_batch(multi_hgemm_op_t* ops, int num_ops) {
+    float alpha = 1.0f, beta = 0.0f;
+
+    for (int i = 0; i < num_ops; i++) {
+        int d = ops[i].dev;
+        int m = ops[i].m, k = ops[i].k, n = ops[i].n;
+
+        cublasLtMatmulDesc_t opDesc;
+        cublasLtMatmulDescCreate(&opDesc, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+
+        cublasOperation_t opN = CUBLAS_OP_N;
+        cublasOperation_t opT = CUBLAS_OP_T;
+        if (ops[i].transB) {
+            cublasLtMatmulDescSetAttribute(opDesc, CUBLASLT_MATMUL_DESC_TRANSA, &opT, sizeof(opT));
+            cublasLtMatmulDescSetAttribute(opDesc, CUBLASLT_MATMUL_DESC_TRANSB, &opN, sizeof(opN));
+        } else {
+            cublasLtMatmulDescSetAttribute(opDesc, CUBLASLT_MATMUL_DESC_TRANSA, &opN, sizeof(opN));
+            cublasLtMatmulDescSetAttribute(opDesc, CUBLASLT_MATMUL_DESC_TRANSB, &opN, sizeof(opN));
+        }
+
+        cublasLtMatrixLayout_t Adesc, Bdesc, Cdesc;
+        if (ops[i].transB) {
+            cublasLtMatrixLayoutCreate(&Adesc, CUDA_R_16F, k, n, k);
+            cublasLtMatrixLayoutCreate(&Bdesc, CUDA_R_16F, k, m, k);
+        } else {
+            cublasLtMatrixLayoutCreate(&Adesc, CUDA_R_16F, n, k, n);
+            cublasLtMatrixLayoutCreate(&Bdesc, CUDA_R_16F, k, m, k);
+        }
+        cublasLtMatrixLayoutCreate(&Cdesc, CUDA_R_16F, n, m, n);
+
+        cublasLtMatmulPreference_t pref;
+        cublasLtMatmulPreferenceCreate(&pref);
+        cublasLtMatmulPreferenceSetAttribute(pref,
+            CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+            &tw_devices[d].lt_workspace_size, sizeof(size_t));
+
+        cublasLtMatmulHeuristicResult_t heur;
+        int nResults = 0;
+        cublasLtMatmulAlgoGetHeuristic(tw_devices[d].lt_handle, opDesc,
+            Adesc, Bdesc, Cdesc, Cdesc, pref, 1, &heur, &nResults);
+
+        if (nResults > 0) {
+            cublasLtMatmul(tw_devices[d].lt_handle, opDesc,
+                &alpha, ops[i].dB, Adesc, ops[i].dA, Bdesc,
+                &beta, ops[i].dC, Cdesc, ops[i].dC, Cdesc,
+                &heur.algo,
+                tw_devices[d].lt_workspace, tw_devices[d].lt_workspace_size,
+                tw_devices[d].stream);
+        }
+
+        cublasLtMatmulPreferenceDestroy(pref);
+        cublasLtMatrixLayoutDestroy(Adesc);
+        cublasLtMatrixLayoutDestroy(Bdesc);
+        cublasLtMatrixLayoutDestroy(Cdesc);
+        cublasLtMatmulDescDestroy(opDesc);
+    }
+    for (int i = 0; i < num_ops; i++) {
+        cudaStreamSynchronize(tw_devices[ops[i].dev].stream);
+    }
+}
+
 // Getters for device properties (can't access static arrays from Go)
 int tw_multi_sm_count(int dev) { return (dev >= 0 && dev < tw_device_count) ? tw_devices[dev].sm_count : 0; }
 int tw_multi_compute_major(int dev) { return (dev >= 0 && dev < tw_device_count) ? tw_devices[dev].compute_major : 0; }
@@ -397,6 +470,11 @@ func (mc *MultiCUDA) Release(dt *DeviceTensor) {
 	}
 }
 
+// PeerCopyInto copies data from src device into an existing dst pointer on dstDev.
+func (mc *MultiCUDA) PeerCopyInto(srcDev int, src unsafe.Pointer, dstDev int, dst unsafe.Pointer, bytes int) {
+	C.tw_multi_peer_copy(C.int(srcDev), src, C.int(dstDev), dst, C.size_t(bytes))
+}
+
 // PeerCopy copies data between two devices. Uses NVLink if available.
 func (mc *MultiCUDA) PeerCopy(src *DeviceTensor, dstDev int) *DeviceTensor {
 	dst := &DeviceTensor{
@@ -467,6 +545,36 @@ type ParallelOp struct {
 	DeviceID   int
 	A, B, C    unsafe.Pointer
 	M, K, N    int
+}
+
+// ParallelFP16Op describes an FP16 matmul to fire on a specific device.
+type ParallelFP16Op struct {
+	DeviceID   int
+	A, B, C    unsafe.Pointer
+	M, K, N    int
+	TransB     bool // true = C = A @ B^T, false = C = A @ B
+}
+
+// ParallelMatMulFP16 fires all-FP16 cublasLt matmuls across devices.
+// Zero goroutine overhead — all launches queued async via per-device streams.
+func (mc *MultiCUDA) ParallelMatMulFP16(ops []ParallelFP16Op) {
+	if len(ops) == 0 {
+		return
+	}
+	cOps := make([]C.multi_hgemm_op_t, len(ops))
+	for i, op := range ops {
+		cOps[i].dev = C.int(op.DeviceID)
+		cOps[i].dA = op.A
+		cOps[i].dB = op.B
+		cOps[i].dC = op.C
+		cOps[i].m = C.int(op.M)
+		cOps[i].k = C.int(op.K)
+		cOps[i].n = C.int(op.N)
+		if op.TransB {
+			cOps[i].transB = C.int(1)
+		}
+	}
+	C.tw_multi_hgemm_batch(&cOps[0], C.int(len(ops)))
 }
 
 // String returns a summary of the multi-GPU topology.

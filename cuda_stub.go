@@ -90,6 +90,8 @@ func (c *CUDA) ZerosL3(shape []int) *Tensor                         { return nil
 func (c *CUDA) AllocFP16Buffer(nElements int) unsafe.Pointer     { return nil }
 func NewCUDADevice(deviceIdx int) *CUDA                                  { return nil }
 func (c *CUDA) MatMulFP16TransposeBT(a, b *Tensor, m, k, n int) *Tensor { return nil }
+func (c *CUDA) MatMulFP16Into(out, a, b *Tensor, m, k, n int)          {}
+func (c *CUDA) MatMulFP16TransposeBTInto(out, a, b *Tensor, m, k, n int) {}
 func (c *CUDA) AllocFP16Tensor(nElements int, shape []int) *Tensor { return nil }
 func (c *CUDA) FreeFP16Tensor(t *Tensor)                        {}
 func (c *CUDA) FromHostFP16(data []float32, shape []int) *Tensor { return nil }
