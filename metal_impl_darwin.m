@@ -2164,6 +2164,40 @@ static id<MTLComputePipelineState> make_ps(NSString* name) {
     return ps;
 }
 
+// Constant buffer cache — avoid per-dispatch MTLBuffer allocation.
+// Maps 4-byte values to pre-allocated shared MTLBuffers.
+#define CONST_CACHE_SIZE 64
+static struct { uint32_t key; id<MTLBuffer> buf; bool used; } g_const_cache[CONST_CACHE_SIZE];
+static int g_const_cache_count = 0;
+
+static id<MTLBuffer> const_buf(const void* val, size_t len) {
+    uint32_t key = 0;
+    memcpy(&key, val, len < 4 ? len : 4);
+    for (int i = 0; i < g_const_cache_count; i++) {
+        if (g_const_cache[i].key == key) return g_const_cache[i].buf;
+    }
+    id<MTLBuffer> buf = [g_device newBufferWithBytes:val length:4 options:MTLResourceStorageModeShared];
+    if (g_const_cache_count < CONST_CACHE_SIZE) {
+        g_const_cache[g_const_cache_count++] = (typeof(g_const_cache[0])){key, buf, true};
+    }
+    return buf;
+}
+
+// Mutable constant buffer — for per-step values (lr, bc1, bc2, etc.)
+// Pre-allocated, CPU writes before dispatch.
+#define MUT_CONST_COUNT 16
+static id<MTLBuffer> g_mut_const[MUT_CONST_COUNT];
+static int g_mut_const_next = 0;
+
+static id<MTLBuffer> mut_const_buf(float val) {
+    int idx = g_mut_const_next++ % MUT_CONST_COUNT;
+    if (!g_mut_const[idx]) {
+        g_mut_const[idx] = [g_device newBufferWithLength:4 options:MTLResourceStorageModeShared];
+    }
+    *(float*)[g_mut_const[idx] contents] = val;
+    return g_mut_const[idx];
+}
+
 int mtl_init_compute(void) {
     if (g_compute_lib) return 0;
     NSError* err = nil;
@@ -2430,13 +2464,13 @@ void mtl_adamw_gpu(void* paramRef, void* gradRef, void* mRef, void* vRef,
                    float eps, float wd, int n) {
     @autoreleasepool {
     // Scalar constant buffers
-    id<MTLBuffer> lrBuf   = [g_device newBufferWithBytes:&lr    length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> b1Buf   = [g_device newBufferWithBytes:&beta1 length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> b2Buf   = [g_device newBufferWithBytes:&beta2 length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> bc1Buf  = [g_device newBufferWithBytes:&bc1   length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> bc2Buf  = [g_device newBufferWithBytes:&bc2   length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> epsBuf  = [g_device newBufferWithBytes:&eps   length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> wdBuf   = [g_device newBufferWithBytes:&wd    length:sizeof(float) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> lrBuf   = const_buf(&lr, 4);
+    id<MTLBuffer> b1Buf   = const_buf(&beta1, 4);
+    id<MTLBuffer> b2Buf   = const_buf(&beta2, 4);
+    id<MTLBuffer> bc1Buf  = const_buf(&bc1, 4);
+    id<MTLBuffer> bc2Buf  = const_buf(&bc2, 4);
+    id<MTLBuffer> epsBuf  = const_buf(&eps, 4);
+    id<MTLBuffer> wdBuf   = const_buf(&wd, 4);
 
     id<MTLCommandBuffer> cmd = get_cmd();
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
@@ -2474,20 +2508,20 @@ void mtl_dna_rung_gpu(
     @autoreleasepool {
 
     // Pack all 8 scalar rung/adam constants into tiny buffers
-    id<MTLBuffer> bb1Buf  = [g_device newBufferWithBytes:&backbone1 length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> gl1Buf  = [g_device newBufferWithBytes:&glyco1    length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> hb1Buf  = [g_device newBufferWithBytes:&hbond1    length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> hb2Buf  = [g_device newBufferWithBytes:&hbond2    length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> gl2Buf  = [g_device newBufferWithBytes:&glyco2    length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> bb2Buf  = [g_device newBufferWithBytes:&backbone2 length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> bsBuf   = [g_device newBufferWithBytes:&bondStr   length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> lrBuf   = [g_device newBufferWithBytes:&lr        length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> b1Buf   = [g_device newBufferWithBytes:&beta1     length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> b2Buf   = [g_device newBufferWithBytes:&beta2     length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> bc1Buf  = [g_device newBufferWithBytes:&bc1       length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> bc2Buf  = [g_device newBufferWithBytes:&bc2       length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> epsBuf  = [g_device newBufferWithBytes:&eps       length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> wdBuf   = [g_device newBufferWithBytes:&wd        length:sizeof(float) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> bb1Buf  = const_buf(&backbone1, 4);
+    id<MTLBuffer> gl1Buf  = const_buf(&glyco1, 4);
+    id<MTLBuffer> hb1Buf  = const_buf(&hbond1, 4);
+    id<MTLBuffer> hb2Buf  = const_buf(&hbond2, 4);
+    id<MTLBuffer> gl2Buf  = const_buf(&glyco2, 4);
+    id<MTLBuffer> bb2Buf  = const_buf(&backbone2, 4);
+    id<MTLBuffer> bsBuf   = const_buf(&bondStr, 4);
+    id<MTLBuffer> lrBuf   = const_buf(&lr, 4);
+    id<MTLBuffer> b1Buf   = const_buf(&beta1, 4);
+    id<MTLBuffer> b2Buf   = const_buf(&beta2, 4);
+    id<MTLBuffer> bc1Buf  = const_buf(&bc1, 4);
+    id<MTLBuffer> bc2Buf  = const_buf(&bc2, 4);
+    id<MTLBuffer> epsBuf  = const_buf(&eps, 4);
+    id<MTLBuffer> wdBuf   = const_buf(&wd, 4);
 
     id<MTLCommandBuffer> cmd = get_cmd();
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
@@ -2545,20 +2579,20 @@ void mtl_dna_rung_warm(
     float eps, float wd, int n) {
     @autoreleasepool {
 
-    id<MTLBuffer> bb1Buf  = [g_device newBufferWithBytes:&backbone1 length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> gl1Buf  = [g_device newBufferWithBytes:&glyco1    length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> hb1Buf  = [g_device newBufferWithBytes:&hbond1    length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> hb2Buf  = [g_device newBufferWithBytes:&hbond2    length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> gl2Buf  = [g_device newBufferWithBytes:&glyco2    length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> bb2Buf  = [g_device newBufferWithBytes:&backbone2 length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> bsBuf   = [g_device newBufferWithBytes:&bondStr   length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> lrBuf   = [g_device newBufferWithBytes:&lr        length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> b1Buf   = [g_device newBufferWithBytes:&beta1     length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> b2Buf   = [g_device newBufferWithBytes:&beta2     length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> bc1Buf  = [g_device newBufferWithBytes:&bc1       length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> bc2Buf  = [g_device newBufferWithBytes:&bc2       length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> epsBuf  = [g_device newBufferWithBytes:&eps       length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> wdBuf   = [g_device newBufferWithBytes:&wd        length:sizeof(float) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> bb1Buf  = const_buf(&backbone1, 4);
+    id<MTLBuffer> gl1Buf  = const_buf(&glyco1, 4);
+    id<MTLBuffer> hb1Buf  = const_buf(&hbond1, 4);
+    id<MTLBuffer> hb2Buf  = const_buf(&hbond2, 4);
+    id<MTLBuffer> gl2Buf  = const_buf(&glyco2, 4);
+    id<MTLBuffer> bb2Buf  = const_buf(&backbone2, 4);
+    id<MTLBuffer> bsBuf   = const_buf(&bondStr, 4);
+    id<MTLBuffer> lrBuf   = const_buf(&lr, 4);
+    id<MTLBuffer> b1Buf   = const_buf(&beta1, 4);
+    id<MTLBuffer> b2Buf   = const_buf(&beta2, 4);
+    id<MTLBuffer> bc1Buf  = const_buf(&bc1, 4);
+    id<MTLBuffer> bc2Buf  = const_buf(&bc2, 4);
+    id<MTLBuffer> epsBuf  = const_buf(&eps, 4);
+    id<MTLBuffer> wdBuf   = const_buf(&wd, 4);
 
     id<MTLBuffer> cache = (__bridge id<MTLBuffer>)cacheRef;
 
@@ -2609,13 +2643,13 @@ void mtl_adamw_warm(
     float eps, float wd, int n) {
     @autoreleasepool {
 
-    id<MTLBuffer> lrBuf   = [g_device newBufferWithBytes:&lr    length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> b1Buf   = [g_device newBufferWithBytes:&beta1 length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> b2Buf   = [g_device newBufferWithBytes:&beta2 length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> bc1Buf  = [g_device newBufferWithBytes:&bc1   length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> bc2Buf  = [g_device newBufferWithBytes:&bc2   length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> epsBuf  = [g_device newBufferWithBytes:&eps   length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> wdBuf   = [g_device newBufferWithBytes:&wd    length:sizeof(float) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> lrBuf   = const_buf(&lr, 4);
+    id<MTLBuffer> b1Buf   = const_buf(&beta1, 4);
+    id<MTLBuffer> b2Buf   = const_buf(&beta2, 4);
+    id<MTLBuffer> bc1Buf  = const_buf(&bc1, 4);
+    id<MTLBuffer> bc2Buf  = const_buf(&bc2, 4);
+    id<MTLBuffer> epsBuf  = const_buf(&eps, 4);
+    id<MTLBuffer> wdBuf   = const_buf(&wd, 4);
 
     id<MTLBuffer> cache = (__bridge id<MTLBuffer>)cacheRef;
 
@@ -2679,10 +2713,10 @@ void mtl_lm_head_forward_grad(
     uint32_t un = (uint32_t)nPositions;
     float invN = 1.0f / (float)nPositions;
 
-    id<MTLBuffer> dimBuf   = [g_device newBufferWithBytes:&udim   length:sizeof(uint32_t) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> vocabBuf = [g_device newBufferWithBytes:&uvocab length:sizeof(uint32_t) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> nBuf     = [g_device newBufferWithBytes:&un     length:sizeof(uint32_t) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> invNBuf  = [g_device newBufferWithBytes:&invN   length:sizeof(float)    options:MTLResourceStorageModeShared];
+    id<MTLBuffer> dimBuf   = const_buf(&udim, 4);
+    id<MTLBuffer> vocabBuf = const_buf(&uvocab, 4);
+    id<MTLBuffer> nBuf     = const_buf(&un, 4);
+    id<MTLBuffer> invNBuf  = const_buf(&invN, 4);
 
     // Zero the loss buffer
     float zero = 0.0f;
@@ -2756,10 +2790,10 @@ void mtl_lm_head_sparse_forward_grad(
     uint32_t un = (uint32_t)nPositions;
     float invN = 1.0f / (float)nPositions;
 
-    id<MTLBuffer> dimBuf  = [g_device newBufferWithBytes:&udim length:sizeof(uint32_t) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> hotBuf  = [g_device newBufferWithBytes:&uhot length:sizeof(uint32_t) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> nBuf    = [g_device newBufferWithBytes:&un   length:sizeof(uint32_t) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> invNBuf = [g_device newBufferWithBytes:&invN length:sizeof(float)    options:MTLResourceStorageModeShared];
+    id<MTLBuffer> dimBuf  = const_buf(&udim, 4);
+    id<MTLBuffer> hotBuf  = const_buf(&uhot, 4);
+    id<MTLBuffer> nBuf    = const_buf(&un, 4);
+    id<MTLBuffer> invNBuf = const_buf(&invN, 4);
 
     float zero = 0.0f;
     memcpy([(__bridge id<MTLBuffer>)lossRef contents], &zero, sizeof(float));
@@ -2823,7 +2857,7 @@ void mtl_lm_head_sparse_forward_grad(
 void mtl_dequant_int8(void* srcRef, void* scalesRef, void* dstRef, int n, int cols) {
     @autoreleasepool {
     uint32_t ucols = (uint32_t)cols;
-    id<MTLBuffer> colsBuf = [g_device newBufferWithBytes:&ucols length:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> colsBuf = const_buf(&ucols, 4);
 
     id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
@@ -2847,7 +2881,7 @@ void mtl_dequant_int8(void* srcRef, void* scalesRef, void* dstRef, int n, int co
 void mtl_dequant_int8_delta(void* srcRef, void* scalesRef, void* deltaRef, void* dstRef, int n, int cols) {
     @autoreleasepool {
     uint32_t ucols = (uint32_t)cols;
-    id<MTLBuffer> colsBuf = [g_device newBufferWithBytes:&ucols length:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> colsBuf = const_buf(&ucols, 4);
     id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     [enc setComputePipelineState:g_ps_dequant_delta];
@@ -2874,14 +2908,14 @@ void mtl_helix_needle(
     @autoreleasepool {
 
     uint32_t ucols = (uint32_t)cols;
-    id<MTLBuffer> lrBuf   = [g_device newBufferWithBytes:&lr    length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> b1Buf   = [g_device newBufferWithBytes:&beta1 length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> b2Buf   = [g_device newBufferWithBytes:&beta2 length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> bc1Buf  = [g_device newBufferWithBytes:&bc1   length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> bc2Buf  = [g_device newBufferWithBytes:&bc2   length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> epsBuf  = [g_device newBufferWithBytes:&eps   length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> wdBuf   = [g_device newBufferWithBytes:&wd    length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> colsBuf = [g_device newBufferWithBytes:&ucols length:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> lrBuf   = const_buf(&lr, 4);
+    id<MTLBuffer> b1Buf   = const_buf(&beta1, 4);
+    id<MTLBuffer> b2Buf   = const_buf(&beta2, 4);
+    id<MTLBuffer> bc1Buf  = const_buf(&bc1, 4);
+    id<MTLBuffer> bc2Buf  = const_buf(&bc2, 4);
+    id<MTLBuffer> epsBuf  = const_buf(&eps, 4);
+    id<MTLBuffer> wdBuf   = const_buf(&wd, 4);
+    id<MTLBuffer> colsBuf = const_buf(&ucols, 4);
 
     id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
@@ -2929,21 +2963,21 @@ void mtl_helix_needle_paired(
     @autoreleasepool {
 
     uint32_t ucols = (uint32_t)cols;
-    id<MTLBuffer> lrBuf   = [g_device newBufferWithBytes:&lr          length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> b1Buf   = [g_device newBufferWithBytes:&beta1       length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> b2Buf   = [g_device newBufferWithBytes:&beta2       length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> bc1Buf  = [g_device newBufferWithBytes:&bc1         length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> bc2Buf  = [g_device newBufferWithBytes:&bc2         length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> epsBuf  = [g_device newBufferWithBytes:&eps         length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> wdBuf   = [g_device newBufferWithBytes:&wd          length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> bb1Buf  = [g_device newBufferWithBytes:&backbone1   length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> gl1Buf  = [g_device newBufferWithBytes:&glyco1      length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> hb1Buf  = [g_device newBufferWithBytes:&hbond1      length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> hb2Buf  = [g_device newBufferWithBytes:&hbond2      length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> gl2Buf  = [g_device newBufferWithBytes:&glyco2      length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> bb2Buf  = [g_device newBufferWithBytes:&backbone2   length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> bsBuf   = [g_device newBufferWithBytes:&bondStrength length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> colsBuf = [g_device newBufferWithBytes:&ucols       length:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> lrBuf   = const_buf(&lr, 4);
+    id<MTLBuffer> b1Buf   = const_buf(&beta1, 4);
+    id<MTLBuffer> b2Buf   = const_buf(&beta2, 4);
+    id<MTLBuffer> bc1Buf  = const_buf(&bc1, 4);
+    id<MTLBuffer> bc2Buf  = const_buf(&bc2, 4);
+    id<MTLBuffer> epsBuf  = const_buf(&eps, 4);
+    id<MTLBuffer> wdBuf   = const_buf(&wd, 4);
+    id<MTLBuffer> bb1Buf  = const_buf(&backbone1, 4);
+    id<MTLBuffer> gl1Buf  = const_buf(&glyco1, 4);
+    id<MTLBuffer> hb1Buf  = const_buf(&hbond1, 4);
+    id<MTLBuffer> hb2Buf  = const_buf(&hbond2, 4);
+    id<MTLBuffer> gl2Buf  = const_buf(&glyco2, 4);
+    id<MTLBuffer> bb2Buf  = const_buf(&backbone2, 4);
+    id<MTLBuffer> bsBuf   = const_buf(&bondStrength, 4);
+    id<MTLBuffer> colsBuf = const_buf(&ucols, 4);
 
     id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
@@ -3229,9 +3263,9 @@ void mtl_fused_sync_all(void) {
 // Fused GEMM: C = A @ B^T, encoded into the active fused command buffer.
 void mtl_fused_gemm_bt(void* aRef, void* bRef, void* cRef, int M, int K, int N) {
     uint32_t um = M, uk = K, un = N;
-    id<MTLBuffer> mBuf = [g_device newBufferWithBytes:&um length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> kBuf = [g_device newBufferWithBytes:&uk length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> nBuf = [g_device newBufferWithBytes:&un length:4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> mBuf = const_buf(&um, 4);
+    id<MTLBuffer> kBuf = const_buf(&uk, 4);
+    id<MTLBuffer> nBuf = const_buf(&un, 4);
     [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)aRef offset:0 atIndex:0];
     [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)bRef offset:0 atIndex:1];
     [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)cRef offset:0 atIndex:2];
@@ -3253,9 +3287,9 @@ void mtl_fused_gemm_bt(void* aRef, void* bRef, void* cRef, int M, int K, int N) 
 
 void mtl_fused_gemm_nn(void* aRef, void* bRef, void* cRef, int M, int K, int N) {
     uint32_t um = M, uk = K, un = N;
-    id<MTLBuffer> mBuf = [g_device newBufferWithBytes:&um length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> kBuf = [g_device newBufferWithBytes:&uk length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> nBuf = [g_device newBufferWithBytes:&un length:4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> mBuf = const_buf(&um, 4);
+    id<MTLBuffer> kBuf = const_buf(&uk, 4);
+    id<MTLBuffer> nBuf = const_buf(&un, 4);
     [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)aRef offset:0 atIndex:0];
     [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)bRef offset:0 atIndex:1];
     [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)cRef offset:0 atIndex:2];
@@ -3276,9 +3310,9 @@ void mtl_fused_gemm_nn(void* aRef, void* bRef, void* cRef, int M, int K, int N) 
 
 void mtl_fused_gemm_tn(void* aRef, void* bRef, void* cRef, int M, int K, int N) {
     uint32_t um = M, uk = K, un = N;
-    id<MTLBuffer> mBuf = [g_device newBufferWithBytes:&um length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> kBuf = [g_device newBufferWithBytes:&uk length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> nBuf = [g_device newBufferWithBytes:&un length:4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> mBuf = const_buf(&um, 4);
+    id<MTLBuffer> kBuf = const_buf(&uk, 4);
+    id<MTLBuffer> nBuf = const_buf(&un, 4);
     [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)aRef offset:0 atIndex:0];
     [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)bRef offset:0 atIndex:1];
     [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)cRef offset:0 atIndex:2];
@@ -3299,7 +3333,7 @@ void mtl_fused_gemm_tn(void* aRef, void* bRef, void* cRef, int M, int K, int N) 
 
 void mtl_fused_dequant(void* srcRef, void* scalesRef, void* dstRef, int n, int cols) {
     uint32_t ucols = (uint32_t)cols;
-    id<MTLBuffer> colsBuf = [g_device newBufferWithBytes:&ucols length:4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> colsBuf = const_buf(&ucols, 4);
     [g_fused_enc[g_active_fused_slot] setComputePipelineState:g_ps_dequant_int8];
     [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)srcRef    offset:0 atIndex:0];
     [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)scalesRef offset:0 atIndex:1];
@@ -3317,11 +3351,11 @@ void mtl_fused_needle_inline(void* dataRef, void* scalesRef, void* cacheRef,
                              int n, int cols) {
     float ss = signalScale, lr2 = lr, b1 = beta1, wd2 = wd;
     uint32_t ucols = (uint32_t)cols;
-    id<MTLBuffer> ssBuf   = [g_device newBufferWithBytes:&ss   length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> lrBuf   = [g_device newBufferWithBytes:&lr2  length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> b1Buf   = [g_device newBufferWithBytes:&b1   length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> wdBuf   = [g_device newBufferWithBytes:&wd2  length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> colsBuf = [g_device newBufferWithBytes:&ucols length:4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> ssBuf   = const_buf(&ss, 4);
+    id<MTLBuffer> lrBuf   = const_buf(&lr2, 4);
+    id<MTLBuffer> b1Buf   = const_buf(&b1, 4);
+    id<MTLBuffer> wdBuf   = const_buf(&wd2, 4);
+    id<MTLBuffer> colsBuf = const_buf(&ucols, 4);
     [g_fused_enc[g_active_fused_slot] setComputePipelineState:g_ps_needle_inline];
     [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)dataRef   offset:0 atIndex:0];
     [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)scalesRef offset:0 atIndex:1];
@@ -3343,7 +3377,7 @@ void mtl_fused_needle_inline(void* dataRef, void* scalesRef, void* cacheRef,
 void mtl_ce_loss(void* logitsRef, void* targetsRef, void* lossesRef, int seqLen, int vocabSize) {
     @autoreleasepool {
     uint32_t uv = (uint32_t)vocabSize;
-    id<MTLBuffer> vBuf = [g_device newBufferWithBytes:&uv length:4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> vBuf = const_buf(&uv, 4);
     id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     [enc setComputePipelineState:g_ps_ce_loss];
@@ -3365,9 +3399,9 @@ void mtl_ce_loss(void* logitsRef, void* targetsRef, void* lossesRef, int seqLen,
 void mtl_fused_gemm_f32_bt(void* aRef, void* bRef, void* cRef, int M, int K, int N) {
     if (!g_ps_gemm4f_bt) { mtl_fused_gemm_bt(aRef, bRef, cRef, M, K, N); return; }
     uint32_t um = M, uk = K, un = N;
-    id<MTLBuffer> mBuf = [g_device newBufferWithBytes:&um length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> kBuf = [g_device newBufferWithBytes:&uk length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> nBuf = [g_device newBufferWithBytes:&un length:4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> mBuf = const_buf(&um, 4);
+    id<MTLBuffer> kBuf = const_buf(&uk, 4);
+    id<MTLBuffer> nBuf = const_buf(&un, 4);
     [g_fused_enc[g_active_fused_slot] setComputePipelineState:g_ps_gemm4f_bt];
     [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)aRef offset:0 atIndex:0];
     [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)bRef offset:0 atIndex:1];
@@ -3382,9 +3416,9 @@ void mtl_fused_gemm_f32_bt(void* aRef, void* bRef, void* cRef, int M, int K, int
 void mtl_fused_gemm_f32_nn(void* aRef, void* bRef, void* cRef, int M, int K, int N) {
     if (!g_ps_gemm4f_nn) { mtl_fused_gemm_nn(aRef, bRef, cRef, M, K, N); return; }
     uint32_t um = M, uk = K, un = N;
-    id<MTLBuffer> mBuf = [g_device newBufferWithBytes:&um length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> kBuf = [g_device newBufferWithBytes:&uk length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> nBuf = [g_device newBufferWithBytes:&un length:4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> mBuf = const_buf(&um, 4);
+    id<MTLBuffer> kBuf = const_buf(&uk, 4);
+    id<MTLBuffer> nBuf = const_buf(&un, 4);
     [g_fused_enc[g_active_fused_slot] setComputePipelineState:g_ps_gemm4f_nn];
     [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)aRef offset:0 atIndex:0];
     [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)bRef offset:0 atIndex:1];
@@ -3399,9 +3433,9 @@ void mtl_fused_gemm_f32_nn(void* aRef, void* bRef, void* cRef, int M, int K, int
 void mtl_fused_gemm_f32_tn(void* aRef, void* bRef, void* cRef, int M, int K, int N) {
     if (!g_ps_gemm4f_tn) { mtl_fused_gemm_tn(aRef, bRef, cRef, M, K, N); return; }
     uint32_t um = M, uk = K, un = N;
-    id<MTLBuffer> mBuf = [g_device newBufferWithBytes:&um length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> kBuf = [g_device newBufferWithBytes:&uk length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> nBuf = [g_device newBufferWithBytes:&un length:4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> mBuf = const_buf(&um, 4);
+    id<MTLBuffer> kBuf = const_buf(&uk, 4);
+    id<MTLBuffer> nBuf = const_buf(&un, 4);
     [g_fused_enc[g_active_fused_slot] setComputePipelineState:g_ps_gemm4f_tn];
     [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)aRef offset:0 atIndex:0];
     [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)bRef offset:0 atIndex:1];
@@ -3417,7 +3451,7 @@ void mtl_fused_gemm_f32_tn(void* aRef, void* bRef, void* cRef, int M, int K, int
 // Fused RMSNorm backward.
 void mtl_fused_rmsnorm_bwd(void* dOutRef, void* xInRef, void* wRef, void* scaleRef, void* dxRef, int seqLen, int dim) {
     uint32_t udim = (uint32_t)dim;
-    id<MTLBuffer> dimBuf = [g_device newBufferWithBytes:&udim length:4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> dimBuf = const_buf(&udim, 4);
     [g_fused_enc[g_active_fused_slot] setComputePipelineState:g_ps_rmsnorm_bwd];
     [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)dOutRef  offset:0 atIndex:0];
     [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)xInRef   offset:0 atIndex:1];
@@ -3437,7 +3471,7 @@ void mtl_rmsnorm_bwd_q(void* dOutRef, void* xInRef, void* wRef, void* scaleRef, 
     @autoreleasepool {
     id<MTLCommandQueue> q = (queueIdx == 0) ? g_queue : g_queue2;
     uint32_t udim = (uint32_t)dim;
-    id<MTLBuffer> dimBuf = [g_device newBufferWithBytes:&udim length:4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> dimBuf = const_buf(&udim, 4);
     id<MTLCommandBuffer> cmd = [q commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     [enc setComputePipelineState:g_ps_rmsnorm_bwd];
@@ -3460,7 +3494,7 @@ void mtl_rmsnorm_bwd_q(void* dOutRef, void* xInRef, void* wRef, void* scaleRef, 
 // Fused dequant INT8 → FP16 for Metal 4 GEMM.
 void mtl_fused_dequant_fp16(void* srcRef, void* scalesRef, void* dstRef, int n, int cols) {
     uint32_t ucols = (uint32_t)cols;
-    id<MTLBuffer> colsBuf = [g_device newBufferWithBytes:&ucols length:4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> colsBuf = const_buf(&ucols, 4);
     [g_fused_enc[g_active_fused_slot] setComputePipelineState:g_ps_dequant_fp16];
     [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)srcRef    offset:0 atIndex:0];
     [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)scalesRef offset:0 atIndex:1];
@@ -3494,8 +3528,8 @@ void mtl_fused_fp16_to_fp32(void* srcRef, void* dstRef, int n) {
 void mtl_fused_rmsnorm(void* xRef, void* wRef, void* scaleRef, int seqLen, int dim) {
     uint32_t udim = (uint32_t)dim;
     float eps = 1e-6f;
-    id<MTLBuffer> dimBuf = [g_device newBufferWithBytes:&udim length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> epsBuf = [g_device newBufferWithBytes:&eps length:4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> dimBuf = const_buf(&udim, 4);
+    id<MTLBuffer> epsBuf = const_buf(&eps, 4);
     [g_fused_enc[g_active_fused_slot] setComputePipelineState:g_ps_rmsnorm_save];
     [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)xRef     offset:0 atIndex:0];
     [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)wRef     offset:0 atIndex:1];
@@ -3531,12 +3565,12 @@ void mtl_fused_silu_gate_mul(void* gateRef, void* upRef, void* outRef, int n) {
 void mtl_fused_attn(void* qRef, void* kRef, void* vRef, void* outRef, void* scoresRef,
                     int dim, int kvDim, int headDim, int nHeads, int nKVHeads, int seqLen) {
     uint32_t ud = dim, ukv = kvDim, uhd = headDim, unh = nHeads, unkv = nKVHeads, un = seqLen;
-    id<MTLBuffer> dBuf   = [g_device newBufferWithBytes:&ud   length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> kvBuf  = [g_device newBufferWithBytes:&ukv  length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> hdBuf  = [g_device newBufferWithBytes:&uhd  length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> nhBuf  = [g_device newBufferWithBytes:&unh  length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> nkvBuf = [g_device newBufferWithBytes:&unkv length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> nBuf   = [g_device newBufferWithBytes:&un   length:4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> dBuf   = const_buf(&ud, 4);
+    id<MTLBuffer> kvBuf  = const_buf(&ukv, 4);
+    id<MTLBuffer> hdBuf  = const_buf(&uhd, 4);
+    id<MTLBuffer> nhBuf  = const_buf(&unh, 4);
+    id<MTLBuffer> nkvBuf = const_buf(&unkv, 4);
+    id<MTLBuffer> nBuf   = const_buf(&un, 4);
     [g_fused_enc[g_active_fused_slot] setComputePipelineState:g_ps_fused_attn];
     [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)qRef      offset:0 atIndex:0];
     [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)kRef      offset:0 atIndex:1];
@@ -3558,10 +3592,10 @@ void mtl_fused_attn(void* qRef, void* kRef, void* vRef, void* outRef, void* scor
 void mtl_fused_rope(void* xRef, int headDim, int nHeads, float theta, int stride, int seqLen) {
     uint32_t uhd = headDim, unh = nHeads, ust = stride;
     float absTheta = theta < 0 ? -theta : theta;
-    id<MTLBuffer> hdBuf = [g_device newBufferWithBytes:&uhd      length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> nhBuf = [g_device newBufferWithBytes:&unh      length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> thBuf = [g_device newBufferWithBytes:&absTheta length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> stBuf = [g_device newBufferWithBytes:&ust      length:4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> hdBuf = const_buf(&uhd, 4);
+    id<MTLBuffer> nhBuf = const_buf(&unh, 4);
+    id<MTLBuffer> thBuf = const_buf(&absTheta, 4);
+    id<MTLBuffer> stBuf = const_buf(&ust, 4);
     id<MTLComputePipelineState> ps = (theta < 0) ? g_ps_rope_bwd : g_ps_rope_fwd;
     [g_fused_enc[g_active_fused_slot] setComputePipelineState:ps];
     [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)xRef offset:0 atIndex:0];
@@ -3588,7 +3622,7 @@ void mtl_fused_copy(void* dstRef, void* srcRef, int n) {
 
 void mtl_fused_bias_add(void* xRef, void* bRef, int n, int cols) {
     uint32_t ucols = (uint32_t)cols;
-    id<MTLBuffer> colsBuf = [g_device newBufferWithBytes:&ucols length:4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> colsBuf = const_buf(&ucols, 4);
     [g_fused_enc[g_active_fused_slot] setComputePipelineState:g_ps_bias_add];
     [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)xRef offset:0 atIndex:0];
     [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)bRef offset:0 atIndex:1];
@@ -3605,9 +3639,9 @@ void mtl_gemm_bt_q(void* aRef, void* bRef, void* cRef, int M, int K, int N, int 
     @autoreleasepool {
     id<MTLCommandQueue> q = (queueIdx == 0) ? g_queue : g_queue2;
     uint32_t um = M, uk = K, un = N;
-    id<MTLBuffer> mBuf = [g_device newBufferWithBytes:&um length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> kBuf = [g_device newBufferWithBytes:&uk length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> nBuf = [g_device newBufferWithBytes:&un length:4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> mBuf = const_buf(&um, 4);
+    id<MTLBuffer> kBuf = const_buf(&uk, 4);
+    id<MTLBuffer> nBuf = const_buf(&un, 4);
     id<MTLCommandBuffer> cmd = [q commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     [enc setBuffer:(__bridge id<MTLBuffer>)aRef offset:0 atIndex:0];
@@ -3635,9 +3669,9 @@ void mtl_gemm_f32_bt_q(void* aRef, void* bRef, void* cRef, int M, int K, int N, 
     id<MTLCommandQueue> q = g_queues[queueIdx < MTL_MAX_QUEUES ? queueIdx : 0];
     if (g_ps_gemm4f_bt) {
         uint32_t um = M, uk = K, un = N;
-        id<MTLBuffer> mBuf = [g_device newBufferWithBytes:&um length:4 options:MTLResourceStorageModeShared];
-        id<MTLBuffer> kBuf = [g_device newBufferWithBytes:&uk length:4 options:MTLResourceStorageModeShared];
-        id<MTLBuffer> nBuf = [g_device newBufferWithBytes:&un length:4 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> mBuf = const_buf(&um, 4);
+        id<MTLBuffer> kBuf = const_buf(&uk, 4);
+        id<MTLBuffer> nBuf = const_buf(&un, 4);
         id<MTLCommandBuffer> cmd = [q commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
         [enc setComputePipelineState:g_ps_gemm4f_bt];
@@ -3663,9 +3697,9 @@ void mtl_gemm_bt_acc_q(void* aRef, void* bRef, void* cRef, int M, int K, int N, 
     @autoreleasepool {
     id<MTLCommandQueue> q = (queueIdx == 0) ? g_queue : g_queue2;
     uint32_t um = M, uk = K, un = N;
-    id<MTLBuffer> mBuf = [g_device newBufferWithBytes:&um length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> kBuf = [g_device newBufferWithBytes:&uk length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> nBuf = [g_device newBufferWithBytes:&un length:4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> mBuf = const_buf(&um, 4);
+    id<MTLBuffer> kBuf = const_buf(&uk, 4);
+    id<MTLBuffer> nBuf = const_buf(&un, 4);
     id<MTLCommandBuffer> cmd = [q commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     [enc setComputePipelineState:g_ps_gemm_bt_acc];
@@ -3686,9 +3720,9 @@ void mtl_gemm_tn_q(void* aRef, void* bRef, void* cRef, int M, int K, int N, int 
     @autoreleasepool {
     id<MTLCommandQueue> q = (queueIdx == 0) ? g_queue : g_queue2;
     uint32_t um = M, uk = K, un = N;
-    id<MTLBuffer> mBuf = [g_device newBufferWithBytes:&um length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> kBuf = [g_device newBufferWithBytes:&uk length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> nBuf = [g_device newBufferWithBytes:&un length:4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> mBuf = const_buf(&um, 4);
+    id<MTLBuffer> kBuf = const_buf(&uk, 4);
+    id<MTLBuffer> nBuf = const_buf(&un, 4);
     id<MTLCommandBuffer> cmd = [q commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     [enc setBuffer:(__bridge id<MTLBuffer>)aRef offset:0 atIndex:0];
@@ -3715,9 +3749,9 @@ void mtl_gemm_nn_q(void* aRef, void* bRef, void* cRef, int M, int K, int N, int 
     @autoreleasepool {
     id<MTLCommandQueue> q = (queueIdx == 0) ? g_queue : g_queue2;
     uint32_t um = M, uk = K, un = N;
-    id<MTLBuffer> mBuf = [g_device newBufferWithBytes:&um length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> kBuf = [g_device newBufferWithBytes:&uk length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> nBuf = [g_device newBufferWithBytes:&un length:4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> mBuf = const_buf(&um, 4);
+    id<MTLBuffer> kBuf = const_buf(&uk, 4);
+    id<MTLBuffer> nBuf = const_buf(&un, 4);
     id<MTLCommandBuffer> cmd = [q commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     [enc setBuffer:(__bridge id<MTLBuffer>)aRef offset:0 atIndex:0];
@@ -3745,8 +3779,8 @@ void mtl_rmsnorm_save_q2(void* xRef, void* wRef, void* scaleRef, int seqLen, int
     id<MTLCommandQueue> q = (queueIdx == 0) ? g_queue : g_queue2;
     uint32_t udim = dim;
     float eps = 1e-6f;
-    id<MTLBuffer> dimBuf = [g_device newBufferWithBytes:&udim length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> epsBuf = [g_device newBufferWithBytes:&eps length:4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> dimBuf = const_buf(&udim, 4);
+    id<MTLBuffer> epsBuf = const_buf(&eps, 4);
     id<MTLCommandBuffer> cmd = [q commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     [enc setComputePipelineState:g_ps_rmsnorm_save];
@@ -3771,12 +3805,12 @@ void mtl_fused_attention_q(void* qRef, void* kRef, void* vRef, void* outRef, voi
     @autoreleasepool {
     id<MTLCommandQueue> q = (queueIdx == 0) ? g_queue : g_queue2;
     uint32_t ud = dim, ukv = kvDim, uhd = headDim, unh = nHeads, unkv = nKVHeads, un = seqLen;
-    id<MTLBuffer> dBuf   = [g_device newBufferWithBytes:&ud   length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> kvBuf  = [g_device newBufferWithBytes:&ukv  length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> hdBuf  = [g_device newBufferWithBytes:&uhd  length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> nhBuf  = [g_device newBufferWithBytes:&unh  length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> nkvBuf = [g_device newBufferWithBytes:&unkv length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> nBuf   = [g_device newBufferWithBytes:&un   length:4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> dBuf   = const_buf(&ud, 4);
+    id<MTLBuffer> kvBuf  = const_buf(&ukv, 4);
+    id<MTLBuffer> hdBuf  = const_buf(&uhd, 4);
+    id<MTLBuffer> nhBuf  = const_buf(&unh, 4);
+    id<MTLBuffer> nkvBuf = const_buf(&unkv, 4);
+    id<MTLBuffer> nBuf   = const_buf(&un, 4);
     id<MTLCommandBuffer> cmd = [q commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     [enc setComputePipelineState:g_ps_fused_attn];
@@ -3808,12 +3842,12 @@ void mtl_fused_attention_bwd_q(void* dOutRef, void* qRef, void* kRef, void* vRef
     @autoreleasepool {
     id<MTLCommandQueue> q = (queueIdx == 0) ? g_queue : g_queue2;
     uint32_t ud = dim, ukv = kvDim, uhd = headDim, unh = nHeads, unkv = nKVHeads, un = seqLen;
-    id<MTLBuffer> dBuf   = [g_device newBufferWithBytes:&ud   length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> kvBuf  = [g_device newBufferWithBytes:&ukv  length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> hdBuf  = [g_device newBufferWithBytes:&uhd  length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> nhBuf  = [g_device newBufferWithBytes:&unh  length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> nkvBuf = [g_device newBufferWithBytes:&unkv length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> nBuf   = [g_device newBufferWithBytes:&un   length:4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> dBuf   = const_buf(&ud, 4);
+    id<MTLBuffer> kvBuf  = const_buf(&ukv, 4);
+    id<MTLBuffer> hdBuf  = const_buf(&uhd, 4);
+    id<MTLBuffer> nhBuf  = const_buf(&unh, 4);
+    id<MTLBuffer> nkvBuf = const_buf(&unkv, 4);
+    id<MTLBuffer> nBuf   = const_buf(&un, 4);
     id<MTLCommandBuffer> cmd = [q commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     [enc setComputePipelineState:g_ps_fused_attn_bwd];
@@ -3845,7 +3879,7 @@ void mtl_bias_add_q(void* xRef, void* bRef, int n, int cols, int queueIdx) {
     @autoreleasepool {
     id<MTLCommandQueue> q = (queueIdx == 0) ? g_queue : g_queue2;
     uint32_t ucols = (uint32_t)cols;
-    id<MTLBuffer> colsBuf = [g_device newBufferWithBytes:&ucols length:4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> colsBuf = const_buf(&ucols, 4);
     id<MTLCommandBuffer> cmd = [q commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     [enc setComputePipelineState:g_ps_bias_add];
@@ -3865,10 +3899,10 @@ void mtl_rope_fwd_q(void* xRef, int headDim, int nHeads, float theta, int stride
     @autoreleasepool {
     id<MTLCommandQueue> q = (queueIdx == 0) ? g_queue : g_queue2;
     uint32_t uhd = headDim, unh = nHeads, ust = stride;
-    id<MTLBuffer> hdBuf  = [g_device newBufferWithBytes:&uhd   length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> nhBuf  = [g_device newBufferWithBytes:&unh   length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> thBuf  = [g_device newBufferWithBytes:&theta length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> stBuf  = [g_device newBufferWithBytes:&ust   length:4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> hdBuf  = const_buf(&uhd, 4);
+    id<MTLBuffer> nhBuf  = const_buf(&unh, 4);
+    id<MTLBuffer> thBuf  = const_buf(&theta, 4);
+    id<MTLBuffer> stBuf  = const_buf(&ust, 4);
     id<MTLCommandBuffer> cmd = [q commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     [enc setComputePipelineState:g_ps_rope_fwd];
@@ -3889,10 +3923,10 @@ void mtl_rope_bwd_q(void* dxRef, int headDim, int nHeads, float theta, int strid
     @autoreleasepool {
     id<MTLCommandQueue> q = (queueIdx == 0) ? g_queue : g_queue2;
     uint32_t uhd = headDim, unh = nHeads, ust = stride;
-    id<MTLBuffer> hdBuf  = [g_device newBufferWithBytes:&uhd   length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> nhBuf  = [g_device newBufferWithBytes:&unh   length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> thBuf  = [g_device newBufferWithBytes:&theta length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> stBuf  = [g_device newBufferWithBytes:&ust   length:4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> hdBuf  = const_buf(&uhd, 4);
+    id<MTLBuffer> nhBuf  = const_buf(&unh, 4);
+    id<MTLBuffer> thBuf  = const_buf(&theta, 4);
+    id<MTLBuffer> stBuf  = const_buf(&ust, 4);
     id<MTLCommandBuffer> cmd = [q commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
     [enc setComputePipelineState:g_ps_rope_bwd];
@@ -3921,8 +3955,8 @@ void mtl_rmsnorm_save_q(void* xRef, void* weightRef, void* scaleRef, int seqLen,
     // For now: dispatch existing kernel on specified queue
     uint32_t dimVal = (uint32_t)dim;
     float epsVal = 1e-6f;
-    id<MTLBuffer> dimBuf = [g_device newBufferWithBytes:&dimVal length:sizeof(uint32_t) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> epsBuf = [g_device newBufferWithBytes:&epsVal length:sizeof(float) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> dimBuf = const_buf(&dimVal, 4);
+    id<MTLBuffer> epsBuf = const_buf(&epsVal, 4);
 
     id<MTLCommandBuffer> cmd = [q commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
@@ -4031,14 +4065,14 @@ void mtl_helix_needle_q(
     id<MTLCommandQueue> q = (queueIdx == 0) ? g_queue : g_queue2;
 
     uint32_t ucols = (uint32_t)cols;
-    id<MTLBuffer> lrBuf   = [g_device newBufferWithBytes:&lr    length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> b1Buf   = [g_device newBufferWithBytes:&beta1 length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> b2Buf   = [g_device newBufferWithBytes:&beta2 length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> bc1Buf  = [g_device newBufferWithBytes:&bc1   length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> bc2Buf  = [g_device newBufferWithBytes:&bc2   length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> epsBuf  = [g_device newBufferWithBytes:&eps   length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> wdBuf   = [g_device newBufferWithBytes:&wd    length:sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> colsBuf = [g_device newBufferWithBytes:&ucols length:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> lrBuf   = const_buf(&lr, 4);
+    id<MTLBuffer> b1Buf   = const_buf(&beta1, 4);
+    id<MTLBuffer> b2Buf   = const_buf(&beta2, 4);
+    id<MTLBuffer> bc1Buf  = const_buf(&bc1, 4);
+    id<MTLBuffer> bc2Buf  = const_buf(&bc2, 4);
+    id<MTLBuffer> epsBuf  = const_buf(&eps, 4);
+    id<MTLBuffer> wdBuf   = const_buf(&wd, 4);
+    id<MTLBuffer> colsBuf = const_buf(&ucols, 4);
 
     id<MTLCommandBuffer> cmd = [q commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
@@ -4072,7 +4106,7 @@ void mtl_dequant_int8_q(void* srcRef, void* scalesRef, void* dstRef, int n, int 
     @autoreleasepool {
     id<MTLCommandQueue> q = (queueIdx == 0) ? g_queue : g_queue2;
     uint32_t ucols = (uint32_t)cols;
-    id<MTLBuffer> colsBuf = [g_device newBufferWithBytes:&ucols length:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> colsBuf = const_buf(&ucols, 4);
 
     id<MTLCommandBuffer> cmd = [q commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
@@ -4149,9 +4183,9 @@ void mtl_fused_dequant_delta(void* srcRef, void* scalesRef, void* deltaRef, void
 void mtl_fused_lm_head_pass1(void* hiddenRef, void* embedRef, void* maxRef, void* sumExpRef,
                               int dim, int vocabSize, int nPositions) {
     uint32_t udim = dim, uvocab = vocabSize, un = nPositions;
-    id<MTLBuffer> dimBuf   = [g_device newBufferWithBytes:&udim   length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> vocabBuf = [g_device newBufferWithBytes:&uvocab length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> nBuf     = [g_device newBufferWithBytes:&un     length:4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> dimBuf   = const_buf(&udim, 4);
+    id<MTLBuffer> vocabBuf = const_buf(&uvocab, 4);
+    id<MTLBuffer> nBuf     = const_buf(&un, 4);
     id<MTLComputeCommandEncoder> enc = g_fused_enc[g_active_fused_slot];
     [enc setComputePipelineState:g_ps_lm_pass1];
     [enc setBuffer:(__bridge id<MTLBuffer>)hiddenRef offset:0 atIndex:0];
@@ -4173,10 +4207,10 @@ void mtl_fused_lm_head_pass2(void* hiddenRef, void* embedRef, void* maxRef, void
                               int dim, int vocabSize, int nPositions) {
     uint32_t udim = dim, uvocab = vocabSize, un = nPositions;
     float invN = 1.0f / (float)nPositions;
-    id<MTLBuffer> dimBuf   = [g_device newBufferWithBytes:&udim   length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> vocabBuf = [g_device newBufferWithBytes:&uvocab length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> nBuf     = [g_device newBufferWithBytes:&un     length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> invNBuf  = [g_device newBufferWithBytes:&invN   length:4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> dimBuf   = const_buf(&udim, 4);
+    id<MTLBuffer> vocabBuf = const_buf(&uvocab, 4);
+    id<MTLBuffer> nBuf     = const_buf(&un, 4);
+    id<MTLBuffer> invNBuf  = const_buf(&invN, 4);
     // Zero loss scalar before atomic adds
     float zero = 0.0f;
     memcpy([(__bridge id<MTLBuffer>)lossRef contents], &zero, sizeof(float));
@@ -4202,9 +4236,9 @@ void mtl_fused_lm_head_pass2(void* hiddenRef, void* embedRef, void* maxRef, void
 // Sparse TN GEMM: C = A^T @ B, skipping output rows where mask[row]==0.
 void mtl_fused_gemm_tn_sparse(void* aRef, void* bRef, void* cRef, void* maskRef, int M, int K, int N) {
     uint32_t um = M, uk = K, un = N;
-    id<MTLBuffer> mBuf = [g_device newBufferWithBytes:&um length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> kBuf = [g_device newBufferWithBytes:&uk length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> nBuf = [g_device newBufferWithBytes:&un length:4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> mBuf = const_buf(&um, 4);
+    id<MTLBuffer> kBuf = const_buf(&uk, 4);
+    id<MTLBuffer> nBuf = const_buf(&un, 4);
     [g_fused_enc[g_active_fused_slot] setComputePipelineState:g_ps_gemm_tn_sparse];
     [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)aRef    offset:0 atIndex:0];
     [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)bRef    offset:0 atIndex:1];
