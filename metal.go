@@ -116,8 +116,12 @@ void mtl_fused_zero_scalar(void* buf);
 void mtl_fused_barrier_buffers(void);
 void mtl_fused_grad_norm_sq(void* grad, void* sumSq, int n);
 void mtl_fused_grad_clip_scale(void* grad, void* sumSq, float maxNorm, int n);
+void mtl_fused_commit_slot(int slot);
+void mtl_fused_wait_slot(int slot);
 void mtl_fused_dequant_delta(void* src, void* scales, void* delta, void* dst, int n, int cols);
 void mtl_fused_dequant_delta_sparse(void* src, void* scales, void* delta, void* dst, void* mask, int n, int cols);
+void mtl_fused_lm_head_pass1(void* hidden, void* embed, void* maxBuf, void* sumExp, int dim, int vocabSize, int n);
+void mtl_fused_lm_head_pass2(void* hidden, void* embed, void* maxBuf, void* sumExp, void* targets, void* dHidden, void* loss, int dim, int vocabSize, int n);
 void mtl_fused_gemm_tn_sparse(void* a, void* b, void* c, void* mask, int M, int K, int N);
 void mtl_fused_end_async(void);
 void mtl_fused_wait(void);
@@ -510,9 +514,11 @@ func (m *Metal) poolPut(sizeFloats int, buf C.MTLBufferRef) {
 
 func (m *Metal) FusedBegin()             { C.mtl_fused_begin() }
 func (m *Metal) FusedEnd()               { C.mtl_fused_end() }
-func (m *Metal) FusedBeginSlot(slot int) { C.mtl_fused_begin_slot(C.int(slot)) }
-func (m *Metal) FusedEndSlot(slot int)   { C.mtl_fused_end_slot(C.int(slot)) }
-func (m *Metal) FusedSetSlot(slot int)   { C.mtl_fused_set_slot(C.int(slot)) }
+func (m *Metal) FusedBeginSlot(slot int)  { C.mtl_fused_begin_slot(C.int(slot)) }
+func (m *Metal) FusedEndSlot(slot int)    { C.mtl_fused_end_slot(C.int(slot)) }
+func (m *Metal) FusedSetSlot(slot int)    { C.mtl_fused_set_slot(C.int(slot)) }
+func (m *Metal) FusedCommitSlot(slot int) { C.mtl_fused_commit_slot(C.int(slot)) }
+func (m *Metal) FusedWaitSlot(slot int)   { C.mtl_fused_wait_slot(C.int(slot)) }
 func (m *Metal) FusedSyncAll()           { C.mtl_fused_sync_all() }
 
 func (m *Metal) FusedGemmBT(a, b, c *Tensor, M, K, N int) {
@@ -689,6 +695,17 @@ func (m *Metal) FusedGradClipScale(grad, sumSq *Tensor, maxNorm float32, n int) 
 
 func (m *Metal) FusedDequantDelta(src, scales, delta, dst *Tensor, n, cols int) {
 	C.mtl_fused_dequant_delta(MtlBufPtr(src), MtlBufPtr(scales), MtlBufPtr(delta), MtlBufPtr(dst), C.int(n), C.int(cols))
+}
+
+func (m *Metal) FusedLMHeadPass1(hidden, embed, maxBuf, sumExp *Tensor, dim, vocabSize, n int) {
+	C.mtl_fused_lm_head_pass1(MtlBufPtr(hidden), MtlBufPtr(embed), MtlBufPtr(maxBuf), MtlBufPtr(sumExp),
+		C.int(dim), C.int(vocabSize), C.int(n))
+}
+
+func (m *Metal) FusedLMHeadPass2(hidden, embed, maxBuf, sumExp, targets, dHidden, loss *Tensor, dim, vocabSize, n int) {
+	C.mtl_fused_lm_head_pass2(MtlBufPtr(hidden), MtlBufPtr(embed), MtlBufPtr(maxBuf), MtlBufPtr(sumExp),
+		MtlBufPtr(targets), MtlBufPtr(dHidden), MtlBufPtr(loss),
+		C.int(dim), C.int(vocabSize), C.int(n))
 }
 
 func (m *Metal) FusedGemmF32TNSparse(a, b, c *Tensor, mask *HotRowMask, M, K, N int) {

@@ -3191,6 +3191,22 @@ void mtl_fused_end_slot(int slot) {
     g_fused_cmd[slot] = nil;
 }
 
+// Commit slot but keep cmd for wait.
+void mtl_fused_commit_slot(int slot) {
+    if (!g_fused_enc[slot]) return;
+    [g_fused_enc[slot] endEncoding];
+    [g_fused_cmd[slot] commit];
+    g_fused_enc[slot] = nil;
+}
+
+// Wait for a previously committed slot.
+void mtl_fused_wait_slot(int slot) {
+    if (g_fused_cmd[slot]) {
+        [g_fused_cmd[slot] waitUntilCompleted];
+        g_fused_cmd[slot] = nil;
+    }
+}
+
 // Set the active fused slot (for routing get_cmd/get_enc).
 void mtl_fused_set_slot(int slot) {
     g_active_fused_slot = slot;
@@ -4120,6 +4136,60 @@ void mtl_fused_dequant_delta(void* srcRef, void* scalesRef, void* deltaRef, void
     NSUInteger tpg = g_ps_dequant_delta.maxTotalThreadsPerThreadgroup;
     if (tpg > 1024) tpg = 1024;
     [g_fused_enc[g_active_fused_slot] dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+}
+
+// Fused LM head pass 1: max + sumExp per position. No logits buffer.
+void mtl_fused_lm_head_pass1(void* hiddenRef, void* embedRef, void* maxRef, void* sumExpRef,
+                              int dim, int vocabSize, int nPositions) {
+    uint32_t udim = dim, uvocab = vocabSize, un = nPositions;
+    id<MTLBuffer> dimBuf   = [g_device newBufferWithBytes:&udim   length:4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> vocabBuf = [g_device newBufferWithBytes:&uvocab length:4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> nBuf     = [g_device newBufferWithBytes:&un     length:4 options:MTLResourceStorageModeShared];
+    id<MTLComputeCommandEncoder> enc = g_fused_enc[g_active_fused_slot];
+    [enc setComputePipelineState:g_ps_lm_pass1];
+    [enc setBuffer:(__bridge id<MTLBuffer>)hiddenRef offset:0 atIndex:0];
+    [enc setBuffer:(__bridge id<MTLBuffer>)embedRef  offset:0 atIndex:1];
+    [enc setBuffer:(__bridge id<MTLBuffer>)maxRef    offset:0 atIndex:2];
+    [enc setBuffer:(__bridge id<MTLBuffer>)sumExpRef offset:0 atIndex:3];
+    [enc setBuffer:dimBuf   offset:0 atIndex:4];
+    [enc setBuffer:vocabBuf offset:0 atIndex:5];
+    [enc setBuffer:nBuf     offset:0 atIndex:6];
+    NSUInteger tpg = g_ps_lm_pass1.maxTotalThreadsPerThreadgroup;
+    tpg = (tpg / 32) * 32;
+    if (tpg == 0) tpg = 32;
+    [enc dispatchThreadgroups:MTLSizeMake(nPositions, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+}
+
+// Fused LM head pass 2: loss + dHidden from softmax CE gradient. No logits buffer.
+void mtl_fused_lm_head_pass2(void* hiddenRef, void* embedRef, void* maxRef, void* sumExpRef,
+                              void* targetsRef, void* dHiddenRef, void* lossRef,
+                              int dim, int vocabSize, int nPositions) {
+    uint32_t udim = dim, uvocab = vocabSize, un = nPositions;
+    float invN = 1.0f / (float)nPositions;
+    id<MTLBuffer> dimBuf   = [g_device newBufferWithBytes:&udim   length:4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> vocabBuf = [g_device newBufferWithBytes:&uvocab length:4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> nBuf     = [g_device newBufferWithBytes:&un     length:4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> invNBuf  = [g_device newBufferWithBytes:&invN   length:4 options:MTLResourceStorageModeShared];
+    // Zero loss scalar before atomic adds
+    float zero = 0.0f;
+    memcpy([(__bridge id<MTLBuffer>)lossRef contents], &zero, sizeof(float));
+    id<MTLComputeCommandEncoder> enc = g_fused_enc[g_active_fused_slot];
+    [enc setComputePipelineState:g_ps_lm_pass2];
+    [enc setBuffer:(__bridge id<MTLBuffer>)hiddenRef   offset:0 atIndex:0];
+    [enc setBuffer:(__bridge id<MTLBuffer>)embedRef    offset:0 atIndex:1];
+    [enc setBuffer:(__bridge id<MTLBuffer>)maxRef      offset:0 atIndex:2];
+    [enc setBuffer:(__bridge id<MTLBuffer>)sumExpRef   offset:0 atIndex:3];
+    [enc setBuffer:(__bridge id<MTLBuffer>)targetsRef  offset:0 atIndex:4];
+    [enc setBuffer:(__bridge id<MTLBuffer>)dHiddenRef  offset:0 atIndex:5];
+    [enc setBuffer:(__bridge id<MTLBuffer>)lossRef     offset:0 atIndex:6];
+    [enc setBuffer:dimBuf   offset:0 atIndex:7];
+    [enc setBuffer:vocabBuf offset:0 atIndex:8];
+    [enc setBuffer:nBuf     offset:0 atIndex:9];
+    [enc setBuffer:invNBuf  offset:0 atIndex:10];
+    NSUInteger tpg = g_ps_lm_pass2.maxTotalThreadsPerThreadgroup;
+    tpg = (tpg / 32) * 32;
+    if (tpg == 0) tpg = 32;
+    [enc dispatchThreadgroups:MTLSizeMake(nPositions, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
 }
 
 // Sparse TN GEMM: C = A^T @ B, skipping output rows where mask[row]==0.
