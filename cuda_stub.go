@@ -84,6 +84,8 @@ func (c *CUDA) ReleaseInt8(q *Int8Tensor)                        {}
 func (c *CUDA) DequantToFP16(q *Int8Tensor, fp16Buf unsafe.Pointer) {}
 func (c *CUDA) DequantToFP32(q *Int8Tensor, fp32Buf unsafe.Pointer) {}
 func (c *CUDA) AllocGPU(bytes int) unsafe.Pointer                   { return nil }
+func (c *CUDA) UploadRaw(dst *Tensor, data []int8)                  {}
+func (c *CUDA) UploadRawBytes(dst *Tensor, data unsafe.Pointer, nBytes int) {}
 func (c *CUDA) ZerosL3(shape []int) *Tensor                         { return nil }
 func (c *CUDA) AllocFP16Buffer(nElements int) unsafe.Pointer     { return nil }
 func (c *CUDA) AllocFP16Tensor(nElements int, shape []int) *Tensor { return nil }

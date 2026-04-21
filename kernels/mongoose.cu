@@ -1596,4 +1596,21 @@ void mongoose_kv_cache_write(float* cache, const float* src, int pos, int kvDim,
     kv_cache_write_kernel<<<blocks, threads, 0, stream>>>(cache, src, pos, kvDim);
 }
 
+// Dequant INT8 + FP32 delta → FP32 output.
+__global__ void dequant_int8_delta_kernel(
+    const int8_t* __restrict__ data, const float* __restrict__ scales,
+    const float* __restrict__ delta, float* __restrict__ out, int n, int cols) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float scale = scales[i / cols] / 127.0f;
+    out[i] = (float)data[i] * scale + delta[i];
+}
+
+void mongoose_dequant_int8_delta(
+    const void* data, const float* scales, const float* delta,
+    float* out, int n, int cols, cudaStream_t stream) {
+    dequant_int8_delta_kernel<<<(n+255)/256, 256, 0, stream>>>(
+        (const int8_t*)data, scales, delta, out, n, cols);
+}
+
 } // extern "C"

@@ -810,6 +810,14 @@ func (c *CUDA) UploadInto(dst *Tensor, data []float32) {
 	C.tw_gpu_upload(dst.device.(*cuPtr).ptr, unsafe.Pointer(&data[0]), C.size_t(len(data)*4))
 }
 
+func (c *CUDA) UploadRaw(dst *Tensor, data []int8) {
+	C.tw_gpu_upload(dst.device.(*cuPtr).ptr, unsafe.Pointer(&data[0]), C.size_t(len(data)))
+}
+
+func (c *CUDA) UploadRawBytes(dst *Tensor, data unsafe.Pointer, nBytes int) {
+	C.tw_gpu_upload(dst.device.(*cuPtr).ptr, data, C.size_t(nBytes))
+}
+
 func (c *CUDA) UploadSlice(dst *Tensor, offsetFloats int, data []float32) {
 	dstPtr := unsafe.Add(dst.device.(*cuPtr).ptr, offsetFloats*4)
 	C.tw_gpu_upload(dstPtr, unsafe.Pointer(&data[0]), C.size_t(len(data)*4))

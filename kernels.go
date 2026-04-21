@@ -43,6 +43,7 @@ typedef void (*fn_helix_needle)(void*, float*, const float*, void*, void*, const
 typedef void (*fn_helix_needle_paired)(void*, void*, float*, float*, const float*, const float*, void*, void*, void*, void*, const void*, float, float, float, float, float, float, float, float, float, float, float, float, float, float, int, int, cudaStream_t);
 typedef void (*fn_dequant_int8_fp16)(const void*, const float*, void*, int, int, cudaStream_t);
 typedef void (*fn_dequant_int8_fp32)(const void*, const float*, float*, int, int, cudaStream_t);
+typedef void (*fn_dequant_int8_delta)(const void*, const float*, const float*, float*, int, int, cudaStream_t);
 typedef void (*fn_fp32_to_fp16)(const float*, void*, int, cudaStream_t);
 typedef void (*fn_fp16_to_fp32)(const void*, float*, int, cudaStream_t);
 typedef void (*fn_rmsnorm_wgrad)(const float*, const float*, const float*, float*, int, int, cudaStream_t);
@@ -90,6 +91,7 @@ static fn_helix_needle      k_helix_needle = NULL;
 static fn_helix_needle_paired k_helix_needle_paired = NULL;
 static fn_dequant_int8_fp16 k_dequant_int8_fp16 = NULL;
 static fn_dequant_int8_fp32 k_dequant_int8_fp32 = NULL;
+static fn_dequant_int8_delta k_dequant_int8_delta = NULL;
 static fn_fp32_to_fp16     k_fp32_to_fp16 = NULL;
 static fn_fp16_to_fp32     k_fp16_to_fp32 = NULL;
 static fn_rmsnorm_wgrad    k_rmsnorm_wgrad = NULL;
@@ -140,6 +142,7 @@ int tw_load_kernels(const char* path) {
     k_helix_needle_paired = (fn_helix_needle_paired)dlsym(kernel_lib, "mongoose_helix_needle_paired");
     k_dequant_int8_fp16   = (fn_dequant_int8_fp16)dlsym(kernel_lib, "mongoose_dequant_int8_to_fp16");
     k_dequant_int8_fp32   = (fn_dequant_int8_fp32)dlsym(kernel_lib, "mongoose_dequant_int8_to_fp32");
+    k_dequant_int8_delta  = (fn_dequant_int8_delta)dlsym(kernel_lib, "mongoose_dequant_int8_delta");
     k_fp32_to_fp16        = (fn_fp32_to_fp16)dlsym(kernel_lib, "mongoose_fp32_to_fp16");
     k_fp16_to_fp32        = (fn_fp16_to_fp32)dlsym(kernel_lib, "mongoose_fp16_to_fp32");
     k_rmsnorm_wgrad       = (fn_rmsnorm_wgrad)dlsym(kernel_lib, "mongoose_rmsnorm_wgrad");
@@ -329,6 +332,9 @@ void tw_k_softmax_ce(float* logits, const int* targets, float* losses, float* gr
 int tw_softmax_ce_loaded() { return k_softmax_ce != NULL ? 1 : 0; }
 void tw_k_dequant_int8_fp16(const void* data, const float* scales, void* out, int rows, int cols) {
     if (k_dequant_int8_fp16) k_dequant_int8_fp16(data, scales, out, rows, cols, 0);
+}
+void tw_k_dequant_int8_delta(const void* data, const float* scales, const float* delta, float* out, int n, int cols) {
+    if (k_dequant_int8_delta) k_dequant_int8_delta(data, scales, delta, out, n, cols, 0);
 }
 void tw_k_dequant_int8_fp32(const void* data, const float* scales, float* out, int rows, int cols) {
     if (k_dequant_int8_fp32) k_dequant_int8_fp32(data, scales, out, rows, cols, 0);
@@ -716,6 +722,10 @@ func KDequantInt8ToFP16(dataPtr, scalesPtr, outPtr unsafe.Pointer, rows, cols in
 
 // KDequantInt8ToFP32: dequantize INT8 weights to FP32 on GPU.
 // data[rows,cols] INT8 + scales[rows] FP32 → out[rows,cols] FP32.
+func KDequantInt8DeltaToFP32(dataPtr, scalesPtr, deltaPtr, outPtr unsafe.Pointer, n, cols int) {
+	C.tw_k_dequant_int8_delta(dataPtr, (*C.float)(scalesPtr), (*C.float)(deltaPtr), (*C.float)(outPtr), C.int(n), C.int(cols))
+}
+
 func KDequantInt8ToFP32(dataPtr, scalesPtr, outPtr unsafe.Pointer, rows, cols int) {
 	C.tw_k_dequant_int8_fp32(dataPtr, (*C.float)(scalesPtr), (*C.float)(outPtr), C.int(rows), C.int(cols))
 }
