@@ -46,6 +46,14 @@ typedef void (*fn_dequant_int8_fp32)(const void*, const float*, float*, int, int
 typedef void (*fn_dequant_int8_delta)(const void*, const float*, const float*, float*, int, int, cudaStream_t);
 typedef void (*fn_fp32_to_fp16)(const float*, void*, int, cudaStream_t);
 typedef void (*fn_fp16_to_fp32)(const void*, float*, int, cudaStream_t);
+typedef void (*fn_fp16_add_inplace)(void*, const void*, int, cudaStream_t);
+typedef void (*fn_fp32_add_fp16)(float*, const void*, int, cudaStream_t);
+typedef void (*fn_rmsnorm_save_fp16)(const void*, void*, const void*, float*, int, int, cudaStream_t);
+typedef void (*fn_rmsnorm_bwd_fp16)(const void*, const void*, const void*, const float*, void*, int, int, cudaStream_t);
+typedef void (*fn_rope_fp16)(void*, const float*, const float*, int, int, int, int, cudaStream_t);
+typedef void (*fn_attn_gqa_fp16)(const void*, const void*, const void*, void*, int, int, int, int, int, cudaStream_t);
+typedef void (*fn_silu_gate_mul_fp16)(const void*, const void*, void*, int, cudaStream_t);
+typedef void (*fn_silu_gate_bwd_fp16)(const void*, const void*, const void*, void*, void*, int, cudaStream_t);
 typedef void (*fn_rmsnorm_wgrad)(const float*, const float*, const float*, float*, int, int, cudaStream_t);
 typedef void (*fn_grad_sumsq)(const float*, float*, int, cudaStream_t);
 typedef void (*fn_grad_scale)(float*, float, int, cudaStream_t);
@@ -100,6 +108,15 @@ static fn_grad_scale       k_grad_scale = NULL;
 static fn_q8_matvec        k_q8_matvec = NULL;
 static fn_q4_matvec        k_q4_matvec = NULL;
 static fn_kv_cache_write   k_kv_cache_write = NULL;
+static fn_fp16_add_inplace   k_fp16_add_inplace = NULL;
+static fn_fp32_add_fp16      k_fp32_add_fp16 = NULL;
+static fn_rmsnorm_save_fp16  k_rmsnorm_save_fp16 = NULL;
+static fn_rmsnorm_bwd_fp16   k_rmsnorm_bwd_fp16 = NULL;
+static fn_rope_fp16          k_rope_fp16 = NULL;
+static fn_rope_fp16          k_rope_bwd_fp16 = NULL;
+static fn_attn_gqa_fp16      k_attn_gqa_fp16 = NULL;
+static fn_silu_gate_mul_fp16 k_silu_gate_mul_fp16 = NULL;
+static fn_silu_gate_bwd_fp16 k_silu_gate_bwd_fp16 = NULL;
 
 int tw_load_kernels(const char* path) {
     kernel_lib = dlopen(path, RTLD_NOW);
@@ -151,6 +168,15 @@ int tw_load_kernels(const char* path) {
     k_q8_matvec           = (fn_q8_matvec)dlsym(kernel_lib, "mongoose_q8_matvec");
     k_q4_matvec           = (fn_q4_matvec)dlsym(kernel_lib, "mongoose_q4_matvec");
     k_kv_cache_write      = (fn_kv_cache_write)dlsym(kernel_lib, "mongoose_kv_cache_write");
+    k_fp16_add_inplace    = (fn_fp16_add_inplace)dlsym(kernel_lib, "mongoose_fp16_add_inplace");
+    k_fp32_add_fp16       = (fn_fp32_add_fp16)dlsym(kernel_lib, "mongoose_fp32_add_fp16");
+    k_rmsnorm_save_fp16   = (fn_rmsnorm_save_fp16)dlsym(kernel_lib, "mongoose_rmsnorm_out_save_fp16");
+    k_rmsnorm_bwd_fp16    = (fn_rmsnorm_bwd_fp16)dlsym(kernel_lib, "mongoose_rmsnorm_backward_fp16");
+    k_rope_fp16           = (fn_rope_fp16)dlsym(kernel_lib, "mongoose_rope_fp16");
+    k_rope_bwd_fp16       = (fn_rope_fp16)dlsym(kernel_lib, "mongoose_rope_backward_fp16");
+    k_attn_gqa_fp16       = (fn_attn_gqa_fp16)dlsym(kernel_lib, "mongoose_causal_attention_gqa_fp16");
+    k_silu_gate_mul_fp16  = (fn_silu_gate_mul_fp16)dlsym(kernel_lib, "mongoose_silu_gate_mul_fp16");
+    k_silu_gate_bwd_fp16  = (fn_silu_gate_bwd_fp16)dlsym(kernel_lib, "mongoose_silu_gate_backward_fp16");
 
     if (!k_rmsnorm || !k_relu || !k_add_inplace || !k_embedding_gather) return -2;
     return 0;
@@ -359,6 +385,37 @@ int tw_sparse_kernels_loaded() {
 }
 int tw_sparse_fp16_kernels_loaded() {
     return (k_relu_and_index_fp16 != NULL && k_sparse_matmul_fp16 != NULL) ? 1 : 0;
+}
+int tw_fp16_train_kernels_loaded() {
+    return (k_rmsnorm_save_fp16 && k_rope_fp16 && k_attn_gqa_fp16 &&
+            k_silu_gate_mul_fp16 && k_silu_gate_bwd_fp16) ? 1 : 0;
+}
+void tw_k_fp16_add_inplace(void* a, const void* b, int n) {
+    if (k_fp16_add_inplace) k_fp16_add_inplace(a, b, n, 0);
+}
+void tw_k_fp32_add_fp16(float* a, const void* b, int n) {
+    if (k_fp32_add_fp16) k_fp32_add_fp16(a, b, n, 0);
+}
+void tw_k_rmsnorm_save_fp16(const void* in, void* out, const void* w, float* scales, int seqLen, int dim) {
+    if (k_rmsnorm_save_fp16) k_rmsnorm_save_fp16(in, out, w, scales, seqLen, dim, 0);
+}
+void tw_k_rmsnorm_bwd_fp16(const void* dOut, const void* xIn, const void* w, const float* scales, void* dx, int seqLen, int dim) {
+    if (k_rmsnorm_bwd_fp16) k_rmsnorm_bwd_fp16(dOut, xIn, w, scales, dx, seqLen, dim, 0);
+}
+void tw_k_rope_fp16(void* x, const float* cos_tab, const float* sin_tab, int seqLen, int dim, int headDim, int nHeads) {
+    if (k_rope_fp16) k_rope_fp16(x, cos_tab, sin_tab, seqLen, dim, headDim, nHeads, 0);
+}
+void tw_k_rope_bwd_fp16(void* dx, const float* cos_tab, const float* sin_tab, int seqLen, int dim, int headDim, int nHeads) {
+    if (k_rope_bwd_fp16) k_rope_bwd_fp16(dx, cos_tab, sin_tab, seqLen, dim, headDim, nHeads, 0);
+}
+void tw_k_attn_gqa_fp16(const void* Q, const void* K, const void* V, void* out, int seqLen, int dim, int kvDim, int numHeads, int numKVHeads) {
+    if (k_attn_gqa_fp16) k_attn_gqa_fp16(Q, K, V, out, seqLen, dim, kvDim, numHeads, numKVHeads, 0);
+}
+void tw_k_silu_gate_mul_fp16(const void* gate, const void* up, void* out, int n) {
+    if (k_silu_gate_mul_fp16) k_silu_gate_mul_fp16(gate, up, out, n, 0);
+}
+void tw_k_silu_gate_bwd_fp16(const void* dOut, const void* gate, const void* up, void* dGate, void* dUp, int n) {
+    if (k_silu_gate_bwd_fp16) k_silu_gate_bwd_fp16(dOut, gate, up, dGate, dUp, n, 0);
 }
 */
 import "C"
@@ -760,3 +817,42 @@ func HasQ8Matvec() bool { return C.tw_k_has_q8_matvec() != 0 }
 
 // HasQ4Matvec returns true if the fused Q4 matvec kernel is loaded.
 func HasQ4Matvec() bool { return C.tw_k_has_q4_matvec() != 0 }
+
+// FP16TrainKernelsLoaded returns true if all native FP16 training kernels are available.
+func FP16TrainKernelsLoaded() bool { return C.tw_fp16_train_kernels_loaded() == 1 }
+
+func KFP16AddInPlace(aPtr, bPtr unsafe.Pointer, n int) {
+	C.tw_k_fp16_add_inplace(aPtr, bPtr, C.int(n))
+}
+
+func KFP32AddFP16(aPtr unsafe.Pointer, bPtr unsafe.Pointer, n int) {
+	C.tw_k_fp32_add_fp16((*C.float)(aPtr), bPtr, C.int(n))
+}
+
+func KRMSNormOutSaveFP16(inPtr, outPtr, weightPtr unsafe.Pointer, scalesPtr unsafe.Pointer, seqLen, dim int) {
+	C.tw_k_rmsnorm_save_fp16(inPtr, outPtr, weightPtr, (*C.float)(scalesPtr), C.int(seqLen), C.int(dim))
+}
+
+func KRMSNormBackwardFP16(dOutPtr, xInPtr, weightPtr unsafe.Pointer, scalesPtr, dxPtr unsafe.Pointer, seqLen, dim int) {
+	C.tw_k_rmsnorm_bwd_fp16(dOutPtr, xInPtr, weightPtr, (*C.float)(scalesPtr), dxPtr, C.int(seqLen), C.int(dim))
+}
+
+func KRoPEFP16(xPtr, cosPtr, sinPtr unsafe.Pointer, seqLen, dim, headDim, nHeads int) {
+	C.tw_k_rope_fp16(xPtr, (*C.float)(cosPtr), (*C.float)(sinPtr), C.int(seqLen), C.int(dim), C.int(headDim), C.int(nHeads))
+}
+
+func KRoPEBackwardFP16(dxPtr, cosPtr, sinPtr unsafe.Pointer, seqLen, dim, headDim, nHeads int) {
+	C.tw_k_rope_bwd_fp16(dxPtr, (*C.float)(cosPtr), (*C.float)(sinPtr), C.int(seqLen), C.int(dim), C.int(headDim), C.int(nHeads))
+}
+
+func KCausalAttentionGQAFP16(qPtr, kPtr, vPtr, outPtr unsafe.Pointer, seqLen, dim, kvDim, numHeads, numKVHeads int) {
+	C.tw_k_attn_gqa_fp16(qPtr, kPtr, vPtr, outPtr, C.int(seqLen), C.int(dim), C.int(kvDim), C.int(numHeads), C.int(numKVHeads))
+}
+
+func KSiLUGateMulFP16(gatePtr, upPtr, outPtr unsafe.Pointer, n int) {
+	C.tw_k_silu_gate_mul_fp16(gatePtr, upPtr, outPtr, C.int(n))
+}
+
+func KSiLUGateBackwardFP16(dOutPtr, gatePtr, upPtr, dGatePtr, dUpPtr unsafe.Pointer, n int) {
+	C.tw_k_silu_gate_bwd_fp16(dOutPtr, gatePtr, upPtr, dGatePtr, dUpPtr, C.int(n))
+}

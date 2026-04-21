@@ -66,6 +66,16 @@ type RawDevicePtr interface {
 	RawPtr() unsafe.Pointer
 }
 
+type rawPtr struct{ p unsafe.Pointer }
+
+func (r *rawPtr) RawPtr() unsafe.Pointer { return r.p }
+
+// TensorFromDevicePtr wraps a raw GPU pointer as a Tensor.
+// Used for multi-GPU allocations where the pointer lives on a remote device.
+func TensorFromDevicePtr(ptr unsafe.Pointer, nElements int) *Tensor {
+	return &Tensor{Shape: []int{nElements}, Size: nElements, device: &rawPtr{ptr}}
+}
+
 // DevicePtr returns the raw GPU pointer for passing to CUDA kernels.
 // Returns nil if the tensor is CPU-only.
 func (t *Tensor) DevicePtr() unsafe.Pointer {

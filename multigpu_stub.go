@@ -30,6 +30,9 @@ func (mc *MultiCUDA) PeerCopy(src *DeviceTensor, dst int) *DeviceTensor { return
 func (mc *MultiCUDA) MatMulOnDevice(dev int, a, b unsafe.Pointer, m, k, n int) unsafe.Pointer {
 	return nil
 }
+func (mc *MultiCUDA) MatMulFP16TransBOnDevice(dev int, a, b, out unsafe.Pointer, m, k, n int) {}
+func (mc *MultiCUDA) MatMulFP16FP32OutOnDevice(dev int, a, b unsafe.Pointer, out unsafe.Pointer, m, k, n int) {}
+func (mc *MultiCUDA) MatMulFP16TransAFP32OutOnDevice(dev int, a, b unsafe.Pointer, out unsafe.Pointer, m, k, n int) {}
 func (mc *MultiCUDA) MatMulFP16OnDevice(dev int, a, b unsafe.Pointer, m, k, n int) unsafe.Pointer {
 	return nil
 }
@@ -53,3 +56,14 @@ type ParallelFP16Op struct {
 }
 
 func (mc *MultiCUDA) ParallelMatMulFP16(ops []ParallelFP16Op) {}
+func SetDevice(dev int)                                                                              {}
+func (mc *MultiCUDA) AllocFP16OnDevice(dev, nElements int) unsafe.Pointer                            { return nil }
+func (mc *MultiCUDA) AllocBytesOnDevice(dev, bytes int) unsafe.Pointer                               { return nil }
+func (mc *MultiCUDA) ZerosFP32OnDevice(dev, nFloats int) *Tensor                                     { return nil }
+func (mc *MultiCUDA) ZeroOnDevice(dev int, ptr unsafe.Pointer, bytes int)                             {}
+func (mc *MultiCUDA) UploadFP32OnDevice(dev int, dst unsafe.Pointer, src []float32)                   {}
+func (mc *MultiCUDA) DownloadFP32FromDevice(dev int, src unsafe.Pointer, nFloats int) []float32       { return nil }
+func (mc *MultiCUDA) FromHostFP32OnDevice(dev int, data []float32, shape []int) *Tensor               { return nil }
+func (mc *MultiCUDA) FromHostFP16OnDevice(dev int, data []float32, shape []int, f func([]float32, []int) *Tensor) *Tensor { return nil }
+func (mc *MultiCUDA) SparsePeerCopy(srcDev int, src unsafe.Pointer, dstDev int, dst unsafe.Pointer, rows []int32, cols, elemSize int) {}
+func (mc *MultiCUDA) PeerCopyAsync(srcDev int, src unsafe.Pointer, dstDev int, dst unsafe.Pointer, bytes int) {}

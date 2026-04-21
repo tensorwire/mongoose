@@ -91,6 +91,10 @@ func (c *CUDA) AllocFP16Buffer(nElements int) unsafe.Pointer     { return nil }
 func NewCUDADevice(deviceIdx int) *CUDA                                  { return nil }
 func (c *CUDA) MatMulFP16TransposeBT(a, b *Tensor, m, k, n int) *Tensor { return nil }
 func (c *CUDA) MatMulFP16Into(out, a, b *Tensor, m, k, n int)          {}
+func (c *CUDA) MatMulFP16TransposeATInto(out, a, b *Tensor, m, k, n int) {}
+func (c *CUDA) MatMulAllFP16TransposeBTInto(out, a, b *Tensor, m, k, n int) {}
+func (c *CUDA) MatMulAllFP16Into(out, a, b *Tensor, m, k, n int)          {}
+func (c *CUDA) FP16Copy(dst, src *Tensor, nBytes int)                      {}
 func (c *CUDA) MatMulFP16TransposeBTInto(out, a, b *Tensor, m, k, n int) {}
 func (c *CUDA) AllocFP16Tensor(nElements int, shape []int) *Tensor { return nil }
 func (c *CUDA) FreeFP16Tensor(t *Tensor)                        {}

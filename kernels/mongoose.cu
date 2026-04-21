@@ -1613,4 +1613,285 @@ void mongoose_dequant_int8_delta(
         (const int8_t*)data, scales, delta, out, n, cols);
 }
 
+// === FP16 Utility Kernels ===
+
+__global__ void fp16_add_inplace_kernel(__half* a, const __half* b, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) a[i] = __float2half(__half2float(a[i]) + __half2float(b[i]));
+}
+
+void mongoose_fp16_add_inplace(void* a, const void* b, int n, cudaStream_t stream) {
+    fp16_add_inplace_kernel<<<(n+255)/256, 256, 0, stream>>>((__half*)a, (const __half*)b, n);
+}
+
+__global__ void fp32_add_fp16_kernel(float* a, const __half* b, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) a[i] += __half2float(b[i]);
+}
+
+void mongoose_fp32_add_fp16(float* a, const void* b, int n, cudaStream_t stream) {
+    fp32_add_fp16_kernel<<<(n+255)/256, 256, 0, stream>>>(a, (const __half*)b, n);
+}
+
+// === FP16 Element-wise Kernels for Native FP16 Training ===
+// All inputs/outputs are __half. Internal accumulation uses float for stability.
+// These eliminate the FP32↔FP16 conversion overhead between GEMMs.
+// RoPE cos/sin tables stay FP32 (tiny, shared across all positions).
+
+__global__ void rmsnorm_out_save_fp16_kernel(const __half* input, __half* out, const __half* weight,
+                                              float* rmsScales, int dim) {
+    int row = blockIdx.x;
+    const __half* inr = input + row * dim;
+    __half* outr = out + row * dim;
+
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float v = __half2float(inr[i]);
+        ss += v * v;
+    }
+    for (int offset = warpSize/2; offset > 0; offset /= 2)
+        ss += __shfl_down_sync(0xffffffff, ss, offset);
+    __shared__ float shared[32];
+    int lane = threadIdx.x % warpSize;
+    int wid = threadIdx.x / warpSize;
+    if (lane == 0) shared[wid] = ss;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int nWarps = (blockDim.x + warpSize - 1) / warpSize;
+        float total = 0.0f;
+        for (int i = 0; i < nWarps; i++) total += shared[i];
+        shared[0] = total;
+    }
+    __syncthreads();
+
+    float scale = rsqrtf(shared[0] / dim + 1e-6f);
+    if (threadIdx.x == 0) rmsScales[row] = scale;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        outr[i] = __float2half(__half2float(inr[i]) * scale * __half2float(weight[i]));
+    }
+}
+
+void mongoose_rmsnorm_out_save_fp16(const void* input, void* out, const void* weight,
+                                     float* rmsScales, int seqLen, int dim, cudaStream_t stream) {
+    int threads = dim < 1024 ? dim : 1024;
+    rmsnorm_out_save_fp16_kernel<<<seqLen, threads, 0, stream>>>(
+        (const __half*)input, (__half*)out, (const __half*)weight, rmsScales, dim);
+}
+
+__global__ void rmsnorm_backward_fp16_kernel(const __half* dOut, const __half* xIn, const __half* weight,
+                                              const float* rmsScales, __half* dx, int dim) {
+    int row = blockIdx.x;
+    float scale = rmsScales[row];
+    const __half* dO = dOut + row * dim;
+    const __half* x = xIn + row * dim;
+    __half* dxr = dx + row * dim;
+
+    float dot = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        dot += __half2float(dO[i]) * __half2float(weight[i]) * __half2float(x[i]);
+    }
+    for (int offset = warpSize/2; offset > 0; offset /= 2)
+        dot += __shfl_down_sync(0xffffffff, dot, offset);
+    __shared__ float shared[32];
+    int lane = threadIdx.x % warpSize;
+    int wid = threadIdx.x / warpSize;
+    if (lane == 0) shared[wid] = dot;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int nWarps = (blockDim.x + warpSize - 1) / warpSize;
+        float total = 0.0f;
+        for (int i = 0; i < nWarps; i++) total += shared[i];
+        shared[0] = total;
+    }
+    __syncthreads();
+    dot = shared[0];
+
+    float coeff = scale * scale * scale * dot / dim;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        dxr[i] = __float2half((__half2float(dO[i]) * __half2float(weight[i]) - __half2float(x[i]) * coeff) * scale);
+    }
+}
+
+void mongoose_rmsnorm_backward_fp16(const void* dOut, const void* xIn, const void* weight,
+                                     const float* rmsScales, void* dx, int seqLen, int dim, cudaStream_t stream) {
+    int threads = dim < 1024 ? dim : 1024;
+    rmsnorm_backward_fp16_kernel<<<seqLen, threads, 0, stream>>>(
+        (const __half*)dOut, (const __half*)xIn, (const __half*)weight, rmsScales, (__half*)dx, dim);
+}
+
+__global__ void rope_fp16_kernel(__half* x, const float* cos_tab, const float* sin_tab,
+                                  int dim, int headDim, int nHeads, int halfHead) {
+    int pos = blockIdx.x;
+    for (int h = 0; h < nHeads; h++) {
+        int base = pos * dim + h * headDim;
+        for (int j = threadIdx.x; j < halfHead; j += blockDim.x) {
+            float c = cos_tab[pos * halfHead + j];
+            float s = sin_tab[pos * halfHead + j];
+            float x0 = __half2float(x[base + j]);
+            float x1 = __half2float(x[base + halfHead + j]);
+            x[base + j]            = __float2half(x0 * c - x1 * s);
+            x[base + halfHead + j] = __float2half(x0 * s + x1 * c);
+        }
+    }
+}
+
+void mongoose_rope_fp16(void* x, const float* cos_tab, const float* sin_tab,
+                         int seqLen, int dim, int headDim, int nHeads, cudaStream_t stream) {
+    int halfHead = headDim / 2;
+    int threads = halfHead < 256 ? halfHead : 256;
+    rope_fp16_kernel<<<seqLen, threads, 0, stream>>>((__half*)x, cos_tab, sin_tab, dim, headDim, nHeads, halfHead);
+}
+
+__global__ void rope_backward_fp16_kernel(__half* dx, const float* cos_tab, const float* sin_tab,
+                                           int dim, int headDim, int nHeads, int halfHead) {
+    int pos = blockIdx.x;
+    for (int h = 0; h < nHeads; h++) {
+        int base = pos * dim + h * headDim;
+        for (int j = threadIdx.x; j < halfHead; j += blockDim.x) {
+            float c = cos_tab[pos * halfHead + j];
+            float s = sin_tab[pos * halfHead + j];
+            float x0 = __half2float(dx[base + j]);
+            float x1 = __half2float(dx[base + halfHead + j]);
+            dx[base + j]            = __float2half( x0 * c + x1 * s);
+            dx[base + halfHead + j] = __float2half(-x0 * s + x1 * c);
+        }
+    }
+}
+
+void mongoose_rope_backward_fp16(void* dx, const float* cos_tab, const float* sin_tab,
+                                  int seqLen, int dim, int headDim, int nHeads, cudaStream_t stream) {
+    int halfHead = headDim / 2;
+    int threads = halfHead < 256 ? halfHead : 256;
+    rope_backward_fp16_kernel<<<seqLen, threads, 0, stream>>>((__half*)dx, cos_tab, sin_tab, dim, headDim, nHeads, halfHead);
+}
+
+__global__ void causal_attention_fp16_kernel(
+    const __half* Q, const __half* K, const __half* V, __half* out,
+    int seqLen, int dim, int kvDim, int numHeads, int numKVHeads, int headDim
+) {
+    int pos = blockIdx.x;
+    int head = blockIdx.y;
+    int hOff = head * headDim;
+    int kvHead = head / (numHeads / numKVHeads);
+    int kvOff = kvHead * headDim;
+
+    extern __shared__ float shared[];
+    float* scores = shared;
+
+    float scale = rsqrtf((float)headDim);
+
+    for (int j = threadIdx.x; j <= pos; j += blockDim.x) {
+        float dot = 0.0f;
+        for (int d = 0; d < headDim; d++) {
+            dot += __half2float(Q[pos * dim + hOff + d]) * __half2float(K[j * kvDim + kvOff + d]);
+        }
+        scores[j] = dot * scale;
+    }
+    __syncthreads();
+
+    float maxVal = -1e30f;
+    for (int j = threadIdx.x; j <= pos; j += blockDim.x) {
+        if (scores[j] > maxVal) maxVal = scores[j];
+    }
+    for (int offset = warpSize / 2; offset > 0; offset /= 2)
+        maxVal = fmaxf(maxVal, __shfl_down_sync(0xffffffff, maxVal, offset));
+    __shared__ float blockMax[32];
+    int lane = threadIdx.x % warpSize;
+    int wid = threadIdx.x / warpSize;
+    if (lane == 0) blockMax[wid] = maxVal;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float m = blockMax[0];
+        for (int i = 1; i < (blockDim.x + warpSize - 1) / warpSize; i++)
+            m = fmaxf(m, blockMax[i]);
+        blockMax[0] = m;
+    }
+    __syncthreads();
+    maxVal = blockMax[0];
+
+    float sumExp = 0.0f;
+    for (int j = threadIdx.x; j <= pos; j += blockDim.x) {
+        scores[j] = expf(scores[j] - maxVal);
+        sumExp += scores[j];
+    }
+    for (int offset = warpSize / 2; offset > 0; offset /= 2)
+        sumExp += __shfl_down_sync(0xffffffff, sumExp, offset);
+    __shared__ float blockSum[32];
+    if (lane == 0) blockSum[wid] = sumExp;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float s = 0;
+        for (int i = 0; i < (blockDim.x + warpSize - 1) / warpSize; i++)
+            s += blockSum[i];
+        blockSum[0] = s;
+    }
+    __syncthreads();
+    sumExp = blockSum[0];
+
+    for (int j = threadIdx.x; j <= pos; j += blockDim.x) {
+        scores[j] /= sumExp;
+    }
+    __syncthreads();
+
+    for (int d = threadIdx.x; d < headDim; d += blockDim.x) {
+        float val = 0.0f;
+        for (int j = 0; j <= pos; j++) {
+            val += scores[j] * __half2float(V[j * kvDim + kvOff + d]);
+        }
+        out[pos * dim + hOff + d] = __float2half(val);
+    }
+}
+
+void mongoose_causal_attention_gqa_fp16(
+    const void* Q, const void* K, const void* V, void* out,
+    int seqLen, int dim, int kvDim, int numHeads, int numKVHeads, cudaStream_t stream
+) {
+    int headDim = dim / numHeads;
+    int threads = headDim < 256 ? headDim : 256;
+    size_t sharedBytes = seqLen * sizeof(float);
+    dim3 grid(seqLen, numHeads);
+    causal_attention_fp16_kernel<<<grid, threads, sharedBytes, stream>>>(
+        (const __half*)Q, (const __half*)K, (const __half*)V, (__half*)out,
+        seqLen, dim, kvDim, numHeads, numKVHeads, headDim);
+}
+
+__global__ void silu_gate_mul_fp16_kernel(const __half* gate, const __half* up, __half* out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float g = __half2float(gate[i]);
+        float sig = 1.0f / (1.0f + expf(-g));
+        out[i] = __float2half(g * sig * __half2float(up[i]));
+    }
+}
+
+void mongoose_silu_gate_mul_fp16(const void* gate, const void* up, void* out, int n, cudaStream_t stream) {
+    silu_gate_mul_fp16_kernel<<<(n+255)/256, 256, 0, stream>>>(
+        (const __half*)gate, (const __half*)up, (__half*)out, n);
+}
+
+__global__ void silu_gate_backward_fp16_kernel(
+    const __half* dOut, const __half* gate, const __half* up,
+    __half* dGate, __half* dUp, int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float g = __half2float(gate[i]);
+        float sig = 1.0f / (1.0f + expf(-g));
+        float silu_g = g * sig;
+        float dO = __half2float(dOut[i]);
+        float u = __half2float(up[i]);
+        dUp[i] = __float2half(dO * silu_g);
+        dGate[i] = __float2half(dO * u * (sig + silu_g * (1.0f - sig)));
+    }
+}
+
+void mongoose_silu_gate_backward_fp16(
+    const void* dOut, const void* gate, const void* up,
+    void* dGate, void* dUp, int n, cudaStream_t stream
+) {
+    silu_gate_backward_fp16_kernel<<<(n+255)/256, 256, 0, stream>>>(
+        (const __half*)dOut, (const __half*)gate, (const __half*)up,
+        (__half*)dGate, (__half*)dUp, n);
+}
+
 } // extern "C"

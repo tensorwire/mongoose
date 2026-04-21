@@ -194,6 +194,51 @@ int tw_multi_hgemm_lt(int dev, const void* dA, const void* dB, void* dC, int m, 
     return (int)status;
 }
 
+// FP16 MatMul with B transposed on a specific device via cublasGemmEx.
+// Single call, zero descriptor overhead. C[m,n] = A[m,k] @ B[n,k]^T, all FP16.
+int tw_multi_hgemm_transB(int dev, const void* dA, const void* dB, void* dC, int m, int k, int n) {
+    float alpha = 1.0f, beta = 0.0f;
+    return (int)cublasGemmEx(tw_devices[dev].handle,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        n, m, k,
+        &alpha,
+        dB, CUDA_R_16F, k,
+        dA, CUDA_R_16F, k,
+        &beta,
+        dC, CUDA_R_16F, n,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+}
+
+// FP16 MatMul on device: C = A @ B, FP16 in, FP32 out. For dW gradient accumulation.
+int tw_multi_hgemm_fp32out(int dev, const void* dA, const void* dB, float* dC, int m, int k, int n) {
+    float alpha = 1.0f, beta = 0.0f;
+    return (int)cublasGemmEx(tw_devices[dev].handle,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        n, m, k,
+        &alpha,
+        dB, CUDA_R_16F, n,
+        dA, CUDA_R_16F, k,
+        &beta,
+        dC, CUDA_R_32F, n,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+}
+
+// FP16 TransA on device: C[k,n] = A[m,k]^T @ B[m,n], FP16 in, FP32 out. For dW grads.
+int tw_multi_hgemm_transA_fp32out(int dev, const void* dA, const void* dB, float* dC, int m, int k, int n) {
+    float alpha = 1.0f, beta = 0.0f;
+    return (int)cublasGemmEx(tw_devices[dev].handle,
+        CUBLAS_OP_N, CUBLAS_OP_T, n, k, m,
+        &alpha,
+        dB, CUDA_R_16F, n,
+        dA, CUDA_R_16F, k,
+        &beta,
+        dC, CUDA_R_32F, n,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+}
+
 void tw_multi_sync(int dev) {
     cudaSetDevice(dev);
     cudaDeviceSynchronize();
@@ -327,6 +372,73 @@ void tw_multi_hgemm_batch(multi_hgemm_op_t* ops, int num_ops) {
 int tw_multi_sm_count(int dev) { return (dev >= 0 && dev < tw_device_count) ? tw_devices[dev].sm_count : 0; }
 int tw_multi_compute_major(int dev) { return (dev >= 0 && dev < tw_device_count) ? tw_devices[dev].compute_major : 0; }
 int tw_multi_compute_minor(int dev) { return (dev >= 0 && dev < tw_device_count) ? tw_devices[dev].compute_minor : 0; }
+
+void tw_set_device(int dev) { cudaSetDevice(dev); }
+
+// Allocate FP16 buffer on a specific device. Returns device pointer.
+void* tw_multi_alloc_fp16(int dev, int nElements) {
+    cudaSetDevice(dev);
+    void* ptr;
+    cudaError_t err = cudaMalloc(&ptr, (size_t)nElements * 2);
+    if (err != cudaSuccess) return NULL;
+    return ptr;
+}
+
+// Allocate raw bytes on a specific device.
+void* tw_multi_alloc_bytes(int dev, size_t bytes) {
+    cudaSetDevice(dev);
+    void* ptr;
+    cudaError_t err = cudaMalloc(&ptr, bytes);
+    if (err != cudaSuccess) return NULL;
+    return ptr;
+}
+
+// Allocate + zero FP32 buffer on a specific device. Returns nFloats * 4 bytes.
+void* tw_multi_zeros_fp32(int dev, int nFloats) {
+    cudaSetDevice(dev);
+    void* ptr;
+    size_t bytes = (size_t)nFloats * 4;
+    cudaError_t err = cudaMalloc(&ptr, bytes);
+    if (err != cudaSuccess) return NULL;
+    cudaMemset(ptr, 0, bytes);
+    return ptr;
+}
+
+// Zero a buffer on a specific device.
+void tw_multi_zero(int dev, void* ptr, size_t bytes) {
+    cudaSetDevice(dev);
+    cudaMemset(ptr, 0, bytes);
+}
+
+// Upload host data to a specific device — for initializing FP32 weights on remote GPUs.
+void tw_multi_upload_fp32(int dev, void* dst, const float* src, int nFloats) {
+    cudaSetDevice(dev);
+    cudaMemcpy(dst, src, (size_t)nFloats * 4, cudaMemcpyHostToDevice);
+}
+
+// Download device data to host.
+void tw_multi_download_fp32(int dev, float* dst, const void* src, int nFloats) {
+    cudaSetDevice(dev);
+    cudaMemcpy(dst, src, (size_t)nFloats * 4, cudaMemcpyDeviceToHost);
+}
+
+// P2P copy using async on source device's stream for overlap
+void tw_multi_peer_copy_async(int srcDev, const void* src, int dstDev, void* dst, size_t bytes) {
+    cudaMemcpyPeerAsync(dst, dstDev, src, srcDev, bytes, tw_devices[srcDev].stream);
+}
+
+// Sparse P2P: copy only specified rows from src to dst.
+// rows[] = row indices, nRows = count, cols = elements per row.
+// Copies nRows * cols * elemSize bytes total, scattered by row index.
+void tw_multi_sparse_p2p(int srcDev, const void* src, int dstDev, void* dst,
+                          const int* rows, int nRows, int cols, int elemSize) {
+    for (int i = 0; i < nRows; i++) {
+        int r = rows[i];
+        if (r < 0) continue;
+        size_t offset = (size_t)r * cols * elemSize;
+        cudaMemcpyPeer((char*)dst + offset, dstDev, (const char*)src + offset, srcDev, (size_t)cols * elemSize);
+    }
+}
 */
 import "C"
 
@@ -495,6 +607,21 @@ func (mc *MultiCUDA) MatMulOnDevice(dev int, a, b unsafe.Pointer, m, k, n int) u
 	return out
 }
 
+// MatMulFP16TransBOnDevice runs FP16 C = A @ B^T on a specific device. All FP16.
+func (mc *MultiCUDA) MatMulFP16TransBOnDevice(dev int, a, b, out unsafe.Pointer, m, k, n int) {
+	C.tw_multi_hgemm_transB(C.int(dev), a, b, out, C.int(m), C.int(k), C.int(n))
+}
+
+// MatMulFP16FP32OutOnDevice runs FP16 C = A @ B on device. FP16 in, FP32 out.
+func (mc *MultiCUDA) MatMulFP16FP32OutOnDevice(dev int, a, b unsafe.Pointer, out unsafe.Pointer, m, k, n int) {
+	C.tw_multi_hgemm_fp32out(C.int(dev), a, b, (*C.float)(out), C.int(m), C.int(k), C.int(n))
+}
+
+// MatMulFP16TransAFP32OutOnDevice: C[k,n] = A[m,k]^T @ B[m,n]. FP16 in, FP32 out.
+func (mc *MultiCUDA) MatMulFP16TransAFP32OutOnDevice(dev int, a, b unsafe.Pointer, out unsafe.Pointer, m, k, n int) {
+	C.tw_multi_hgemm_transA_fp32out(C.int(dev), a, b, (*C.float)(out), C.int(m), C.int(k), C.int(n))
+}
+
 // MatMulFP16OnDevice runs FP16 cublasLt matmul on a specific device.
 func (mc *MultiCUDA) MatMulFP16OnDevice(dev int, a, b unsafe.Pointer, m, k, n int) unsafe.Pointer {
 	fp16Bytes := m * n * 2
@@ -575,6 +702,83 @@ func (mc *MultiCUDA) ParallelMatMulFP16(ops []ParallelFP16Op) {
 		}
 	}
 	C.tw_multi_hgemm_batch(&cOps[0], C.int(len(ops)))
+}
+
+// SetDevice switches the CUDA context to a specific GPU.
+// All subsequent kernel launches (including dlopen'd kernels on the default stream)
+// will fire on this device until the next SetDevice call.
+func SetDevice(dev int) {
+	C.tw_set_device(C.int(dev))
+}
+
+// AllocFP16OnDevice allocates an FP16 buffer on a specific GPU.
+func (mc *MultiCUDA) AllocFP16OnDevice(dev, nElements int) unsafe.Pointer {
+	return C.tw_multi_alloc_fp16(C.int(dev), C.int(nElements))
+}
+
+// AllocBytesOnDevice allocates raw bytes on a specific GPU.
+func (mc *MultiCUDA) AllocBytesOnDevice(dev, bytes int) unsafe.Pointer {
+	return C.tw_multi_alloc_bytes(C.int(dev), C.size_t(bytes))
+}
+
+// ZerosFP32OnDevice allocates and zeros an FP32 buffer on a specific GPU, wrapped as a Tensor.
+func (mc *MultiCUDA) ZerosFP32OnDevice(dev, nFloats int) *Tensor {
+	ptr := C.tw_multi_zeros_fp32(C.int(dev), C.int(nFloats))
+	return TensorFromDevicePtr(unsafe.Pointer(ptr), nFloats)
+}
+
+// ZeroOnDevice zeros a buffer on a specific device.
+func (mc *MultiCUDA) ZeroOnDevice(dev int, ptr unsafe.Pointer, bytes int) {
+	C.tw_multi_zero(C.int(dev), ptr, C.size_t(bytes))
+}
+
+// UploadFP32OnDevice copies host FP32 data to a buffer on a specific device.
+func (mc *MultiCUDA) UploadFP32OnDevice(dev int, dst unsafe.Pointer, src []float32) {
+	C.tw_multi_upload_fp32(C.int(dev), dst, (*C.float)(unsafe.Pointer(&src[0])), C.int(len(src)))
+}
+
+// DownloadFP32FromDevice copies device FP32 data to host.
+func (mc *MultiCUDA) DownloadFP32FromDevice(dev int, src unsafe.Pointer, nFloats int) []float32 {
+	data := make([]float32, nFloats)
+	C.tw_multi_download_fp32(C.int(dev), (*C.float)(unsafe.Pointer(&data[0])), src, C.int(nFloats))
+	return data
+}
+
+// FromHostFP32OnDevice allocates + uploads FP32 data to a specific device as a Tensor.
+func (mc *MultiCUDA) FromHostFP32OnDevice(dev int, data []float32, shape []int) *Tensor {
+	size := 1
+	for _, s := range shape { size *= s }
+	ptr := C.tw_multi_zeros_fp32(C.int(dev), C.int(size))
+	C.tw_multi_upload_fp32(C.int(dev), unsafe.Pointer(ptr), (*C.float)(unsafe.Pointer(&data[0])), C.int(size))
+	return &Tensor{Shape: shape, Size: size, device: &rawPtr{unsafe.Pointer(ptr)}}
+}
+
+// FromHostFP16OnDevice uploads FP32 host data as FP16 to a specific device.
+// Converts on GPU 0 then P2P copies if dev != 0.
+func (mc *MultiCUDA) FromHostFP16OnDevice(dev int, data []float32, shape []int, cuda0FP16Convert func([]float32, []int) *Tensor) *Tensor {
+	size := 1
+	for _, s := range shape { size *= s }
+	if dev == 0 {
+		return cuda0FP16Convert(data, shape)
+	}
+	tmp := cuda0FP16Convert(data, shape)
+	dstPtr := C.tw_multi_alloc_fp16(C.int(dev), C.int(size))
+	C.tw_multi_peer_copy(C.int(0), tmp.DevicePtr(), C.int(dev), unsafe.Pointer(dstPtr), C.size_t(size*2))
+	return TensorFromDevicePtr(unsafe.Pointer(dstPtr), size)
+}
+
+// SparsePeerCopy copies only the specified rows between devices.
+// Each row is cols elements wide. elemSize is bytes per element (4 for FP32, 2 for FP16).
+func (mc *MultiCUDA) SparsePeerCopy(srcDev int, src unsafe.Pointer, dstDev int, dst unsafe.Pointer,
+	rows []int32, cols, elemSize int) {
+	if len(rows) == 0 { return }
+	C.tw_multi_sparse_p2p(C.int(srcDev), src, C.int(dstDev), dst,
+		(*C.int)(unsafe.Pointer(&rows[0])), C.int(len(rows)), C.int(cols), C.int(elemSize))
+}
+
+// PeerCopyAsync copies between devices without blocking the caller.
+func (mc *MultiCUDA) PeerCopyAsync(srcDev int, src unsafe.Pointer, dstDev int, dst unsafe.Pointer, bytes int) {
+	C.tw_multi_peer_copy_async(C.int(srcDev), src, C.int(dstDev), dst, C.size_t(bytes))
 }
 
 // String returns a summary of the multi-GPU topology.

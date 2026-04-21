@@ -63,3 +63,13 @@ func KQ4Matvec(actPtr, weightPtr, scalesPtr, outPtr unsafe.Pointer, N, K int) {}
 func KKVCacheWrite(cachePtr, srcPtr unsafe.Pointer, pos, kvDim int) {}
 func HasQ8Matvec() bool { return false }
 func HasQ4Matvec() bool { return false }
+func FP16TrainKernelsLoaded() bool { return false }
+func KFP16AddInPlace(aPtr, bPtr unsafe.Pointer, n int) {}
+func KFP32AddFP16(aPtr unsafe.Pointer, bPtr unsafe.Pointer, n int) {}
+func KRMSNormOutSaveFP16(inPtr, outPtr, weightPtr unsafe.Pointer, scalesPtr unsafe.Pointer, seqLen, dim int) {}
+func KRMSNormBackwardFP16(dOutPtr, xInPtr, weightPtr unsafe.Pointer, scalesPtr, dxPtr unsafe.Pointer, seqLen, dim int) {}
+func KRoPEFP16(xPtr, cosPtr, sinPtr unsafe.Pointer, seqLen, dim, headDim, nHeads int) {}
+func KRoPEBackwardFP16(dxPtr, cosPtr, sinPtr unsafe.Pointer, seqLen, dim, headDim, nHeads int) {}
+func KCausalAttentionGQAFP16(qPtr, kPtr, vPtr, outPtr unsafe.Pointer, seqLen, dim, kvDim, numHeads, numKVHeads int) {}
+func KSiLUGateMulFP16(gatePtr, upPtr, outPtr unsafe.Pointer, n int) {}
+func KSiLUGateBackwardFP16(dOutPtr, gatePtr, upPtr, dGatePtr, dUpPtr unsafe.Pointer, n int) {}

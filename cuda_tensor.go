@@ -133,6 +133,20 @@ int tw_gpu_hgemm(const void* dA, const void* dB, float* dC, int m, int k, int n)
     return (int)s;
 }
 
+// C = A^T @ B: FP16 inputs, FP32 output. For dW gradient accumulation.
+int tw_gpu_hgemm_transA(const void* dA, const void* dB, float* dC, int m, int k, int n) {
+    float alpha = 1.0f, beta = 0.0f;
+    return (int)cublasGemmEx(tw_cublas_handle,
+        CUBLAS_OP_N, CUBLAS_OP_T, n, k, m,
+        &alpha,
+        dB, CUDA_R_16F, n,
+        dA, CUDA_R_16F, k,
+        &beta,
+        dC, CUDA_R_32F, n,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+}
+
 // --- cublasLt for maximum FP16 throughput ---
 // PyTorch uses cublasLtMatmul (not cublasGemmEx) with:
 //   - 32 MiB workspace for split-K algorithms
@@ -369,6 +383,11 @@ int tw_gpu_sgemm_transB(const float* dA, const float* dB, float* dC, int m, int 
         &alpha, dB, CUDA_R_32F, k, dA, CUDA_R_32F, k,
         &beta, dC, CUDA_R_32F, n,
         CUBLAS_COMPUTE_32F_FAST_TF32, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+}
+
+// FP16 copy: dst = src, both FP16
+int tw_gpu_fp16_copy(void* dst, const void* src, int nBytes) {
+    return (int)cudaMemcpy(dst, src, nBytes, cudaMemcpyDeviceToDevice);
 }
 
 // FP16 matmul: C = A @ B, all FP16. Single cublasGemmEx call, zero descriptor overhead.
@@ -693,6 +712,44 @@ func (c *CUDA) MatMulFP16(a, b *Tensor, m, k, n int) *Tensor {
 		device: &cuPtr{ptr: ptr},
 		eng:    c,
 	}
+}
+
+// MatMulAllFP16TransposeBTInto: C = A @ B^T, all FP16 in/out. For native FP16 forward.
+func (c *CUDA) MatMulAllFP16TransposeBTInto(out, a, b *Tensor, m, k, n int) {
+	ret := C.tw_gpu_hgemm_fp16_transB(
+		a.DevicePtr(), b.DevicePtr(), out.DevicePtr(),
+		C.int(m), C.int(k), C.int(n),
+	)
+	if ret != 0 {
+		log.Printf("[CUDA] hgemm_fp16_transB FAILED: status=%d m=%d k=%d n=%d", ret, m, k, n)
+	}
+}
+
+// MatMulAllFP16Into: C = A @ B, all FP16 in/out. For native FP16 backward dHidden chain.
+func (c *CUDA) MatMulAllFP16Into(out, a, b *Tensor, m, k, n int) {
+	ret := C.tw_gpu_hgemm_fp16(
+		a.DevicePtr(), b.DevicePtr(), out.DevicePtr(),
+		C.int(m), C.int(k), C.int(n),
+	)
+	if ret != 0 {
+		log.Printf("[CUDA] hgemm_fp16 FAILED: status=%d m=%d k=%d n=%d", ret, m, k, n)
+	}
+}
+
+// FP16Copy copies FP16 data between tensors.
+func (c *CUDA) FP16Copy(dst, src *Tensor, nBytes int) {
+	C.tw_gpu_fp16_copy(dst.device.(*cuPtr).ptr, src.device.(*cuPtr).ptr, C.int(nBytes))
+}
+
+// MatMulFP16TransposeATInto computes C[k,n] = A[m,k]^T @ B[m,n].
+// A,B are FP16, C is FP32. For dW gradient accumulation in native FP16 training.
+func (c *CUDA) MatMulFP16TransposeATInto(out, a, b *Tensor, m, k, n int) {
+	C.tw_gpu_hgemm_transA(
+		a.device.(*cuPtr).ptr,
+		b.device.(*cuPtr).ptr,
+		(*C.float)(out.device.(*cuPtr).ptr),
+		C.int(m), C.int(k), C.int(n),
+	)
 }
 
 // MatMulFP16Into computes C = A @ B where A,B are FP16, C is FP32, into existing buffer.
