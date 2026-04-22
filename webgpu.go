@@ -62,6 +62,9 @@ type WebGPU struct {
 	adapterName string
 	backend     string
 
+	maxBufSize     uint64
+	maxStorageBind uint64
+
 	// Buffer pool to avoid rapid create/destroy cycles (Metal stability)
 	uniformBuf *wgpu.Buffer
 	uniformSize uint64
@@ -191,12 +194,16 @@ func newWebGPUWithPref(pref gputypes.PowerPreference) *WebGPU {
 		return nil
 	}
 
+	limits := device.Limits()
+
 	g := &WebGPU{
-		instance: instance,
-		adapter:  adapter,
-		device:   device,
-		pipeline: pipeline,
-		bgl:      bgl,
+		instance:       instance,
+		adapter:        adapter,
+		device:         device,
+		pipeline:       pipeline,
+		bgl:            bgl,
+		maxBufSize:     limits.MaxBufferSize,
+		maxStorageBind: limits.MaxStorageBufferBindingSize,
 	}
 
 	info := adapter.Info()
@@ -216,67 +223,130 @@ func (g *WebGPU) AdapterName() string {
 	return g.adapterName
 }
 
-// MatMul computes C = A @ B on the GPU.
+// MatMul computes C = A @ B on the GPU with automatic fallback.
+// Tries full GPU dispatch, then tiled GPU dispatch for oversized matrices,
+// then CPU as last resort.
+var wgpuFallbackLogged bool
+
 func (g *WebGPU) MatMul(a, b []float32, m, k, n int) []float32 {
+	result, err := g.gpuMatMulSingle(a, b, m, k, n)
+	if err == nil {
+		return result
+	}
+
+	result, err = g.tiledMatMul(a, b, m, k, n)
+	if err == nil {
+		return result
+	}
+
+	if !wgpuFallbackLogged {
+		log.Printf("[webgpu] GPU matmul unavailable, using CPU fallback")
+		wgpuFallbackLogged = true
+	}
+	return cpuMatMul(a, b, m, k, n)
+}
+
+// gpuMatMulSingle attempts a single GPU matmul dispatch.
+// Returns an error if any GPU resource creation fails.
+func (g *WebGPU) gpuMatMulSingle(a, b []float32, m, k, n int) ([]float32, error) {
+	aSize := uint64(len(a)) * 4
+	bSize := uint64(len(b)) * 4
+	cSize := uint64(m * n * 4)
+
+	// Use 64MB as safe limit — wgpu staging belt crashes on large mapped writes
+	// even within device-reported limits. 64MB is conservative but avoids the
+	// memmove SIGSEGV in stagingBelt.allocateOversized.
+	maxBuf := uint64(64 * 1024 * 1024)
+	if g.maxStorageBind > 0 && g.maxStorageBind < maxBuf {
+		maxBuf = g.maxStorageBind
+	}
+	if g.maxBufSize > 0 && g.maxBufSize < maxBuf {
+		maxBuf = g.maxBufSize
+	}
+	if aSize > maxBuf || bSize > maxBuf || cSize > maxBuf {
+		return nil, fmt.Errorf("buffer %d bytes exceeds safe limit %d bytes", max64(aSize, max64(bSize, cSize)), maxBuf)
+	}
+
 	q := g.device.Queue()
 
 	aBytes := float32sToBytes(a)
 	bBytes := float32sToBytes(b)
-	aSize := uint64(len(aBytes))
-	bSize := uint64(len(bBytes))
-	cSize := uint64(m * n * 4)
 
-	// Reuse or recreate buffers only when sizes change
+	var err error
+
 	if g.uniformBuf == nil {
-		g.uniformBuf, _ = g.device.CreateBuffer(&wgpu.BufferDescriptor{
+		g.uniformBuf, err = g.device.CreateBuffer(&wgpu.BufferDescriptor{
 			Label: "dims", Size: 16,
 			Usage: wgpu.BufferUsageUniform | wgpu.BufferUsageCopyDst,
 		})
+		if err != nil {
+			return nil, fmt.Errorf("uniform buffer: %w", err)
+		}
 		g.uniformSize = 16
 	}
 	if g.aBuf == nil || g.aSize < aSize {
 		if g.aBuf != nil { g.aBuf.Release() }
-		g.aBuf, _ = g.device.CreateBuffer(&wgpu.BufferDescriptor{
+		g.aBuf, err = g.device.CreateBuffer(&wgpu.BufferDescriptor{
 			Label: "A", Size: aSize,
 			Usage: wgpu.BufferUsageStorage | wgpu.BufferUsageCopyDst,
 		})
+		if err != nil {
+			g.aBuf = nil
+			g.aSize = 0
+			return nil, fmt.Errorf("A buffer (%d bytes): %w", aSize, err)
+		}
 		g.aSize = aSize
 	}
 	if g.bBuf == nil || g.bSize < bSize {
 		if g.bBuf != nil { g.bBuf.Release() }
-		g.bBuf, _ = g.device.CreateBuffer(&wgpu.BufferDescriptor{
+		g.bBuf, err = g.device.CreateBuffer(&wgpu.BufferDescriptor{
 			Label: "B", Size: bSize,
 			Usage: wgpu.BufferUsageStorage | wgpu.BufferUsageCopyDst,
 		})
+		if err != nil {
+			g.bBuf = nil
+			g.bSize = 0
+			return nil, fmt.Errorf("B buffer (%d bytes): %w", bSize, err)
+		}
 		g.bSize = bSize
 	}
 	if g.cBuf == nil || g.cSize < cSize {
 		if g.cBuf != nil { g.cBuf.Release() }
 		if g.stagingBuf != nil { g.stagingBuf.Release() }
-		g.cBuf, _ = g.device.CreateBuffer(&wgpu.BufferDescriptor{
+		g.cBuf, err = g.device.CreateBuffer(&wgpu.BufferDescriptor{
 			Label: "C", Size: cSize,
 			Usage: wgpu.BufferUsageStorage | wgpu.BufferUsageCopySrc,
 		})
-		g.stagingBuf, _ = g.device.CreateBuffer(&wgpu.BufferDescriptor{
+		if err != nil {
+			g.cBuf = nil
+			g.stagingBuf = nil
+			g.cSize = 0
+			return nil, fmt.Errorf("C buffer (%d bytes): %w", cSize, err)
+		}
+		g.stagingBuf, err = g.device.CreateBuffer(&wgpu.BufferDescriptor{
 			Label: "C-staging", Size: cSize,
 			Usage: wgpu.BufferUsageMapRead | wgpu.BufferUsageCopyDst,
 		})
+		if err != nil {
+			g.cBuf.Release()
+			g.cBuf = nil
+			g.stagingBuf = nil
+			g.cSize = 0
+			return nil, fmt.Errorf("staging buffer (%d bytes): %w", cSize, err)
+		}
 		g.cSize = cSize
 	}
 
-	// Dims uniform
 	dimsBuf := make([]byte, 16)
 	binary.LittleEndian.PutUint32(dimsBuf[0:], uint32(m))
 	binary.LittleEndian.PutUint32(dimsBuf[4:], uint32(n))
 	binary.LittleEndian.PutUint32(dimsBuf[8:], uint32(k))
 
-	// Upload
 	q.WriteBuffer(g.uniformBuf, 0, dimsBuf)
 	q.WriteBuffer(g.aBuf, 0, aBytes)
 	q.WriteBuffer(g.bBuf, 0, bBytes)
 
-	// Create bind group (must recreate each call since buffer offsets may differ)
-	bg, _ := g.device.CreateBindGroup(&wgpu.BindGroupDescriptor{
+	bg, err := g.device.CreateBindGroup(&wgpu.BindGroupDescriptor{
 		Label:  "matmul-bg",
 		Layout: g.bgl,
 		Entries: []wgpu.BindGroupEntry{
@@ -286,11 +356,19 @@ func (g *WebGPU) MatMul(a, b []float32, m, k, n int) []float32 {
 			{Binding: 3, Buffer: g.cBuf, Offset: 0, Size: cSize},
 		},
 	})
+	if err != nil {
+		return nil, fmt.Errorf("bind group: %w", err)
+	}
 	defer bg.Release()
 
-	// Dispatch compute + copy to staging
-	encoder, _ := g.device.CreateCommandEncoder(&wgpu.CommandEncoderDescriptor{Label: "matmul"})
-	pass, _ := encoder.BeginComputePass(&wgpu.ComputePassDescriptor{Label: "matmul"})
+	encoder, err := g.device.CreateCommandEncoder(&wgpu.CommandEncoderDescriptor{Label: "matmul"})
+	if err != nil {
+		return nil, fmt.Errorf("command encoder: %w", err)
+	}
+	pass, err := encoder.BeginComputePass(&wgpu.ComputePassDescriptor{Label: "matmul"})
+	if err != nil {
+		return nil, fmt.Errorf("compute pass: %w", err)
+	}
 	pass.SetPipeline(g.pipeline)
 	pass.SetBindGroup(0, bg, nil)
 
@@ -301,8 +379,14 @@ func (g *WebGPU) MatMul(a, b []float32, m, k, n int) []float32 {
 
 	encoder.CopyBufferToBuffer(g.cBuf, 0, g.stagingBuf, 0, cSize)
 
-	cmdBuf, _ := encoder.Finish()
-	subIdx, _ := q.Submit(cmdBuf)
+	cmdBuf, err := encoder.Finish()
+	if err != nil {
+		return nil, fmt.Errorf("encoder finish: %w", err)
+	}
+	subIdx, err := q.Submit(cmdBuf)
+	if err != nil {
+		return nil, fmt.Errorf("queue submit: %w", err)
+	}
 
 	for q.Poll() < subIdx {
 	}
@@ -310,7 +394,95 @@ func (g *WebGPU) MatMul(a, b []float32, m, k, n int) []float32 {
 	cBytes := make([]byte, cSize)
 	q.ReadBuffer(g.stagingBuf, 0, cBytes)
 
-	return bytesToFloat32s(cBytes)
+	return bytesToFloat32s(cBytes), nil
+}
+
+// tiledMatMul splits C = A @ B into tiles that fit in GPU buffers.
+// Tiles along both M (rows of A) and N (columns of B) as needed.
+func (g *WebGPU) tiledMatMul(a, b []float32, m, k, n int) ([]float32, error) {
+	limit := g.maxStorageBind
+	if g.maxBufSize < limit {
+		limit = g.maxBufSize
+	}
+	if limit == 0 {
+		return nil, fmt.Errorf("device reports zero buffer limit")
+	}
+
+	maxElems := int(limit / 4)
+	maxTileM := maxElems / k
+	if maxTileM < 1 {
+		return nil, fmt.Errorf("single row exceeds limit: k=%d limit=%d", k, limit)
+	}
+	if maxTileM > m {
+		maxTileM = m
+	}
+
+	maxTileN := maxElems / k
+	if maxTileN < 1 {
+		return nil, fmt.Errorf("single col exceeds limit: k=%d limit=%d", k, limit)
+	}
+	if maxTileN > n {
+		maxTileN = n
+	}
+
+	out := make([]float32, m*n)
+
+	for rowStart := 0; rowStart < m; rowStart += maxTileM {
+		tileM := maxTileM
+		if rowStart+tileM > m {
+			tileM = m - rowStart
+		}
+
+		aTile := a[rowStart*k : (rowStart+tileM)*k]
+
+		for colStart := 0; colStart < n; colStart += maxTileN {
+			tileN := maxTileN
+			if colStart+tileN > n {
+				tileN = n - colStart
+			}
+
+			var bTile []float32
+			if tileN == n {
+				bTile = b
+			} else {
+				bTile = make([]float32, k*tileN)
+				for r := 0; r < k; r++ {
+					copy(bTile[r*tileN:r*tileN+tileN], b[r*n+colStart:r*n+colStart+tileN])
+				}
+			}
+
+			cTile, err := g.gpuMatMulSingle(aTile, bTile, tileM, k, tileN)
+			if err != nil {
+				return nil, fmt.Errorf("tile [%d:%d, %d:%d]: %w", rowStart, rowStart+tileM, colStart, colStart+tileN, err)
+			}
+
+			for r := 0; r < tileM; r++ {
+				copy(out[(rowStart+r)*n+colStart:(rowStart+r)*n+colStart+tileN], cTile[r*tileN:r*tileN+tileN])
+			}
+		}
+	}
+
+	return out, nil
+}
+
+func max64(a, b uint64) uint64 {
+	if a > b { return a }
+	return b
+}
+
+// cpuMatMul computes C = A @ B in pure Go. Last-resort fallback.
+func cpuMatMul(a, b []float32, m, k, n int) []float32 {
+	out := make([]float32, m*n)
+	for i := 0; i < m; i++ {
+		for j := 0; j < n; j++ {
+			var sum float32
+			for l := 0; l < k; l++ {
+				sum += a[i*k+l] * b[l*n+j]
+			}
+			out[i*n+j] = sum
+		}
+	}
+	return out
 }
 
 // RMSNorm on CPU (small vector, not worth GPU dispatch overhead).
