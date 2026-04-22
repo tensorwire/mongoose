@@ -2,23 +2,43 @@
 
 GPU compute for Go. Trains transformers without Python. One `Engine` interface, five backends — CUDA, Metal, Accelerate, WebGPU, CPU — selected at build time. Sparse by default.
 
-## Training — Dual H100 SXM NVLink
+## Training throughput
 
-Helix Dispatch: interleaved position parallelism. Both GPUs fire every GEMM simultaneously. No gradient sync. Per-GPU optimizer. Only K,V crosses the wire.
+### Dual H100 SXM NVLink — Helix Dispatch
+
+8 layers, seq_len=64, vocab=256. 2000 steps. Both GPUs fire every GEMM simultaneously via interleaved position parallelism. No gradient sync.
 
 ```
-Byte-level transformer, 8 layers, seq_len=64, 2000 steps.
-
-dim       mongoose    dense (DDP)    ratio
-128       172.5       —              —
-256       184.9       —              —
-512        74.4       —              —
-1024       66.0       —              —
-2048       40.9       32.5           1.3x
-4096       21.7       14.1           1.54x
+dim       params     mongoose    dense (DDP)    ratio
+2048     302M         40.9       32.5           1.3x
+4096    1209M         21.7       14.1           1.54x
 ```
 
-At dim=4096 (1.2B params), mongoose trains 54% faster than the standard dense approach using the same hardware.
+### RTX 5090 — single GPU
+
+4 layers, seq_len=64, vocab=256. 1000 steps. Pure Helix optimizer, FP16 tensor cores at dim>=512.
+
+```
+dim       params     steps/s
+128       624K       773
+512       9.6M       455
+1024      38M        191
+2048      152M        74
+```
+
+### Apple M4 Max — Metal + Needle INT8
+
+4 layers, seq_len=64, vocab=256. 100 steps. Needle INT8 optimizer with conductor-driven sparsity. Single command buffer per step.
+
+```
+dim       params     steps/s
+128       624K       134
+256       2.4M       113
+512       9.6M       104
+1024      38M         49
+2048      152M        32
+4096      605M        11
+```
 
 ## How it works
 
