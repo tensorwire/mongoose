@@ -1,143 +1,78 @@
 # mongoose
 
-GPU compute library for Go. Trains and infers transformers without Python. Five backends behind one `Engine` interface — CUDA, Metal, Accelerate, WebGPU, CPU — selected by build tags. The public API operates on `[]float32` slices and `*Tensor` pointers. No framework, no graph compiler, no JIT.
+GPU compute for Go. Trains transformers without Python. One `Engine` interface, five backends — CUDA, Metal, Accelerate, WebGPU, CPU — selected at build time. Sparse by default.
 
-## Training throughput
+## Training — Dual H100 SXM NVLink
 
-Byte-level transformer, 4 layers, seq_len=64, vocab=256. 100 steps each. Measured April 2026.
-
-```
-                Metal (M4 Max 40GB)             CUDA (RTX 5090 32GB)
-dim=128         134 steps/s                     700 steps/s
-dim=256         113                             —
-dim=512         104                             —
-dim=1024         49                             —
-dim=2048         32                             —
-dim=4096         11 (605M params, 9.5s)         —
-```
-
-Metal path uses Needle INT8 optimizer with conductor-driven sparsity. CUDA path uses FP32 Helix DNA optimizer with AdamW for unpaired weights.
-
-### vs PyTorch MPS (M4 Max, same model, same data)
+Helix Dispatch: interleaved position parallelism. Both GPUs fire every GEMM simultaneously. No gradient sync. Per-GPU optimizer. Only K,V crosses the wire.
 
 ```
-dim       mongoose    PyTorch 2.8    ratio
-128       134         62             2.2x
-256       113         68             1.7x
-512       104         64             1.6x
-1024       49         60             0.8x
-2048       32         24             1.3x
-4096       11          6             1.7x
+Byte-level transformer, 8 layers, seq_len=64, 2000 steps.
+
+dim       mongoose    dense (DDP)    ratio
+128       172.5       —              —
+256       184.9       —              —
+512        74.4       —              —
+1024       66.0       —              —
+2048       40.9       32.5           1.3x
+4096       21.7       14.1           1.54x
 ```
 
-We lose at dim=1024 — PyTorch's MPSGraph fuses operations that our per-op dispatch path doesn't. Fused layer kernels exist for dim<512 but the tiled GEMM approach at larger dims needs the same treatment.
+At dim=4096 (1.2B params), mongoose trains 54% faster than the standard dense approach using the same hardware.
 
-## What the training pipeline does
+## How it works
 
-The Metal path runs the entire step — forward, GPU loss, backward, gradient clipping, optimizer, weight writeback — in a single command buffer with zero CPU synchronization.
+**Conductor** observes which rows are active each step. Inactive rows get no gradient, no optimizer update, no weight writeback. The sparse TN GEMM kernel skips entire 32-row threadgroup tiles when the mask says zero.
 
-**Needle** trains INT8 weights directly. Each weight is stored as INT8 + per-row FP32 scale + FP32 delta residual. The optimizer kernel dequants to FP32 in register, applies the Adam update with gradient clipping, requantizes, and writes the FP32 live weight for the next forward pass. The weight is FP32 for nanoseconds. FP16 momentum and velocity.
+**Helix** couples parameter pairs through DNA rung geometry — gate↔up (G≡C, 3 H-bonds), wq↔wo (A≡T, 2 H-bonds), wk↔wv (A≡T, 2 H-bonds). Three pairs per layer, no orphan weights. The coupled gradient cross-pollinates signal between functionally related weights.
 
-**Conductor** observes which embedding rows and projection output rows are active each step. Inactive rows get no gradient, no optimizer update, no dequant. At byte-level vocab=256 with seq=64, roughly 27 of 256 embed rows are hot. The sparse TN GEMM kernel skips entire 32-row threadgroup tiles in the backward pass when the mask is zero.
+**Helix Dispatch** splits sequence positions across GPUs. Even positions GPU 0, odd positions GPU 1. Both GPUs hold full weight replicas (read-only FP16). Each GPU runs its own Helix optimizer on its own FP32 master weights — two independent strands coupled through the conductor's shared hot-row mask. Scales to N GPUs: `pos % nGPUs == gpu`.
 
-**Helix** couples parameter pairs through DNA rung geometry — gate↔up with G≡C bonding (3 hydrogen bonds), Q↔K with A≡T bonding (2 hydrogen bonds). The coupled gradient cross-pollinates signal between paired weights. Fibonacci stride adapts exploration rate to training signal conductivity. The immune system checkpoints at loss floors and reverts on rebound.
-
-### CUDA status
-
-The CUDA path uses FP32 weights with `KHelixDNAStep` for paired parameters and `KAdamW` for singles. The Needle INT8 CUDA kernels exist (`mongoose_helix_needle`, `mongoose_helix_needle_paired` in `mongoose.cu`) and the Go bindings are wired, but the full pipeline requires the Xe iGPU for INT8↔FP16 conversion through L3 cache to avoid bottlenecking the discrete GPU. Shipping CUDA Needle with an Intel iGPU dependency is too opinionated for v1 — it works on Arrow Lake systems where the Xe shares L3 with the CPU, but excludes AMD platforms and older Intel. The FP32 path runs clean at 700 steps/s on RTX 5090.
-
-Checkpoints are cross-compatible: safetensors format with Llama-compatible config.json. Train on Metal with Needle, resume on CUDA with FP32, or vice versa.
+**Needle** (Metal path) trains INT8 weights directly. INT8 + per-row scale + FP32 delta residual. The weight is FP32 for nanoseconds — only in register, never in memory.
 
 ## Build
 
 ```bash
-# macOS — Metal + Accelerate
-CGO_ENABLED=1 go build ./...
-
-# Linux — CUDA
-CGO_ENABLED=1 go build ./...
-
-# Any platform — WebGPU/Vulkan, pure Go
-CGO_ENABLED=0 go build ./...
+CGO_ENABLED=1 go build ./...   # CUDA on Linux, Metal on macOS
+CGO_ENABLED=0 go build ./...   # WebGPU/Vulkan, pure Go
 ```
 
-Optional kernel compilation:
-
+CUDA kernels (optional, enables fused training + inference):
 ```bash
-# CUDA custom kernels
 cd kernels
 nvcc -shared -o libmongoose_kernels.so mongoose.cu \
     -Xcompiler -fPIC -gencode arch=compute_90,code=compute_90
-
-# Metal 4 cooperative tensor GEMM
-cd kernels
-xcrun metal -std=metal4.0 -O2 -c gemm_metal4.metal -o gemm_metal4.air
-xcrun metallib -o gemm_metal4.metallib gemm_metal4.air
-
-# Fused training kernels (pre/post attention)
-xcrun metal -std=metal3.0 -O2 -c fused_train.metal -o fused_train.air
-xcrun metallib -o fused_train.metallib fused_train.air
 ```
 
-## Architecture
-
-### Interfaces
+## Interfaces
 
 ```go
-eng := mongoose.NewMetal()  // or NewCUDA(), &CPU{}, NewWebGPU()
-result := eng.MatMul(weights, input, rows, cols, 1)
-
+eng := mongoose.NewCUDA()  // or NewMetal(), &CPU{}, NewWebGPU()
 te := mongoose.AsTensorEngine(eng)
-t := te.FromHost(data, []int{rows, cols})  // GPU-resident
+t := te.FromHost(data, []int{rows, cols})
 ```
 
-Four interface levels: `Engine` (host slices), `TensorEngine` (GPU-resident tensors), `TrainEngine` (BLAS primitives for CPU-side training), `GraphTrainEngine` (fused single-dispatch training).
+Four levels: `Engine` (host slices), `TensorEngine` (GPU tensors), `TrainEngine` (BLAS), `GraphTrainEngine` (fused dispatch).
 
-### Backends
+## Backends
 
-| Backend | Build tag | Dispatch |
-|---------|-----------|----------|
-| CUDA | `linux && cgo` | cuBLAS + custom kernels via dlopen |
-| Metal | `darwin && cgo` | MPS + Metal compute shaders + Metal 4 matmul2d |
+| Backend | Build tag | What |
+|---------|-----------|------|
+| CUDA | `linux && cgo` | cuBLAS + cublasLt + custom kernels |
+| Metal | `darwin && cgo` | MPS + compute shaders + Metal 4 matmul2d |
 | Accelerate | `darwin && cgo` | Apple AMX via cblas |
-| WebGPU | `!cgo` | gogpu/wgpu WGSL shaders (Vulkan/Metal/DX12) |
-| CPU | always | Pure Go, auto-vectorizes on NEON/AVX |
-
-Every backend has a `*_stub.go` companion. `go build ./...` compiles on any platform.
-
-### Metal training dispatch
-
-At dim < 512: fused kernels (`fused_pre_attn`, `fused_post_attn`) combine RMSNorm + GEMM + RoPE + SiLU into one dispatch per layer phase. At dim >= 512: tiled 32×32 GEMMs with shared memory tiling. Auto-selected based on model shape.
-
-Forward dispatches encode into one Metal compute command buffer. The batch-encode path (Apple7/M1) calls all dispatch functions from a single C function — one CGo round-trip per step. The ICB path (Apple8+/M2+) pre-encodes into an indirect command buffer at init — the infrastructure is built but blocked on a command encoding issue at high buffer bind counts.
-
-### CUDA arena allocator
-
-One `cudaMalloc` at init for 80% of VRAM. Sub-allocation by best-fit with 256-byte alignment and block merging. Zero `cudaMalloc`/`cudaFree` during training.
-
-### Warm cache
-
-On Metal: one MTLBuffer in unified memory holds all optimizer state. CPU and GPU access the same physical pages. On CUDA: pinned host memory (L3 bridge) for rung coefficients and masks.
-
-## Custom kernels
-
-**CUDA** (`kernels/mongoose.cu`): RMSNorm, RoPE, GQA attention, SiLU, fused Q8/Q4 matvec, AdamW, helix DNA step, helix needle (single + paired), cross-entropy, INT8 dequant (+delta variant), embedding gather, KV cache write.
-
-**Metal** (`metal_impl_darwin.m`): Same kernel set compiled from inline MSL source at init. All `constant&` parameters migrated to `device const*` for indirect command buffer compatibility. Pipeline states created with `supportIndirectCommandBuffers = YES`.
-
-**Metal 4** (`kernels/gemm_metal4.metal`): Cooperative tensor matmul2d in FP16 and FP32 (BT, NN, TN). Pre-compiled to `.metallib`, loaded at runtime, falls back to tiled GEMM if unavailable.
-
-**Fused training** (`kernels/fused_train.metal`): `fused_pre_attn` (RMSNorm → Q/K/V GEMM → RoPE) and `fused_post_attn` (WO GEMM → residual → RMSNorm → gate/up GEMM → SiLU → down GEMM → residual). One threadgroup per position, dim threads. Pre-compiled to `.metallib`.
+| WebGPU | `!cgo` | gogpu/wgpu (Vulkan/Metal/DX12) |
+| CPU | always | Pure Go |
 
 ## Ecosystem
 
 | Package | What |
 |---------|------|
-| [ai](https://github.com/open-ai-org/ai) | CLI — train, infer, chat, serve, quantize, resume |
-| [helix](https://github.com/open-ai-org/helix) | DNA optimizer — rung coupling, immune system, Fibonacci stride |
-| [needle](https://github.com/open-ai-org/needle) | Fused INT8 dequant + Adam kernels (CUDA + Metal) |
-| [gguf](https://github.com/open-ai-org/gguf) | GGUF + SafeTensors + NumPy I/O |
-| [tokenizer](https://github.com/open-ai-org/tokenizer) | BPE tokenizer (GPT-2, SentencePiece) |
+| [ai](https://github.com/open-ai-org/ai) | CLI — train, infer, chat, serve, quantize |
+| [helix](https://github.com/open-ai-org/helix) | DNA optimizer |
+| [needle](https://github.com/open-ai-org/needle) | Fused INT8 optimizer kernels |
+| [gguf](https://github.com/open-ai-org/gguf) | GGUF + SafeTensors I/O |
+| [tokenizer](https://github.com/open-ai-org/tokenizer) | BPE tokenizer |
 
 ## License
 
