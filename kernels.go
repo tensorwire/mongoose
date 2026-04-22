@@ -433,6 +433,11 @@ func LoadKernels(paths ...string) bool {
 	searchPaths := append(paths,
 		"./libmongoose_kernels.so",
 		"./kernels/libmongoose_kernels.so",
+	)
+	if exe, err := os.Executable(); err == nil {
+		searchPaths = append(searchPaths, filepath.Join(filepath.Dir(exe), "libmongoose_kernels.so"))
+	}
+	searchPaths = append(searchPaths,
 		filepath.Join(os.Getenv("HOME"), "tensorwire/libmongoose_kernels.so"),
 		"/usr/local/lib/libmongoose_kernels.so",
 	)
