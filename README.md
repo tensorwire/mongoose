@@ -40,6 +40,13 @@ dim       params     steps/s
 4096      605M        11
 ```
 
+## Inference — Qwen2.5-0.5B (200 tokens)
+
+```
+RTX 5090     182.4 tok/s    Q8 fused matvec
+M4 Max        51.0 tok/s    GPU-resident
+```
+
 ## How it works
 
 **Conductor** observes which rows are active each step. Inactive rows get no gradient, no optimizer update, no weight writeback. The sparse TN GEMM kernel skips entire 32-row threadgroup tiles when the mask says zero.
