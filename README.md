@@ -40,6 +40,21 @@ dim       params     steps/s
 4096      605M        11
 ```
 
+### Convergence — RTX 5090, dim=512, 4 layers
+
+```
+step       loss     floor    notes
+1          6.166    —        
+50         3.876    2.573    immune checkpoint at step 39
+100        2.588    2.374
+200        2.184    1.892    
+300        2.047    1.755
+400        1.940    1.285    immune rewind at step 356
+500        1.951    1.285    364.8 steps/s steady state
+```
+
+Loss drops 4.8x in 500 steps. The Helix immune system checkpoints at loss floors and reverts on rebound — visible in the floor column tracking the best-seen loss.
+
 ## Inference — Qwen2.5-0.5B (200 tokens)
 
 ```

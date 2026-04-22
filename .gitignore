@@ -1,6 +1,21 @@
+# Build artifacts (keep .metallib and .so in kernels/)
+*.o
+*.a
+*.exe
 
-# Test logs
+# Test
 *.log
 
 # OS
 .DS_Store
+Thumbs.db
+
+# Models
+*.gguf
+*.safetensors
+*.bin
+
+# Python
+*.py
+*.pyc
+__pycache__/
