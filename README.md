@@ -44,7 +44,7 @@ dim       params     steps/s
 
 ```
 RTX 5090     182.4 tok/s    Q8 fused matvec
-M4 Max        51.0 tok/s    GPU-resident
+M4 Max        54.3 tok/s    GPU-resident
 ```
 
 ## How it works
