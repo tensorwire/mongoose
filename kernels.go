@@ -451,6 +451,18 @@ func LoadKernels(paths ...string) bool {
 			return true
 		}
 	}
+
+	// Fallback: auto-compile from embedded source
+	if soPath := ProvisionKernels(); soPath != "" {
+		cPath := C.CString(soPath)
+		ret := C.tw_load_kernels(cPath)
+		C.free(unsafe.Pointer(cPath))
+		if ret == 0 {
+			log.Printf("[mongoose] CUDA kernels loaded from %s (auto-compiled)", soPath)
+			return true
+		}
+	}
+
 	return false
 }
 
