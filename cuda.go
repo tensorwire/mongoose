@@ -202,6 +202,9 @@ type CUDA struct {
 	Arena      *GPUArena                // arena allocator — replaces pool when active
 }
 
+// CUDADeviceCount returns the number of CUDA GPUs without initializing anything.
+func CUDADeviceCount() int { return int(C.tw_cuda_device_count()) }
+
 // NewCUDA initializes the CUDA backend on device 0.
 func NewCUDA() *CUDA { return NewCUDADevice(0) }
 

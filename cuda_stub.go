@@ -6,6 +6,7 @@ import "unsafe"
 
 type CUDA struct{}
 
+func CUDADeviceCount() int                                    { return 0 }
 func NewCUDA() *CUDA                                          { return nil }
 func (c *CUDA) Name() string                                  { return "cuda/unavailable" }
 func (c *CUDA) MatMul(a, b []float32, m, k, n int) []float32  { return nil }
