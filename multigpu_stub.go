@@ -67,3 +67,5 @@ func (mc *MultiCUDA) FromHostFP32OnDevice(dev int, data []float32, shape []int) 
 func (mc *MultiCUDA) FromHostFP16OnDevice(dev int, data []float32, shape []int, f func([]float32, []int) *Tensor) *Tensor { return nil }
 func (mc *MultiCUDA) SparsePeerCopy(srcDev int, src unsafe.Pointer, dstDev int, dst unsafe.Pointer, rows []int32, cols, elemSize int) {}
 func (mc *MultiCUDA) PeerCopyAsync(srcDev int, src unsafe.Pointer, dstDev int, dst unsafe.Pointer, bytes int) {}
+func InterleaveExtract(src, dst unsafe.Pointer, seqLen, cols, stride, offset, elemSize int)              {}
+func InterleaveInsert(src, dst unsafe.Pointer, seqLen, cols, stride, offset, elemSize int)               {}

@@ -427,6 +427,29 @@ void tw_multi_peer_copy_async(int srcDev, const void* src, int dstDev, void* dst
     cudaMemcpyPeerAsync(dst, dstDev, src, srcDev, bytes, tw_devices[srcDev].stream);
 }
 
+// Interleave scatter: extract every Nth row starting at offset into a packed buffer.
+// src[seqLen, cols] → dst[seqLen/stride, cols], taking rows where (row % stride == offset).
+// Both src and dst on the CURRENT device. elemSize = bytes per element (2 for FP16, 4 for FP32).
+void tw_interleave_extract(const void* src, void* dst, int seqLen, int cols, int stride, int offset, int elemSize) {
+    int outRow = 0;
+    size_t rowBytes = (size_t)cols * elemSize;
+    for (int i = offset; i < seqLen; i += stride) {
+        cudaMemcpy((char*)dst + (size_t)outRow * rowBytes, (const char*)src + (size_t)i * rowBytes, rowBytes, cudaMemcpyDeviceToDevice);
+        outRow++;
+    }
+}
+
+// Interleave gather: scatter packed rows back into strided positions.
+// src[seqLen/stride, cols] → dst[seqLen, cols], writing to rows where (row % stride == offset).
+void tw_interleave_insert(const void* src, void* dst, int seqLen, int cols, int stride, int offset, int elemSize) {
+    int inRow = 0;
+    size_t rowBytes = (size_t)cols * elemSize;
+    for (int i = offset; i < seqLen; i += stride) {
+        cudaMemcpy((char*)dst + (size_t)i * rowBytes, (const char*)src + (size_t)inRow * rowBytes, rowBytes, cudaMemcpyDeviceToDevice);
+        inRow++;
+    }
+}
+
 // Sparse P2P: copy only specified rows from src to dst.
 // rows[] = row indices, nRows = count, cols = elements per row.
 // Copies nRows * cols * elemSize bytes total, scattered by row index.
@@ -779,6 +802,18 @@ func (mc *MultiCUDA) SparsePeerCopy(srcDev int, src unsafe.Pointer, dstDev int, 
 // PeerCopyAsync copies between devices without blocking the caller.
 func (mc *MultiCUDA) PeerCopyAsync(srcDev int, src unsafe.Pointer, dstDev int, dst unsafe.Pointer, bytes int) {
 	C.tw_multi_peer_copy_async(C.int(srcDev), src, C.int(dstDev), dst, C.size_t(bytes))
+}
+
+// InterleaveExtract extracts every Nth row (stride) starting at offset into a packed buffer.
+// src[seqLen, cols] → dst[seqLen/stride, cols]. Both on current device. elemSize: 2=FP16, 4=FP32.
+func InterleaveExtract(src, dst unsafe.Pointer, seqLen, cols, stride, offset, elemSize int) {
+	C.tw_interleave_extract(src, dst, C.int(seqLen), C.int(cols), C.int(stride), C.int(offset), C.int(elemSize))
+}
+
+// InterleaveInsert scatters packed rows back into strided positions.
+// src[seqLen/stride, cols] → dst[seqLen, cols] at rows where row%stride==offset.
+func InterleaveInsert(src, dst unsafe.Pointer, seqLen, cols, stride, offset, elemSize int) {
+	C.tw_interleave_insert(src, dst, C.int(seqLen), C.int(cols), C.int(stride), C.int(offset), C.int(elemSize))
 }
 
 // String returns a summary of the multi-GPU topology.
