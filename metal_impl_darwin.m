@@ -5468,8 +5468,8 @@ static NSString* g_infer_kernel_src =
 @"#include <metal_stdlib>\n"
 "using namespace metal;\n"
 "\n"
-"// Q8 fused dequant matvec: out[row] = sum_k(act[k] * int8_weight[row*K+k] * scale[row]/127).\n"
-"// One threadgroup per output row. Cooperative SIMD reduction.\n"
+"// Q8 fused dequant matvec: one threadgroup per output row, SIMD reduction.\n"
+"// Vectorized 4-wide loads for memory bandwidth.\n"
 "kernel void q8_matvec(\n"
 "    device const float* act   [[buffer(0)]],  // [K]\n"
 "    device const char* weight  [[buffer(1)]],  // [N, K] int8\n"
@@ -5484,8 +5484,17 @@ static NSString* g_infer_kernel_src =
 "    float scale = scales[row] / 127.0f;\n"
 "    device const char* wRow = weight + row * K;\n"
 "    float sum = 0.0f;\n"
-"    for (uint k = tid; k < K; k += tpg)\n"
-"        sum += act[k] * float(wRow[k]) * scale;\n"
+"    // Vectorized loop: process 4 elements at a time\n"
+"    uint k = tid * 4;\n"
+"    for (; k + 3 < K; k += tpg * 4) {\n"
+"        float4 a = float4(act[k], act[k+1], act[k+2], act[k+3]);\n"
+"        float4 w = float4(float(wRow[k]), float(wRow[k+1]), float(wRow[k+2]), float(wRow[k+3]));\n"
+"        sum += dot(a, w);\n"
+"    }\n"
+"    // Tail\n"
+"    for (; k < K; k += tpg)\n"
+"        sum += act[k] * float(wRow[k]);\n"
+"    sum *= scale;\n"
 "    sum = simd_sum(sum);\n"
 "    threadgroup float shared[32];\n"
 "    uint lane = tid % 32, warp = tid / 32;\n"
@@ -5824,7 +5833,7 @@ int mtl_fused_set_weight(int idx, const float* data, int nFloats) {
 #define DT(x,y,z, tx,ty,tz) [enc dispatchThreads:MTLSizeMake(x,y,z) threadsPerThreadgroup:MTLSizeMake(tx,ty,tz)]
 #define DTG(gx,gy,gz, tx,ty,tz) [enc dispatchThreadgroups:MTLSizeMake(gx,gy,gz) threadsPerThreadgroup:MTLSizeMake(tx,ty,tz)]
 #define BARRIER() [enc memoryBarrierWithScope:MTLBarrierScopeBuffers]
-// Quantized matvec: dispatches Q4 or Q8 based on weight's q4 flag.
+// Quantized matvec dispatch. One threadgroup per output row.
 #define QMV(act, w, out, cb_K) do { \
     if ((w).q4) { \
         PS(g_ps_q4mv); BUF(act, 0); BUF((w).data, 1); BUF((w).scales, 2); BUF(out, 3); CB(cb_K, 4); \
