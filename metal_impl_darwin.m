@@ -5458,12 +5458,492 @@ static void batch_encode_bwd(ICBBuildParams* p) {
     }
 }
 
-// Inference compute-shader stubs — satisfy linker.
-// Real implementations will replace these.
+// ============================================================
+// Inference engine — single command buffer, single compute encoder per token.
+// Pattern: llama.cpp ggml-metal. Barriers between dependent dispatches.
+// ============================================================
+
+// Inline kernels for inference (not needed by training).
+static NSString* g_infer_kernel_src =
+@"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"\n"
+"// Q8 fused dequant matvec: out[row] = sum_k(act[k] * int8_weight[row*K+k] * scale[row]/127).\n"
+"// One threadgroup per output row. Cooperative SIMD reduction.\n"
+"kernel void q8_matvec(\n"
+"    device const float* act   [[buffer(0)]],  // [K]\n"
+"    device const char* weight  [[buffer(1)]],  // [N, K] int8\n"
+"    device const float* scales [[buffer(2)]],  // [N]\n"
+"    device float* out          [[buffer(3)]],  // [N]\n"
+"    device const uint* p_K     [[buffer(4)]],\n"
+"    uint row [[threadgroup_position_in_grid]],\n"
+"    uint tid [[thread_index_in_threadgroup]],\n"
+"    uint tpg [[threads_per_threadgroup]])\n"
+"{\n"
+"    uint K = p_K[0];\n"
+"    float scale = scales[row] / 127.0f;\n"
+"    device const char* wRow = weight + row * K;\n"
+"    float sum = 0.0f;\n"
+"    for (uint k = tid; k < K; k += tpg)\n"
+"        sum += act[k] * float(wRow[k]) * scale;\n"
+"    sum = simd_sum(sum);\n"
+"    threadgroup float shared[32];\n"
+"    uint lane = tid % 32, warp = tid / 32;\n"
+"    if (lane == 0) shared[warp] = sum;\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    if (warp == 0) {\n"
+"        sum = (lane < (tpg + 31) / 32) ? shared[lane] : 0.0f;\n"
+"        sum = simd_sum(sum);\n"
+"    }\n"
+"    if (tid == 0) out[row] = sum;\n"
+"}\n"
+"\n"
+"// Q4 fused dequant matvec: packed 4-bit weights, 2 values per byte.\n"
+"kernel void q4_matvec(\n"
+"    device const float* act     [[buffer(0)]],\n"
+"    device const uchar* weight  [[buffer(1)]],  // [N, K/2] packed\n"
+"    device const float* scales  [[buffer(2)]],  // [N]\n"
+"    device float* out           [[buffer(3)]],  // [N]\n"
+"    device const uint* p_K      [[buffer(4)]],\n"
+"    uint row [[threadgroup_position_in_grid]],\n"
+"    uint tid [[thread_index_in_threadgroup]],\n"
+"    uint tpg [[threads_per_threadgroup]])\n"
+"{\n"
+"    uint K = p_K[0];\n"
+"    float scale = scales[row] / 7.0f;\n"
+"    uint halfK = K / 2;\n"
+"    device const uchar* wRow = weight + row * halfK;\n"
+"    float sum = 0.0f;\n"
+"    for (uint k = tid; k < halfK; k += tpg) {\n"
+"        uchar packed = wRow[k];\n"
+"        float w0 = float(int(packed & 0xF) - 8) * scale;\n"
+"        float w1 = float(int(packed >> 4) - 8) * scale;\n"
+"        sum += act[k * 2] * w0 + act[k * 2 + 1] * w1;\n"
+"    }\n"
+"    sum = simd_sum(sum);\n"
+"    threadgroup float shared[32];\n"
+"    uint lane = tid % 32, warp = tid / 32;\n"
+"    if (lane == 0) shared[warp] = sum;\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    if (warp == 0) {\n"
+"        sum = (lane < (tpg + 31) / 32) ? shared[lane] : 0.0f;\n"
+"        sum = simd_sum(sum);\n"
+"    }\n"
+"    if (tid == 0) out[row] = sum;\n"
+"}\n"
+"\n"
+"// Rotate-half RoPE at explicit position (for pretrained HF models).\n"
+"// x is [1, nHeads*headDim]. Pairs: (x[j], x[j+halfDim]) per head.\n"
+"kernel void rope_rotate_half(\n"
+"    device float* x          [[buffer(0)]],\n"
+"    device const uint* p_hd  [[buffer(1)]],  // headDim\n"
+"    device const uint* p_nh  [[buffer(2)]],  // nHeads\n"
+"    device const uint* p_pos [[buffer(3)]],  // position\n"
+"    device const float* p_th [[buffer(4)]],  // theta\n"
+"    uint pid [[thread_position_in_grid]])\n"
+"{\n"
+"    uint headDim = p_hd[0], nHeads = p_nh[0], pos = p_pos[0];\n"
+"    float theta = p_th[0];\n"
+"    uint halfDim = headDim / 2;\n"
+"    uint h = pid / halfDim;\n"
+"    uint j = pid % halfDim;\n"
+"    if (h >= nHeads) return;\n"
+"    float freq = 1.0f / pow(theta, float(2*j) / float(headDim));\n"
+"    float angle = float(pos) * freq;\n"
+"    float cosA = cos(angle), sinA = sin(angle);\n"
+"    uint base = h * headDim;\n"
+"    float x0 = x[base + j], x1 = x[base + j + halfDim];\n"
+"    x[base + j]           = x0 * cosA - x1 * sinA;\n"
+"    x[base + j + halfDim] = x0 * sinA + x1 * cosA;\n"
+"}\n"
+"\n"
+"// Decode attention: single Q over KV cache.\n"
+"// One threadgroup per head, headDim threads.\n"
+"kernel void decode_attn(\n"
+"    device const float* Q      [[buffer(0)]],  // [1, dim]\n"
+"    device const float* kCache [[buffer(1)]],  // [maxSeq, kvDim]\n"
+"    device const float* vCache [[buffer(2)]],  // [maxSeq, kvDim]\n"
+"    device float* out          [[buffer(3)]],  // [1, dim]\n"
+"    device const uint* p_kvDim   [[buffer(4)]],\n"
+"    device const uint* p_headDim [[buffer(5)]],\n"
+"    device const uint* p_nHeads  [[buffer(6)]],\n"
+"    device const uint* p_nKVH   [[buffer(7)]],\n"
+"    device const uint* p_seqLen [[buffer(8)]],\n"
+"    uint h [[threadgroup_position_in_grid]],\n"
+"    uint tid [[thread_index_in_threadgroup]])\n"
+"{\n"
+"    uint kvDim = p_kvDim[0], headDim = p_headDim[0];\n"
+"    uint nHeads = p_nHeads[0], nKVH = p_nKVH[0], seqLen = p_seqLen[0];\n"
+"    if (h >= nHeads || tid >= headDim) return;\n"
+"    uint kvMul = nHeads / nKVH;\n"
+"    uint kvH = h / kvMul;\n"
+"    float scale = 1.0f / sqrt(float(headDim));\n"
+"    threadgroup float scores[4096];\n"
+"    threadgroup float smax[1];\n"
+"    threadgroup float ssum[1];\n"
+"    uint work = (seqLen + headDim - 1) / headDim;\n"
+"    for (uint w = 0; w < work; w++) {\n"
+"        uint t = tid + w * headDim;\n"
+"        if (t < seqLen) {\n"
+"            float dot = 0.0f;\n"
+"            for (uint d = 0; d < headDim; d++)\n"
+"                dot += Q[h * headDim + d] * kCache[t * kvDim + kvH * headDim + d];\n"
+"            scores[t] = dot * scale;\n"
+"        }\n"
+"    }\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    if (tid == 0) { float mx = -1e30f; for (uint t = 0; t < seqLen; t++) mx = max(mx, scores[t]); smax[0] = mx; }\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    float mx = smax[0];\n"
+"    for (uint w = 0; w < work; w++) { uint t = tid + w * headDim; if (t < seqLen) scores[t] = exp(scores[t] - mx); }\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    if (tid == 0) { float s = 0.0f; for (uint t = 0; t < seqLen; t++) s += scores[t]; ssum[0] = s; }\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    float invSum = 1.0f / ssum[0];\n"
+"    float acc = 0.0f;\n"
+"    for (uint t = 0; t < seqLen; t++)\n"
+"        acc += scores[t] * invSum * vCache[t * kvDim + kvH * headDim + tid];\n"
+"    out[h * headDim + tid] = acc;\n"
+"}\n";
+
+static id<MTLComputePipelineState> g_ps_rope_rh = nil;  // rotate-half RoPE
+static id<MTLComputePipelineState> g_ps_dec_attn = nil;  // decode attention
+static id<MTLComputePipelineState> g_ps_q8mv = nil;      // Q8 fused dequant matvec
+static id<MTLComputePipelineState> g_ps_q4mv = nil;      // Q4 fused dequant matvec
+
+// Quantized weight: int8 or packed 4-bit data + float scales per row
+typedef struct {
+    void* data;   // Q8: [rows * cols] int8. Q4: [rows * cols/2] packed uint8.
+    void* scales; // [rows] float32
+    int rows, cols;
+    bool q4;      // true = 4-bit packed, false = 8-bit
+} q8_weight_t;
+
+// Inference state
+static struct {
+    int dim, kvDim, headDim, nHeads, nKVHeads, ffnDim, vocabSize, nLayers, maxSeq;
+    bool built;
+    // Per-layer: norm weights are FP32, matmul weights are Q8
+    void** norm1; void** norm2;           // [dim] FP32
+    q8_weight_t* wq; q8_weight_t* wk; q8_weight_t* wv; q8_weight_t* wo;
+    q8_weight_t* wgate; q8_weight_t* wup; q8_weight_t* wdown;
+    void** bq; void** bk; void** bv;     // bias FP32
+    // KV cache per layer
+    void** kCache; void** vCache;
+    // Final
+    void* finalNorm;
+    q8_weight_t lmHead;
+    // Scratch
+    void* hidden; void* normed; void* Q; void* K; void* V; void* attnOut;
+    void* rmsScale; void* normed2; void* rmsScale2;
+    void* gatePre; void* upOut; void* ffnMid; void* proj; void* logits;
+    // Cached constants
+    id<MTLBuffer> cb_dim; id<MTLBuffer> cb_kvDim; id<MTLBuffer> cb_headDim;
+    id<MTLBuffer> cb_nHeads; id<MTLBuffer> cb_nKVHeads; id<MTLBuffer> cb_ffnDim;
+    id<MTLBuffer> cb_eps; id<MTLBuffer> cb_theta;
+    id<MTLBuffer> cb_Kdim; id<MTLBuffer> cb_Nkvdim; id<MTLBuffer> cb_Nffn; id<MTLBuffer> cb_Nvocab;
+} g_inf = {0};
+
+static bool g_inf_use_q4 = false;
+
+static q8_weight_t inf_quant_alloc(int rows, int cols) {
+    q8_weight_t w;
+    w.rows = rows; w.cols = cols; w.q4 = g_inf_use_q4;
+    int dataBytes = g_inf_use_q4 ? rows * (cols / 2) : rows * cols;
+    w.data = (__bridge_retained void*)[g_device newBufferWithLength:dataBytes options:MTLResourceStorageModeShared];
+    w.scales = (__bridge_retained void*)[g_device newBufferWithLength:rows * sizeof(float) options:MTLResourceStorageModeShared];
+    return w;
+}
+
+static void inf_quant_upload(q8_weight_t* w, const float* fp32, int rows, int cols) {
+    float* scales = (float*)((__bridge id<MTLBuffer>)w->scales).contents;
+    if (w->q4) {
+        uint8_t* dst = (uint8_t*)((__bridge id<MTLBuffer>)w->data).contents;
+        for (int r = 0; r < rows; r++) {
+            float absMax = 0;
+            for (int c = 0; c < cols; c++) {
+                float v = fp32[r * cols + c]; if (v < 0) v = -v;
+                if (v > absMax) absMax = v;
+            }
+            scales[r] = absMax;
+            float invScale = absMax > 0 ? 7.0f / absMax : 0;
+            int halfCols = cols / 2;
+            for (int c = 0; c < halfCols; c++) {
+                float v0 = fp32[r * cols + c * 2] * invScale;
+                float v1 = fp32[r * cols + c * 2 + 1] * invScale;
+                int q0 = (int)(v0 + (v0 > 0 ? 0.5f : -0.5f)) + 8;
+                int q1 = (int)(v1 + (v1 > 0 ? 0.5f : -0.5f)) + 8;
+                if (q0 < 0) q0 = 0; if (q0 > 15) q0 = 15;
+                if (q1 < 0) q1 = 0; if (q1 > 15) q1 = 15;
+                dst[r * halfCols + c] = (uint8_t)(q0 | (q1 << 4));
+            }
+        }
+    } else {
+        int8_t* dst = (int8_t*)((__bridge id<MTLBuffer>)w->data).contents;
+        for (int r = 0; r < rows; r++) {
+            float absMax = 0;
+            for (int c = 0; c < cols; c++) {
+                float v = fp32[r * cols + c]; if (v < 0) v = -v;
+                if (v > absMax) absMax = v;
+            }
+            scales[r] = absMax;
+            float invScale = absMax > 0 ? 127.0f / absMax : 0;
+            for (int c = 0; c < cols; c++) {
+                float v = fp32[r * cols + c] * invScale;
+                if (v > 127) v = 127; if (v < -127) v = -127;
+                dst[r * cols + c] = (int8_t)(v + (v > 0 ? 0.5f : -0.5f));
+            }
+        }
+    }
+}
+
+static void* inf_buf(int nFloats) {
+    return (__bridge_retained void*)[g_device newBufferWithLength:nFloats * sizeof(float)
+                                                         options:MTLResourceStorageModeShared];
+}
+
+static id<MTLBuffer> inf_const(uint32_t val) {
+    return [g_device newBufferWithBytes:&val length:4 options:MTLResourceStorageModeShared];
+}
+
+static id<MTLBuffer> inf_constf(float val) {
+    return [g_device newBufferWithBytes:&val length:4 options:MTLResourceStorageModeShared];
+}
+
 int mtl_fused_build(int dim, int kvDim, int headDim,
                     int nHeads, int nKVHeads, int ffnDim,
-                    int vocabSize, int nLayers, int maxSeq) { return -1; }
-int mtl_fused_num_weights(void) { return 0; }
-int mtl_fused_set_weight(int idx, const float* data, int nFloats) { return -1; }
+                    int vocabSize, int nLayers, int maxSeq) {
+    if (g_inf.built) return 0;
+    if (!g_device || !g_ps_rmsnorm_save || !g_ps_gemm_bt || !g_ps_copy_mem) return -1;
+
+    // Compile inference-only kernels
+    NSError* err = nil;
+    id<MTLLibrary> lib = [g_device newLibraryWithSource:g_infer_kernel_src options:nil error:&err];
+    if (!lib) { NSLog(@"infer kernel compile: %@", err); return -1; }
+    g_ps_rope_rh = [g_device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rope_rotate_half"] error:&err];
+    g_ps_dec_attn = [g_device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"decode_attn"] error:&err];
+    g_ps_q8mv = [g_device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"q8_matvec"] error:&err];
+    g_ps_q4mv = [g_device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"q4_matvec"] error:&err];
+    if (!g_ps_rope_rh || !g_ps_dec_attn || !g_ps_q8mv || !g_ps_q4mv) { NSLog(@"infer pipeline: %@", err); return -1; }
+
+    if (maxSeq > 4096) maxSeq = 4096; // decode_attn threadgroup memory limit
+
+    // Q4 for models > 4B params, Q8 for smaller
+    int64_t nParams = (int64_t)vocabSize * dim;
+    for (int l = 0; l < nLayers; l++) nParams += (int64_t)dim*dim*2 + (int64_t)kvDim*dim*2 + (int64_t)ffnDim*dim*3;
+    g_inf_use_q4 = (nParams > 4000000000LL);
+    NSLog(@"mongoose: inference Q%d (%.1fB params)", g_inf_use_q4 ? 4 : 8, nParams / 1e9);
+
+    g_inf.dim=dim; g_inf.kvDim=kvDim; g_inf.headDim=headDim;
+    g_inf.nHeads=nHeads; g_inf.nKVHeads=nKVHeads; g_inf.ffnDim=ffnDim;
+    g_inf.vocabSize=vocabSize; g_inf.nLayers=nLayers; g_inf.maxSeq=maxSeq;
+
+    // Per-layer weights: norms + biases as FP32, matmul weights as Q8
+    g_inf.norm1=(void**)calloc(nLayers,8); g_inf.norm2=(void**)calloc(nLayers,8);
+    g_inf.bq=(void**)calloc(nLayers,8); g_inf.bk=(void**)calloc(nLayers,8); g_inf.bv=(void**)calloc(nLayers,8);
+    g_inf.wq=(q8_weight_t*)calloc(nLayers,sizeof(q8_weight_t));
+    g_inf.wk=(q8_weight_t*)calloc(nLayers,sizeof(q8_weight_t));
+    g_inf.wv=(q8_weight_t*)calloc(nLayers,sizeof(q8_weight_t));
+    g_inf.wo=(q8_weight_t*)calloc(nLayers,sizeof(q8_weight_t));
+    g_inf.wgate=(q8_weight_t*)calloc(nLayers,sizeof(q8_weight_t));
+    g_inf.wup=(q8_weight_t*)calloc(nLayers,sizeof(q8_weight_t));
+    g_inf.wdown=(q8_weight_t*)calloc(nLayers,sizeof(q8_weight_t));
+    g_inf.kCache=(void**)calloc(nLayers,8); g_inf.vCache=(void**)calloc(nLayers,8);
+    for (int l = 0; l < nLayers; l++) {
+        g_inf.norm1[l]=inf_buf(dim); g_inf.norm2[l]=inf_buf(dim);
+        g_inf.bq[l]=inf_buf(dim); g_inf.bk[l]=inf_buf(kvDim); g_inf.bv[l]=inf_buf(kvDim);
+        g_inf.wq[l]=inf_quant_alloc(dim, dim);
+        g_inf.wk[l]=inf_quant_alloc(kvDim, dim);
+        g_inf.wv[l]=inf_quant_alloc(kvDim, dim);
+        g_inf.wo[l]=inf_quant_alloc(dim, dim);
+        g_inf.wgate[l]=inf_quant_alloc(ffnDim, dim);
+        g_inf.wup[l]=inf_quant_alloc(ffnDim, dim);
+        g_inf.wdown[l]=inf_quant_alloc(dim, ffnDim);
+        g_inf.kCache[l]=inf_buf(maxSeq*kvDim); g_inf.vCache[l]=inf_buf(maxSeq*kvDim);
+    }
+    g_inf.finalNorm=inf_buf(dim);
+    g_inf.lmHead=inf_quant_alloc(vocabSize, dim);
+
+    // Scratch
+    g_inf.hidden=inf_buf(dim); g_inf.normed=inf_buf(dim);
+    g_inf.Q=inf_buf(dim); g_inf.K=inf_buf(kvDim); g_inf.V=inf_buf(kvDim);
+    g_inf.attnOut=inf_buf(dim); g_inf.rmsScale=inf_buf(1); g_inf.rmsScale2=inf_buf(1);
+    g_inf.normed2=inf_buf(dim); g_inf.gatePre=inf_buf(ffnDim);
+    g_inf.upOut=inf_buf(ffnDim); g_inf.ffnMid=inf_buf(ffnDim);
+    g_inf.proj=inf_buf(dim); g_inf.logits=inf_buf(vocabSize);
+
+    // Cached constants (allocated once, never change)
+    g_inf.cb_dim=inf_const(dim); g_inf.cb_kvDim=inf_const(kvDim);
+    g_inf.cb_headDim=inf_const(headDim); g_inf.cb_nHeads=inf_const(nHeads);
+    g_inf.cb_nKVHeads=inf_const(nKVHeads); g_inf.cb_ffnDim=inf_const(ffnDim);
+    g_inf.cb_eps=inf_constf(1e-6f); g_inf.cb_theta=inf_constf(10000.0f);
+    g_inf.cb_Kdim=inf_const(dim); g_inf.cb_Nkvdim=inf_const(kvDim);
+    g_inf.cb_Nffn=inf_const(ffnDim); g_inf.cb_Nvocab=inf_const(vocabSize);
+
+    g_inf.built = true;
+    return 0;
+}
+
+int mtl_fused_num_weights(void) {
+    return g_inf.built ? g_inf.nLayers * 12 + 2 : 0;
+}
+
+int mtl_fused_set_weight(int idx, const float* data, int nFloats) {
+    if (!g_inf.built) return -1;
+    int nL = g_inf.nLayers, dim = g_inf.dim, kvDim = g_inf.kvDim, ffnDim = g_inf.ffnDim;
+    if (idx < nL * 12) {
+        int layer = idx / 12, w = idx % 12;
+        switch (w) {
+            case 0: // norm1 — FP32
+                memcpy(((__bridge id<MTLBuffer>)g_inf.norm1[layer]).contents, data, nFloats*4); break;
+            case 1: inf_quant_upload(&g_inf.wq[layer], data, dim, dim); break;
+            case 2: inf_quant_upload(&g_inf.wk[layer], data, kvDim, dim); break;
+            case 3: inf_quant_upload(&g_inf.wv[layer], data, kvDim, dim); break;
+            case 4: memcpy(((__bridge id<MTLBuffer>)g_inf.bq[layer]).contents, data, nFloats*4); break;
+            case 5: memcpy(((__bridge id<MTLBuffer>)g_inf.bk[layer]).contents, data, nFloats*4); break;
+            case 6: memcpy(((__bridge id<MTLBuffer>)g_inf.bv[layer]).contents, data, nFloats*4); break;
+            case 7: inf_quant_upload(&g_inf.wo[layer], data, dim, dim); break;
+            case 8: memcpy(((__bridge id<MTLBuffer>)g_inf.norm2[layer]).contents, data, nFloats*4); break;
+            case 9: inf_quant_upload(&g_inf.wgate[layer], data, ffnDim, dim); break;
+            case 10: inf_quant_upload(&g_inf.wup[layer], data, ffnDim, dim); break;
+            case 11: inf_quant_upload(&g_inf.wdown[layer], data, dim, ffnDim); break;
+        }
+    } else if (idx == nL*12) {
+        memcpy(((__bridge id<MTLBuffer>)g_inf.finalNorm).contents, data, nFloats*4);
+    } else if (idx == nL*12+1) {
+        inf_quant_upload(&g_inf.lmHead, data, g_inf.vocabSize, dim);
+    }
+    return 0;
+}
+
+// Macros for clean dispatch — all use the same encoder `enc`.
+#define PS(ps) [enc setComputePipelineState:ps]
+#define BUF(ref, idx) [enc setBuffer:(__bridge id<MTLBuffer>)(ref) offset:0 atIndex:idx]
+#define BUFO(ref, off, idx) [enc setBuffer:(__bridge id<MTLBuffer>)(ref) offset:(off) atIndex:idx]
+#define CB(cb, idx) [enc setBuffer:cb offset:0 atIndex:idx]
+#define DT(x,y,z, tx,ty,tz) [enc dispatchThreads:MTLSizeMake(x,y,z) threadsPerThreadgroup:MTLSizeMake(tx,ty,tz)]
+#define DTG(gx,gy,gz, tx,ty,tz) [enc dispatchThreadgroups:MTLSizeMake(gx,gy,gz) threadsPerThreadgroup:MTLSizeMake(tx,ty,tz)]
+#define BARRIER() [enc memoryBarrierWithScope:MTLBarrierScopeBuffers]
+// Quantized matvec: dispatches Q4 or Q8 based on weight's q4 flag.
+#define QMV(act, w, out, cb_K) do { \
+    if ((w).q4) { \
+        PS(g_ps_q4mv); BUF(act, 0); BUF((w).data, 1); BUF((w).scales, 2); BUF(out, 3); CB(cb_K, 4); \
+        DTG((w).rows, 1, 1, MIN(256, (int)g_ps_q4mv.maxTotalThreadsPerThreadgroup), 1, 1); \
+    } else { \
+        PS(g_ps_q8mv); BUF(act, 0); BUF((w).data, 1); BUF((w).scales, 2); BUF(out, 3); CB(cb_K, 4); \
+        DTG((w).rows, 1, 1, MIN(256, (int)g_ps_q8mv.maxTotalThreadsPerThreadgroup), 1, 1); \
+    } \
+} while(0)
+
 int mtl_fused_step(const float* hiddenIn, const float* cosData, const float* sinData,
-                   int pos, float* logitsOut) { return -1; }
+                   int pos, float* logitsOut) {
+    if (!g_inf.built) return -1;
+    int dim=g_inf.dim, kvDim=g_inf.kvDim, headDim=g_inf.headDim;
+    int nHeads=g_inf.nHeads, nKVHeads=g_inf.nKVHeads, ffnDim=g_inf.ffnDim;
+    int nLayers=g_inf.nLayers, vocabSize=g_inf.vocabSize;
+    int seqLen = pos + 1;
+
+    // Upload hidden
+    memcpy(((__bridge id<MTLBuffer>)g_inf.hidden).contents, hiddenIn, dim * sizeof(float));
+
+    // Per-token constants
+    uint32_t upos = (uint32_t)pos, useq = (uint32_t)seqLen;
+    id<MTLBuffer> cb_pos = [g_device newBufferWithBytes:&upos length:4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> cb_seq = [g_device newBufferWithBytes:&useq length:4 options:MTLResourceStorageModeShared];
+
+    // One command buffer, one encoder
+    id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+
+    NSUInteger tpg_norm = (dim / 32) * 32; if (tpg_norm == 0) tpg_norm = 32;
+    if (tpg_norm > g_ps_rmsnorm_save.maxTotalThreadsPerThreadgroup) tpg_norm = g_ps_rmsnorm_save.maxTotalThreadsPerThreadgroup;
+
+    for (int l = 0; l < nLayers; l++) {
+        // --- Pre-attention: RMSNorm → QKV → bias → RoPE ---
+
+        // Copy hidden → normed
+        PS(g_ps_copy_mem); BUF(g_inf.hidden, 0); BUF(g_inf.normed, 1);
+        DT(dim,1,1, 256,1,1); BARRIER();
+
+        // RMSNorm normed in-place
+        PS(g_ps_rmsnorm_save); BUF(g_inf.normed, 0); BUF(g_inf.norm1[l], 1); BUF(g_inf.rmsScale, 2);
+        CB(g_inf.cb_dim, 3); CB(g_inf.cb_eps, 4); DTG(1,1,1, tpg_norm,1,1); BARRIER();
+
+        // QKV matvecs (Q8 fused dequant)
+        QMV(g_inf.normed, g_inf.wq[l], g_inf.Q, g_inf.cb_Kdim);
+        QMV(g_inf.normed, g_inf.wk[l], g_inf.K, g_inf.cb_Kdim);
+        QMV(g_inf.normed, g_inf.wv[l], g_inf.V, g_inf.cb_Kdim);
+        BARRIER();
+
+        // Bias add
+        PS(g_ps_bias_add);
+        BUF(g_inf.Q, 0); BUF(g_inf.bq[l], 1); CB(g_inf.cb_dim, 2); DT(dim,1,1, 256,1,1);
+        BUF(g_inf.K, 0); BUF(g_inf.bk[l], 1); CB(g_inf.cb_kvDim, 2); DT(kvDim,1,1, 256,1,1);
+        BUF(g_inf.V, 0); BUF(g_inf.bv[l], 1); CB(g_inf.cb_kvDim, 2); DT(kvDim,1,1, 256,1,1);
+        BARRIER();
+
+        // RoPE rotate-half
+        int nPQ = nHeads * (headDim / 2), nPK = nKVHeads * (headDim / 2);
+        PS(g_ps_rope_rh);
+        BUF(g_inf.Q, 0); CB(g_inf.cb_headDim, 1); CB(g_inf.cb_nHeads, 2); CB(cb_pos, 3); CB(g_inf.cb_theta, 4);
+        DT(nPQ,1,1, MIN(256,(int)g_ps_rope_rh.maxTotalThreadsPerThreadgroup),1,1);
+        BUF(g_inf.K, 0); CB(g_inf.cb_headDim, 1); CB(g_inf.cb_nKVHeads, 2); CB(cb_pos, 3); CB(g_inf.cb_theta, 4);
+        DT(nPK,1,1, MIN(256,(int)g_ps_rope_rh.maxTotalThreadsPerThreadgroup),1,1);
+        BARRIER();
+
+        // K/V → cache at pos
+        int cOff = pos * kvDim * (int)sizeof(float);
+        PS(g_ps_copy_mem);
+        BUF(g_inf.K, 0); BUFO(g_inf.kCache[l], cOff, 1); DT(kvDim,1,1, 256,1,1);
+        BUF(g_inf.V, 0); BUFO(g_inf.vCache[l], cOff, 1); DT(kvDim,1,1, 256,1,1);
+        BARRIER();
+
+        // Decode attention
+        PS(g_ps_dec_attn);
+        BUF(g_inf.Q, 0); BUF(g_inf.kCache[l], 1); BUF(g_inf.vCache[l], 2); BUF(g_inf.attnOut, 3);
+        CB(g_inf.cb_kvDim, 4); CB(g_inf.cb_headDim, 5); CB(g_inf.cb_nHeads, 6);
+        CB(g_inf.cb_nKVHeads, 7); CB(cb_seq, 8);
+        DTG(nHeads,1,1, headDim,1,1); BARRIER();
+
+        // O-proj + residual
+        QMV(g_inf.attnOut, g_inf.wo[l], g_inf.proj, g_inf.cb_Kdim); BARRIER();
+        PS(g_ps_add_inplace); BUF(g_inf.hidden, 0); BUF(g_inf.proj, 1);
+        DT(dim,1,1, 256,1,1); BARRIER();
+
+        // Post-attn norm
+        PS(g_ps_copy_mem); BUF(g_inf.hidden, 0); BUF(g_inf.normed2, 1);
+        DT(dim,1,1, 256,1,1); BARRIER();
+        PS(g_ps_rmsnorm_save); BUF(g_inf.normed2, 0); BUF(g_inf.norm2[l], 1); BUF(g_inf.rmsScale2, 2);
+        CB(g_inf.cb_dim, 3); CB(g_inf.cb_eps, 4); DTG(1,1,1, tpg_norm,1,1); BARRIER();
+
+        // FFN
+        QMV(g_inf.normed2, g_inf.wgate[l], g_inf.gatePre, g_inf.cb_Kdim);
+        QMV(g_inf.normed2, g_inf.wup[l], g_inf.upOut, g_inf.cb_Kdim);
+        BARRIER();
+        PS(g_ps_silu_gate_mul); BUF(g_inf.gatePre, 0); BUF(g_inf.upOut, 1); BUF(g_inf.ffnMid, 2);
+        DT(ffnDim,1,1, 256,1,1); BARRIER();
+        QMV(g_inf.ffnMid, g_inf.wdown[l], g_inf.proj, g_inf.cb_Nffn); BARRIER();
+        PS(g_ps_add_inplace); BUF(g_inf.hidden, 0); BUF(g_inf.proj, 1);
+        DT(dim,1,1, 256,1,1); BARRIER();
+    }
+
+    // Final: RMSNorm hidden in-place, then lm_head (Q8)
+    PS(g_ps_rmsnorm_save); BUF(g_inf.hidden, 0); BUF(g_inf.finalNorm, 1); BUF(g_inf.rmsScale, 2);
+    CB(g_inf.cb_dim, 3); CB(g_inf.cb_eps, 4); DTG(1,1,1, tpg_norm,1,1); BARRIER();
+    QMV(g_inf.hidden, g_inf.lmHead, g_inf.logits, g_inf.cb_Kdim);
+
+    [enc endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+
+    memcpy(logitsOut, ((__bridge id<MTLBuffer>)g_inf.logits).contents, vocabSize * sizeof(float));
+    return 0;
+}
+
+#undef ENC_PS
+#undef ENC_BUF
+#undef ENC_BUFO
+#undef ENC_CB
+#undef ENC_DT
+#undef ENC_DTG
+#undef BARRIER
