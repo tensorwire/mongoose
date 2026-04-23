@@ -5481,7 +5481,7 @@ static NSString* g_infer_kernel_src =
 "    uint tpg [[threads_per_threadgroup]])\n"
 "{\n"
 "    uint K = p_K[0];\n"
-"    float scale = scales[row] / 127.0f;\n"
+"    float scale = scales[row];\n"  // pre-divided at quantize time
 "    device const char* wRow = weight + row * K;\n"
 "    float sum = 0.0f;\n"
 "    // Vectorized loop: process 4 elements at a time\n"
@@ -5519,7 +5519,7 @@ static NSString* g_infer_kernel_src =
 "    uint tpg [[threads_per_threadgroup]])\n"
 "{\n"
 "    uint K = p_K[0];\n"
-"    float scale = scales[row] / 7.0f;\n"
+"    float scale = scales[row];\n"  // pre-divided at quantize time
 "    uint halfK = K / 2;\n"
 "    device const uchar* wRow = weight + row * halfK;\n"
 "    float sum = 0.0f;\n"
@@ -5674,7 +5674,7 @@ static void inf_quant_upload(q8_weight_t* w, const float* fp32, int rows, int co
                 float v = fp32[r * cols + c]; if (v < 0) v = -v;
                 if (v > absMax) absMax = v;
             }
-            scales[r] = absMax;
+            scales[r] = absMax / 7.0f; // pre-divided for kernel
             float invScale = absMax > 0 ? 7.0f / absMax : 0;
             int halfCols = cols / 2;
             for (int c = 0; c < halfCols; c++) {
@@ -5695,7 +5695,7 @@ static void inf_quant_upload(q8_weight_t* w, const float* fp32, int rows, int co
                 float v = fp32[r * cols + c]; if (v < 0) v = -v;
                 if (v > absMax) absMax = v;
             }
-            scales[r] = absMax;
+            scales[r] = absMax / 127.0f; // pre-divided for kernel
             float invScale = absMax > 0 ? 127.0f / absMax : 0;
             for (int c = 0; c < cols; c++) {
                 float v = fp32[r * cols + c] * invScale;
