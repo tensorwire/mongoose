@@ -71,6 +71,23 @@ int mtl_fused_set_weight(int idx, const float* data, int nFloats);
 int mtl_fused_step(const float* hiddenIn, const float* cosData, const float* sinData,
                    int pos, float* logitsOut);
 void mtl_fused_reset_kv(void);
+void mtl_fused_reset_kv_slot(int slot);
+int mtl_fused_num_slots(void);
+int mtl_fused_partial_step(const float* hiddenIn, int pos,
+                           int layerStart, int layerEnd,
+                           float* hiddenOut, float* logitsOut);
+int mtl_fused_partial_step_slot(int slot, const float* hiddenIn, int pos,
+                                int layerStart, int layerEnd,
+                                float* hiddenOut, float* logitsOut);
+// Streaming inference — ping-pong weight buffers, per-layer dispatch
+int mtl_stream_build(void);
+void mtl_stream_upload_layer(int set, int layer,
+    const float* norm1, const float* wq, const float* wk, const float* wv,
+    const float* bq, const float* bk, const float* bv, const float* wo,
+    const float* norm2, const float* gate, const float* up, const float* down);
+int mtl_stream_step_layer(int set, int layer, int pos);
+int mtl_stream_step_final(int pos, float* logitsOut);
+void mtl_stream_set_hidden(const float* hiddenIn);
 
 // Fused single-dispatch inference (MPSGraph — deprecated)
 int mtl_fused_infer_build(int dim, int kvDim, int headDim,
@@ -499,6 +516,83 @@ func (m *Metal) FusedStep(hidden []float32, cosSlice, sinSlice []float32, pos in
 
 func (m *Metal) FusedResetKV() {
 	C.mtl_fused_reset_kv()
+}
+
+func (m *Metal) FusedResetKVSlot(slot int) {
+	C.mtl_fused_reset_kv_slot(C.int(slot))
+}
+
+func (m *Metal) FusedNumSlots() int {
+	return int(C.mtl_fused_num_slots())
+}
+
+func (m *Metal) FusedPartialStep(hiddenIn []float32, pos, layerStart, layerEnd int, hiddenOut, logitsOut []float32) int {
+	var hOut, lOut *C.float
+	if hiddenOut != nil {
+		hOut = (*C.float)(unsafe.Pointer(&hiddenOut[0]))
+	}
+	if logitsOut != nil {
+		lOut = (*C.float)(unsafe.Pointer(&logitsOut[0]))
+	}
+	return int(C.mtl_fused_partial_step(
+		(*C.float)(unsafe.Pointer(&hiddenIn[0])), C.int(pos),
+		C.int(layerStart), C.int(layerEnd), hOut, lOut))
+}
+
+func (m *Metal) FusedPartialStepSlot(slot int, hiddenIn []float32, pos, layerStart, layerEnd int, hiddenOut, logitsOut []float32) int {
+	var hOut, lOut *C.float
+	if hiddenOut != nil {
+		hOut = (*C.float)(unsafe.Pointer(&hiddenOut[0]))
+	}
+	if logitsOut != nil {
+		lOut = (*C.float)(unsafe.Pointer(&logitsOut[0]))
+	}
+	return int(C.mtl_fused_partial_step_slot(C.int(slot),
+		(*C.float)(unsafe.Pointer(&hiddenIn[0])), C.int(pos),
+		C.int(layerStart), C.int(layerEnd), hOut, lOut))
+}
+
+func (m *Metal) StreamBuild() int {
+	return int(C.mtl_stream_build())
+}
+
+func (m *Metal) StreamUploadLayer(set, layer int,
+	norm1, wq, wk, wv []float32,
+	bq, bk, bv []float32,
+	wo, norm2, gate, up, down []float32) {
+	var bqP, bkP, bvP *C.float
+	if bq != nil {
+		bqP = (*C.float)(unsafe.Pointer(&bq[0]))
+	}
+	if bk != nil {
+		bkP = (*C.float)(unsafe.Pointer(&bk[0]))
+	}
+	if bv != nil {
+		bvP = (*C.float)(unsafe.Pointer(&bv[0]))
+	}
+	C.mtl_stream_upload_layer(C.int(set), C.int(layer),
+		(*C.float)(unsafe.Pointer(&norm1[0])),
+		(*C.float)(unsafe.Pointer(&wq[0])),
+		(*C.float)(unsafe.Pointer(&wk[0])),
+		(*C.float)(unsafe.Pointer(&wv[0])),
+		bqP, bkP, bvP,
+		(*C.float)(unsafe.Pointer(&wo[0])),
+		(*C.float)(unsafe.Pointer(&norm2[0])),
+		(*C.float)(unsafe.Pointer(&gate[0])),
+		(*C.float)(unsafe.Pointer(&up[0])),
+		(*C.float)(unsafe.Pointer(&down[0])))
+}
+
+func (m *Metal) StreamStepLayer(set, layer, pos int) int {
+	return int(C.mtl_stream_step_layer(C.int(set), C.int(layer), C.int(pos)))
+}
+
+func (m *Metal) StreamStepFinal(pos int, logitsOut []float32) int {
+	return int(C.mtl_stream_step_final(C.int(pos), (*C.float)(unsafe.Pointer(&logitsOut[0]))))
+}
+
+func (m *Metal) StreamSetHidden(hidden []float32) {
+	C.mtl_stream_set_hidden((*C.float)(unsafe.Pointer(&hidden[0])))
 }
 
 func (m *Metal) BuildFusedInfer(dim, kvDim, headDim, nHeads, nKVHeads, ffnDim, vocabSize, nLayers, maxSeq int, ropeTheta float64) int {
