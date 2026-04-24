@@ -5534,15 +5534,12 @@ static NSString* g_infer_kernel_src =
 "    ushort sgitg [[simdgroup_index_in_threadgroup]])\n"
 "{\n"
 "    uint K = p_K[0], N = p_N[0];\n"
-"    constant uint QK = 32;\n"
-"    constant short NR0 = 4;\n"
-"    constant short NQ = 16;\n"
+"    const uint QK = 32;\n"
+"    const short NR0 = 4;\n"
+"    const short NQ = 16;\n"
 "    uint nb = K / QK;\n"
-"    uint r0 = (tgpig.x * 2 + sgitg) * NR0;  // NSG=2, NR0=4 → 8 rows/tg\n"
+"    uint r0 = (tgpig.x * 2 + sgitg) * NR0;\n"
 "    if (r0 >= N) return;\n"
-"    // Store block offsets per row (avoid device ptr array on stack)\n"
-"    for (short row = 0; row < NR0; row++)\n"
-"        // offset computed inline below\n"
 "    float sumf[4] = {0,0,0,0};\n"
 "    short ix = tiisg / 2;\n"
 "    short il = (tiisg % 2) * 8;\n"
@@ -5647,6 +5644,7 @@ static id<MTLComputePipelineState> g_ps_rope_rh = nil;  // rotate-half RoPE
 static id<MTLComputePipelineState> g_ps_dec_attn = nil;  // decode attention
 static id<MTLComputePipelineState> g_ps_q8mv = nil;      // Q8 fused dequant matvec
 static id<MTLComputePipelineState> g_ps_q4mv = nil;      // Q4 fused dequant matvec
+static id<MTLComputePipelineState> g_ps_q4mv_simd = nil; // Q4 simd-optimized matvec
 
 // Weight storage: quantized (Q8/Q4) or FP32 (Metal 4 hardware matmul)
 typedef struct {
@@ -5797,6 +5795,21 @@ int mtl_fused_build(int dim, int kvDim, int headDim,
     g_ps_q8mv = [g_device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"q8_matvec"] error:&err];
     g_ps_q4mv = [g_device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"q4_matvec"] error:&err];
     if (!g_ps_rope_rh || !g_ps_dec_attn || !g_ps_q8mv || !g_ps_q4mv) { NSLog(@"infer pipeline: %@", err); return -1; }
+
+    // Load Q4 simd-optimized kernel from separate metallib
+    for (NSString* dir in searchPaths) {
+        NSString* path = [dir stringByAppendingPathComponent:@"q4_simd.metallib"];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
+            id<MTLLibrary> q4lib = [g_device newLibraryWithURL:[NSURL fileURLWithPath:path] error:&err];
+            if (q4lib) {
+                g_ps_q4mv_simd = [g_device newComputePipelineStateWithFunction:[q4lib newFunctionWithName:@"q4_matvec_simd"] error:&err];
+                if (g_ps_q4mv_simd) {
+                    NSLog(@"mongoose: Q4 simd kernel loaded from %@", path);
+                    break;
+                }
+            }
+        }
+    }
 
     if (maxSeq > 4096) maxSeq = 4096; // decode_attn threadgroup memory limit
 
