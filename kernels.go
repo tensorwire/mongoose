@@ -417,6 +417,12 @@ void tw_k_silu_gate_mul_fp16(const void* gate, const void* up, void* out, int n)
 void tw_k_silu_gate_bwd_fp16(const void* dOut, const void* gate, const void* up, void* dGate, void* dUp, int n) {
     if (k_silu_gate_bwd_fp16) k_silu_gate_bwd_fp16(dOut, gate, up, dGate, dUp, n, 0);
 }
+
+// Sparse needle: forward-only, conductor-driven
+extern int tw_helix_needle_sparse_loaded();
+extern void tw_k_helix_needle_sparse(void* data, float* scales, float* cache,
+    void* mom, void* delta, const int* hotIdx,
+    float signalScale, float lr, float beta1, float wd, int nHot, int cols, void* stream);
 */
 import "C"
 
@@ -872,4 +878,20 @@ func KSiLUGateMulFP16(gatePtr, upPtr, outPtr unsafe.Pointer, n int) {
 
 func KSiLUGateBackwardFP16(dOutPtr, gatePtr, upPtr, dGatePtr, dUpPtr unsafe.Pointer, n int) {
 	C.tw_k_silu_gate_bwd_fp16(dOutPtr, gatePtr, upPtr, dGatePtr, dUpPtr, C.int(n))
+}
+
+// NeedleSparseLoaded returns true if the conductor-driven sparse needle kernel is available.
+func NeedleSparseLoaded() bool {
+	return C.tw_helix_needle_sparse_loaded() == 1
+}
+
+// KNeedleSparse fires the forward-only sparse needle on conductor hot rows.
+// Uses signalScale (from helix ForwardOnlyStep) instead of explicit gradients.
+// Only touches nHot rows — conductor-driven sparsity.
+func KNeedleSparse(dataPtr, scalesPtr, cachePtr, momPtr, deltaPtr, hotIdxPtr unsafe.Pointer,
+	signalScale, lr, beta1, wd float32, nHot, cols int) {
+	C.tw_k_helix_needle_sparse(dataPtr, (*C.float)(scalesPtr), (*C.float)(cachePtr),
+		momPtr, deltaPtr, (*C.int)(hotIdxPtr),
+		C.float(signalScale), C.float(lr), C.float(beta1),
+		C.float(wd), C.int(nHot), C.int(cols), 0)
 }
