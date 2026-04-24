@@ -5620,28 +5620,29 @@ static id<MTLComputePipelineState> g_ps_dec_attn = nil;  // decode attention
 static id<MTLComputePipelineState> g_ps_q8mv = nil;      // Q8 fused dequant matvec
 static id<MTLComputePipelineState> g_ps_q4mv = nil;      // Q4 fused dequant matvec
 
-// Quantized weight: int8 or packed 4-bit data + float scales per row
+// Weight storage: quantized (Q8/Q4) or FP32 (Metal 4 hardware matmul)
 typedef struct {
-    void* data;   // Q8: [rows * cols] int8. Q4: [rows * cols/2] packed uint8.
-    void* scales; // [rows] float32
+    void* data;   // Q8: [rows*cols] int8. Q4: [rows*cols/2] uint8. FP32: [rows*cols] float.
+    void* scales; // [rows] float32 (NULL for FP32 mode)
     int rows, cols;
-    bool q4;      // true = 4-bit packed, false = 8-bit
-} q8_weight_t;
+    bool q4;      // true = 4-bit packed
+    bool fp32;    // true = FP32 (Metal 4 path)
+} inf_weight_t;
 
 // Inference state
 static struct {
     int dim, kvDim, headDim, nHeads, nKVHeads, ffnDim, vocabSize, nLayers, maxSeq;
-    bool built;
-    // Per-layer: norm weights are FP32, matmul weights are Q8
-    void** norm1; void** norm2;           // [dim] FP32
-    q8_weight_t* wq; q8_weight_t* wk; q8_weight_t* wv; q8_weight_t* wo;
-    q8_weight_t* wgate; q8_weight_t* wup; q8_weight_t* wdown;
+    bool built, metal4;
+    // Per-layer weights
+    void** norm1; void** norm2;           // [dim] FP32 (norms)
+    inf_weight_t* wq; inf_weight_t* wk; inf_weight_t* wv; inf_weight_t* wo;
+    inf_weight_t* wgate; inf_weight_t* wup; inf_weight_t* wdown;
     void** bq; void** bk; void** bv;     // bias FP32
     // KV cache per layer
     void** kCache; void** vCache;
     // Final
     void* finalNorm;
-    q8_weight_t lmHead;
+    inf_weight_t lmHead;
     // Scratch
     void* hidden; void* normed; void* Q; void* K; void* V; void* attnOut;
     void* rmsScale; void* normed2; void* rmsScale2;
@@ -5650,21 +5651,29 @@ static struct {
     id<MTLBuffer> cb_dim; id<MTLBuffer> cb_kvDim; id<MTLBuffer> cb_headDim;
     id<MTLBuffer> cb_nHeads; id<MTLBuffer> cb_nKVHeads; id<MTLBuffer> cb_ffnDim;
     id<MTLBuffer> cb_eps; id<MTLBuffer> cb_theta;
-    id<MTLBuffer> cb_Kdim; id<MTLBuffer> cb_Nkvdim; id<MTLBuffer> cb_Nffn; id<MTLBuffer> cb_Nvocab;
+    id<MTLBuffer> cb_M1; id<MTLBuffer> cb_Kdim; id<MTLBuffer> cb_Nkvdim;
+    id<MTLBuffer> cb_Nffn; id<MTLBuffer> cb_Nvocab;
 } g_inf = {0};
 
 static bool g_inf_use_q4 = false;
 
-static q8_weight_t inf_quant_alloc(int rows, int cols) {
-    q8_weight_t w;
-    w.rows = rows; w.cols = cols; w.q4 = g_inf_use_q4;
-    int dataBytes = g_inf_use_q4 ? rows * (cols / 2) : rows * cols;
+static inf_weight_t inf_weight_alloc(int rows, int cols) {
+    inf_weight_t w;
+    w.rows = rows; w.cols = cols; w.q4 = g_inf_use_q4; w.fp32 = g_inf.metal4;
+    int dataBytes;
+    if (w.fp32)       dataBytes = rows * cols * sizeof(float);
+    else if (w.q4)    dataBytes = rows * (cols / 2);
+    else              dataBytes = rows * cols; // Q8
     w.data = (__bridge_retained void*)[g_device newBufferWithLength:dataBytes options:MTLResourceStorageModeShared];
-    w.scales = (__bridge_retained void*)[g_device newBufferWithLength:rows * sizeof(float) options:MTLResourceStorageModeShared];
+    w.scales = w.fp32 ? NULL : (__bridge_retained void*)[g_device newBufferWithLength:rows * sizeof(float) options:MTLResourceStorageModeShared];
     return w;
 }
 
-static void inf_quant_upload(q8_weight_t* w, const float* fp32, int rows, int cols) {
+static void inf_weight_upload(inf_weight_t* w, const float* fp32, int rows, int cols) {
+    if (w->fp32) {
+        memcpy(((__bridge id<MTLBuffer>)w->data).contents, fp32, rows * cols * sizeof(float));
+        return;
+    }
     float* scales = (float*)((__bridge id<MTLBuffer>)w->scales).contents;
     if (w->q4) {
         uint8_t* dst = (uint8_t*)((__bridge id<MTLBuffer>)w->data).contents;
@@ -5737,11 +5746,16 @@ int mtl_fused_build(int dim, int kvDim, int headDim,
 
     if (maxSeq > 4096) maxSeq = 4096; // decode_attn threadgroup memory limit
 
-    // Q4 for models > 4B params, Q8 for smaller
+    // Metal 4: use FP32 weights + hardware matmul2d TensorOp.
+    // Otherwise: Q8 (<4B) or Q4 (>4B) with fused dequant matvec kernel.
     int64_t nParams = (int64_t)vocabSize * dim;
     for (int l = 0; l < nLayers; l++) nParams += (int64_t)dim*dim*2 + (int64_t)kvDim*dim*2 + (int64_t)ffnDim*dim*3;
-    g_inf_use_q4 = (nParams > 4000000000LL);
-    NSLog(@"mongoose: inference Q%d (%.1fB params)", g_inf_use_q4 ? 4 : 8, nParams / 1e9);
+    g_inf.metal4 = false; // Q8 beats Metal 4 FP32 for decode (M=1) — 4x less memory traffic
+    g_inf_use_q4 = (!g_inf.metal4 && nParams > 4000000000LL);
+    if (g_inf.metal4)
+        NSLog(@"mongoose: inference FP32 Metal 4 matmul2d (%.1fB params)", nParams / 1e9);
+    else
+        NSLog(@"mongoose: inference Q%d (%.1fB params)", g_inf_use_q4 ? 4 : 8, nParams / 1e9);
 
     g_inf.dim=dim; g_inf.kvDim=kvDim; g_inf.headDim=headDim;
     g_inf.nHeads=nHeads; g_inf.nKVHeads=nKVHeads; g_inf.ffnDim=ffnDim;
@@ -5750,28 +5764,28 @@ int mtl_fused_build(int dim, int kvDim, int headDim,
     // Per-layer weights: norms + biases as FP32, matmul weights as Q8
     g_inf.norm1=(void**)calloc(nLayers,8); g_inf.norm2=(void**)calloc(nLayers,8);
     g_inf.bq=(void**)calloc(nLayers,8); g_inf.bk=(void**)calloc(nLayers,8); g_inf.bv=(void**)calloc(nLayers,8);
-    g_inf.wq=(q8_weight_t*)calloc(nLayers,sizeof(q8_weight_t));
-    g_inf.wk=(q8_weight_t*)calloc(nLayers,sizeof(q8_weight_t));
-    g_inf.wv=(q8_weight_t*)calloc(nLayers,sizeof(q8_weight_t));
-    g_inf.wo=(q8_weight_t*)calloc(nLayers,sizeof(q8_weight_t));
-    g_inf.wgate=(q8_weight_t*)calloc(nLayers,sizeof(q8_weight_t));
-    g_inf.wup=(q8_weight_t*)calloc(nLayers,sizeof(q8_weight_t));
-    g_inf.wdown=(q8_weight_t*)calloc(nLayers,sizeof(q8_weight_t));
+    g_inf.wq=(inf_weight_t*)calloc(nLayers,sizeof(inf_weight_t));
+    g_inf.wk=(inf_weight_t*)calloc(nLayers,sizeof(inf_weight_t));
+    g_inf.wv=(inf_weight_t*)calloc(nLayers,sizeof(inf_weight_t));
+    g_inf.wo=(inf_weight_t*)calloc(nLayers,sizeof(inf_weight_t));
+    g_inf.wgate=(inf_weight_t*)calloc(nLayers,sizeof(inf_weight_t));
+    g_inf.wup=(inf_weight_t*)calloc(nLayers,sizeof(inf_weight_t));
+    g_inf.wdown=(inf_weight_t*)calloc(nLayers,sizeof(inf_weight_t));
     g_inf.kCache=(void**)calloc(nLayers,8); g_inf.vCache=(void**)calloc(nLayers,8);
     for (int l = 0; l < nLayers; l++) {
         g_inf.norm1[l]=inf_buf(dim); g_inf.norm2[l]=inf_buf(dim);
         g_inf.bq[l]=inf_buf(dim); g_inf.bk[l]=inf_buf(kvDim); g_inf.bv[l]=inf_buf(kvDim);
-        g_inf.wq[l]=inf_quant_alloc(dim, dim);
-        g_inf.wk[l]=inf_quant_alloc(kvDim, dim);
-        g_inf.wv[l]=inf_quant_alloc(kvDim, dim);
-        g_inf.wo[l]=inf_quant_alloc(dim, dim);
-        g_inf.wgate[l]=inf_quant_alloc(ffnDim, dim);
-        g_inf.wup[l]=inf_quant_alloc(ffnDim, dim);
-        g_inf.wdown[l]=inf_quant_alloc(dim, ffnDim);
+        g_inf.wq[l]=inf_weight_alloc(dim, dim);
+        g_inf.wk[l]=inf_weight_alloc(kvDim, dim);
+        g_inf.wv[l]=inf_weight_alloc(kvDim, dim);
+        g_inf.wo[l]=inf_weight_alloc(dim, dim);
+        g_inf.wgate[l]=inf_weight_alloc(ffnDim, dim);
+        g_inf.wup[l]=inf_weight_alloc(ffnDim, dim);
+        g_inf.wdown[l]=inf_weight_alloc(dim, ffnDim);
         g_inf.kCache[l]=inf_buf(maxSeq*kvDim); g_inf.vCache[l]=inf_buf(maxSeq*kvDim);
     }
     g_inf.finalNorm=inf_buf(dim);
-    g_inf.lmHead=inf_quant_alloc(vocabSize, dim);
+    g_inf.lmHead=inf_weight_alloc(vocabSize, dim);
 
     // Scratch
     g_inf.hidden=inf_buf(dim); g_inf.normed=inf_buf(dim);
@@ -5786,7 +5800,7 @@ int mtl_fused_build(int dim, int kvDim, int headDim,
     g_inf.cb_headDim=inf_const(headDim); g_inf.cb_nHeads=inf_const(nHeads);
     g_inf.cb_nKVHeads=inf_const(nKVHeads); g_inf.cb_ffnDim=inf_const(ffnDim);
     g_inf.cb_eps=inf_constf(1e-6f); g_inf.cb_theta=inf_constf(10000.0f);
-    g_inf.cb_Kdim=inf_const(dim); g_inf.cb_Nkvdim=inf_const(kvDim);
+    g_inf.cb_M1=inf_const(1); g_inf.cb_Kdim=inf_const(dim); g_inf.cb_Nkvdim=inf_const(kvDim);
     g_inf.cb_Nffn=inf_const(ffnDim); g_inf.cb_Nvocab=inf_const(vocabSize);
 
     g_inf.built = true;
@@ -5805,22 +5819,22 @@ int mtl_fused_set_weight(int idx, const float* data, int nFloats) {
         switch (w) {
             case 0: // norm1 — FP32
                 memcpy(((__bridge id<MTLBuffer>)g_inf.norm1[layer]).contents, data, nFloats*4); break;
-            case 1: inf_quant_upload(&g_inf.wq[layer], data, dim, dim); break;
-            case 2: inf_quant_upload(&g_inf.wk[layer], data, kvDim, dim); break;
-            case 3: inf_quant_upload(&g_inf.wv[layer], data, kvDim, dim); break;
+            case 1: inf_weight_upload(&g_inf.wq[layer], data, dim, dim); break;
+            case 2: inf_weight_upload(&g_inf.wk[layer], data, kvDim, dim); break;
+            case 3: inf_weight_upload(&g_inf.wv[layer], data, kvDim, dim); break;
             case 4: memcpy(((__bridge id<MTLBuffer>)g_inf.bq[layer]).contents, data, nFloats*4); break;
             case 5: memcpy(((__bridge id<MTLBuffer>)g_inf.bk[layer]).contents, data, nFloats*4); break;
             case 6: memcpy(((__bridge id<MTLBuffer>)g_inf.bv[layer]).contents, data, nFloats*4); break;
-            case 7: inf_quant_upload(&g_inf.wo[layer], data, dim, dim); break;
+            case 7: inf_weight_upload(&g_inf.wo[layer], data, dim, dim); break;
             case 8: memcpy(((__bridge id<MTLBuffer>)g_inf.norm2[layer]).contents, data, nFloats*4); break;
-            case 9: inf_quant_upload(&g_inf.wgate[layer], data, ffnDim, dim); break;
-            case 10: inf_quant_upload(&g_inf.wup[layer], data, ffnDim, dim); break;
-            case 11: inf_quant_upload(&g_inf.wdown[layer], data, dim, ffnDim); break;
+            case 9: inf_weight_upload(&g_inf.wgate[layer], data, ffnDim, dim); break;
+            case 10: inf_weight_upload(&g_inf.wup[layer], data, ffnDim, dim); break;
+            case 11: inf_weight_upload(&g_inf.wdown[layer], data, dim, ffnDim); break;
         }
     } else if (idx == nL*12) {
         memcpy(((__bridge id<MTLBuffer>)g_inf.finalNorm).contents, data, nFloats*4);
     } else if (idx == nL*12+1) {
-        inf_quant_upload(&g_inf.lmHead, data, g_inf.vocabSize, dim);
+        inf_weight_upload(&g_inf.lmHead, data, g_inf.vocabSize, dim);
     }
     return 0;
 }
@@ -5833,9 +5847,14 @@ int mtl_fused_set_weight(int idx, const float* data, int nFloats) {
 #define DT(x,y,z, tx,ty,tz) [enc dispatchThreads:MTLSizeMake(x,y,z) threadsPerThreadgroup:MTLSizeMake(tx,ty,tz)]
 #define DTG(gx,gy,gz, tx,ty,tz) [enc dispatchThreadgroups:MTLSizeMake(gx,gy,gz) threadsPerThreadgroup:MTLSizeMake(tx,ty,tz)]
 #define BARRIER() [enc memoryBarrierWithScope:MTLBarrierScopeBuffers]
-// Quantized matvec dispatch. One threadgroup per output row.
-#define QMV(act, w, out, cb_K) do { \
-    if ((w).q4) { \
+// Matvec dispatch: Metal 4 FP32 hardware matmul, or Q8/Q4 fused dequant kernel.
+#define MV(act, w, out, cb_K, cb_N) do { \
+    if ((w).fp32) { \
+        PS(g_ps_gemm4f_bt); BUF(act, 0); BUF((w).data, 1); BUF(out, 2); \
+        CB(g_inf.cb_M1, 3); CB(cb_K, 4); CB(cb_N, 5); \
+        NSUInteger sw = g_ps_gemm4f_bt.threadExecutionWidth; \
+        DTG(((w).rows+31)/32, 1, 1, sw*4, 1, 1); \
+    } else if ((w).q4) { \
         PS(g_ps_q4mv); BUF(act, 0); BUF((w).data, 1); BUF((w).scales, 2); BUF(out, 3); CB(cb_K, 4); \
         DTG((w).rows, 1, 1, MIN(256, (int)g_ps_q4mv.maxTotalThreadsPerThreadgroup), 1, 1); \
     } else { \
@@ -5879,9 +5898,9 @@ int mtl_fused_step(const float* hiddenIn, const float* cosData, const float* sin
         CB(g_inf.cb_dim, 3); CB(g_inf.cb_eps, 4); DTG(1,1,1, tpg_norm,1,1); BARRIER();
 
         // QKV matvecs (Q8 fused dequant)
-        QMV(g_inf.normed, g_inf.wq[l], g_inf.Q, g_inf.cb_Kdim);
-        QMV(g_inf.normed, g_inf.wk[l], g_inf.K, g_inf.cb_Kdim);
-        QMV(g_inf.normed, g_inf.wv[l], g_inf.V, g_inf.cb_Kdim);
+        MV(g_inf.normed, g_inf.wq[l], g_inf.Q, g_inf.cb_Kdim, g_inf.cb_dim);
+        MV(g_inf.normed, g_inf.wk[l], g_inf.K, g_inf.cb_Kdim, g_inf.cb_Nkvdim);
+        MV(g_inf.normed, g_inf.wv[l], g_inf.V, g_inf.cb_Kdim, g_inf.cb_Nkvdim);
         BARRIER();
 
         // Bias add
@@ -5915,7 +5934,7 @@ int mtl_fused_step(const float* hiddenIn, const float* cosData, const float* sin
         DTG(nHeads,1,1, headDim,1,1); BARRIER();
 
         // O-proj + residual
-        QMV(g_inf.attnOut, g_inf.wo[l], g_inf.proj, g_inf.cb_Kdim); BARRIER();
+        MV(g_inf.attnOut, g_inf.wo[l], g_inf.proj, g_inf.cb_Kdim, g_inf.cb_dim); BARRIER();
         PS(g_ps_add_inplace); BUF(g_inf.hidden, 0); BUF(g_inf.proj, 1);
         DT(dim,1,1, 256,1,1); BARRIER();
 
@@ -5926,12 +5945,12 @@ int mtl_fused_step(const float* hiddenIn, const float* cosData, const float* sin
         CB(g_inf.cb_dim, 3); CB(g_inf.cb_eps, 4); DTG(1,1,1, tpg_norm,1,1); BARRIER();
 
         // FFN
-        QMV(g_inf.normed2, g_inf.wgate[l], g_inf.gatePre, g_inf.cb_Kdim);
-        QMV(g_inf.normed2, g_inf.wup[l], g_inf.upOut, g_inf.cb_Kdim);
+        MV(g_inf.normed2, g_inf.wgate[l], g_inf.gatePre, g_inf.cb_Kdim, g_inf.cb_Nffn);
+        MV(g_inf.normed2, g_inf.wup[l], g_inf.upOut, g_inf.cb_Kdim, g_inf.cb_Nffn);
         BARRIER();
         PS(g_ps_silu_gate_mul); BUF(g_inf.gatePre, 0); BUF(g_inf.upOut, 1); BUF(g_inf.ffnMid, 2);
         DT(ffnDim,1,1, 256,1,1); BARRIER();
-        QMV(g_inf.ffnMid, g_inf.wdown[l], g_inf.proj, g_inf.cb_Nffn); BARRIER();
+        MV(g_inf.ffnMid, g_inf.wdown[l], g_inf.proj, g_inf.cb_Nffn, g_inf.cb_dim); BARRIER();
         PS(g_ps_add_inplace); BUF(g_inf.hidden, 0); BUF(g_inf.proj, 1);
         DT(dim,1,1, 256,1,1); BARRIER();
     }
@@ -5939,7 +5958,7 @@ int mtl_fused_step(const float* hiddenIn, const float* cosData, const float* sin
     // Final: RMSNorm hidden in-place, then lm_head (Q8)
     PS(g_ps_rmsnorm_save); BUF(g_inf.hidden, 0); BUF(g_inf.finalNorm, 1); BUF(g_inf.rmsScale, 2);
     CB(g_inf.cb_dim, 3); CB(g_inf.cb_eps, 4); DTG(1,1,1, tpg_norm,1,1); BARRIER();
-    QMV(g_inf.hidden, g_inf.lmHead, g_inf.logits, g_inf.cb_Kdim);
+    MV(g_inf.hidden, g_inf.lmHead, g_inf.logits, g_inf.cb_Kdim, g_inf.cb_Nvocab);
 
     [enc endEncoding];
     [cmd commit];
