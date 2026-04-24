@@ -6004,10 +6004,21 @@ int mtl_fused_step(const float* hiddenIn, const float* cosData, const float* sin
     return 0;
 }
 
-#undef ENC_PS
-#undef ENC_BUF
-#undef ENC_BUFO
-#undef ENC_CB
-#undef ENC_DT
-#undef ENC_DTG
+#undef PS
+#undef BUF
+#undef BUFO
+#undef CB
+#undef DT
+#undef DTG
 #undef BARRIER
+#undef MV
+
+// Reset KV cache — zero all layers. Call between conversations.
+void mtl_fused_reset_kv(void) {
+    if (!g_inf.built) return;
+    int kvDim = g_inf.kvDim, maxSeq = g_inf.maxSeq;
+    for (int l = 0; l < g_inf.nLayers; l++) {
+        memset(((__bridge id<MTLBuffer>)g_inf.kCache[l]).contents, 0, maxSeq * kvDim * sizeof(float));
+        memset(((__bridge id<MTLBuffer>)g_inf.vCache[l]).contents, 0, maxSeq * kvDim * sizeof(float));
+    }
+}

@@ -69,6 +69,7 @@ int mtl_fused_num_weights(void);
 int mtl_fused_set_weight(int idx, const float* data, int nFloats);
 int mtl_fused_step(const float* hiddenIn, const float* cosData, const float* sinData,
                    int pos, float* logitsOut);
+void mtl_fused_reset_kv(void);
 
 // Fused single-dispatch inference (MPSGraph — deprecated)
 int mtl_fused_infer_build(int dim, int kvDim, int headDim,
@@ -492,6 +493,10 @@ func (m *Metal) FusedStep(hidden []float32, cosSlice, sinSlice []float32, pos in
 		(*C.float)(unsafe.Pointer(&sinSlice[0])),
 		C.int(pos),
 		(*C.float)(unsafe.Pointer(&logitsOut[0]))))
+}
+
+func (m *Metal) FusedResetKV() {
+	C.mtl_fused_reset_kv()
 }
 
 func (m *Metal) BuildFusedInfer(dim, kvDim, headDim, nHeads, nKVHeads, ffnDim, vocabSize, nLayers, maxSeq int, ropeTheta float64) int {
