@@ -64,7 +64,8 @@ int mtl_infer_forward_b(float* hiddenIO, float* attnOut, int layer);
 // Fused compute-shader inference (one command buffer per token)
 int mtl_fused_build(int dim, int kvDim, int headDim,
                     int nHeads, int nKVHeads, int ffnDim,
-                    int vocabSize, int nLayers, int maxSeq);
+                    int vocabSize, int nLayers, int maxSeq,
+                    float ropeTheta, float rmsEps);
 int mtl_fused_num_weights(void);
 int mtl_fused_set_weight(int idx, const float* data, int nFloats);
 int mtl_fused_step(const float* hiddenIn, const float* cosData, const float* sinData,
@@ -472,10 +473,11 @@ func (m *Metal) InferLogits(hidden []float32, logitsOut []float32) int {
 		C.int(10000))) // layer >= nLayers triggers final path
 }
 
-func (m *Metal) BuildFused(dim, kvDim, headDim, nHeads, nKVHeads, ffnDim, vocabSize, nLayers, maxSeq int) int {
+func (m *Metal) BuildFused(dim, kvDim, headDim, nHeads, nKVHeads, ffnDim, vocabSize, nLayers, maxSeq int, ropeTheta, rmsEps float64) int {
 	return int(C.mtl_fused_build(C.int(dim), C.int(kvDim), C.int(headDim),
 		C.int(nHeads), C.int(nKVHeads), C.int(ffnDim),
-		C.int(vocabSize), C.int(nLayers), C.int(maxSeq)))
+		C.int(vocabSize), C.int(nLayers), C.int(maxSeq),
+		C.float(ropeTheta), C.float(rmsEps)))
 }
 
 func (m *Metal) FusedNumWeights() int {

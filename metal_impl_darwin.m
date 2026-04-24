@@ -5764,7 +5764,8 @@ static id<MTLBuffer> inf_constf(float val) {
 
 int mtl_fused_build(int dim, int kvDim, int headDim,
                     int nHeads, int nKVHeads, int ffnDim,
-                    int vocabSize, int nLayers, int maxSeq) {
+                    int vocabSize, int nLayers, int maxSeq,
+                    float ropeTheta, float rmsEps) {
     if (g_inf.built) return 0;
     if (!g_device || !g_ps_rmsnorm_save || !g_ps_gemm_bt || !g_ps_copy_mem) return -1;
 
@@ -5866,7 +5867,7 @@ int mtl_fused_build(int dim, int kvDim, int headDim,
     g_inf.cb_dim=inf_const(dim); g_inf.cb_kvDim=inf_const(kvDim);
     g_inf.cb_headDim=inf_const(headDim); g_inf.cb_nHeads=inf_const(nHeads);
     g_inf.cb_nKVHeads=inf_const(nKVHeads); g_inf.cb_ffnDim=inf_const(ffnDim);
-    g_inf.cb_eps=inf_constf(1e-6f); g_inf.cb_theta=inf_constf(10000.0f);
+    g_inf.cb_eps=inf_constf(rmsEps); g_inf.cb_theta=inf_constf(ropeTheta);
     g_inf.cb_M1=inf_const(1); g_inf.cb_Kdim=inf_const(dim); g_inf.cb_Nkvdim=inf_const(kvDim);
     g_inf.cb_Nffn=inf_const(ffnDim); g_inf.cb_Nvocab=inf_const(vocabSize);
 

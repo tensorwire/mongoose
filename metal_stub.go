@@ -51,7 +51,7 @@ func (m *Metal) InferForwardA(hidden []float32, cosSlice, sinSlice []float32, qO
 func (m *Metal) InferForwardB(hidden []float32, attnOut []float32, layer int) int { return -1 }
 func (m *Metal) InferLogits(hidden []float32, logitsOut []float32) int { return -1 }
 
-func (m *Metal) BuildFused(dim, kvDim, headDim, nHeads, nKVHeads, ffnDim, vocabSize, nLayers, maxSeq int) int { return -1 }
+func (m *Metal) BuildFused(dim, kvDim, headDim, nHeads, nKVHeads, ffnDim, vocabSize, nLayers, maxSeq int, ropeTheta, rmsEps float64) int { return -1 }
 func (m *Metal) FusedNumWeights() int { return 0 }
 func (m *Metal) FusedSetWeight(idx int, data []float32) int { return -1 }
 func (m *Metal) FusedStep(hidden []float32, cosSlice, sinSlice []float32, pos int, logitsOut []float32) int { return -1 }
