@@ -41,6 +41,18 @@ dim       params     steps/s
 ```
 
 
+## Fine-tuning — Qwen2.5-0.5B (RTX 5090)
+
+2000 steps, seq=256, lr=1e-5. INT8 base weights, full backward pass.
+
+| Method | Floor | Steps/s | Time | Optimizer VRAM | 14B estimate |
+|--------|-------|---------|------|----------------|--------------|
+| **Helix LoRA** (default) | **0.69** | **13.1** | **153s** | **85 MB** | **~2.4 GB** |
+| AdamW full (--adamw) | 0.82 | 12.8 | 156s | 2.9 GB | ~72 GB |
+| PyTorch QLoRA (baseline) | 0.64 | 10.0 | ~200s | ~500 MB | ~12 GB |
+
+Helix LoRA: frozen INT8 base + rank-8 FP32 adapters, DNA-paired optimizer (gate+up G≡C, wk+wv A=T). AdamW full: dequant→KAdamW→requant on all weights every step. PyTorch: bitsandbytes INT8 + LoRA rank-8 + AdamW.
+
 ## Inference — Qwen2.5-0.5B (200 tokens)
 
 ```
