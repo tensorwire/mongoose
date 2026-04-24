@@ -5507,41 +5507,65 @@ static NSString* g_infer_kernel_src =
 "    }\n"
 "}\n"
 "\n"
-"// Q4 matvec: 4 rows/threadgroup, 256 threads (8 simdgroups, 2 per row).\n"
-"// Packed 4-bit weights, 2 values per byte. Half the bandwidth of Q8.\n"
+"// Q4_0 matvec: ggml block format. NR0=4 rows/simdgroup, NQ=16, 32 threads.\n"
+"// block_q4_0: { half d; uint8_t qs[16]; } = 18 bytes per 32 elements.\n"
+"// Pre-scaled activation trick from llama.cpp: fold nibble positions into yl.\n"
+"struct block_q4_0 { half d; uchar qs[16]; };\n"
+"inline float bq4_dot_y(device const block_q4_0* qb, float sumy, thread float* yl, int il) {\n"
+"    float d = float(qb->d);\n"
+"    float acc0=0, acc1=0, acc2=0, acc3=0;\n"
+"    device const ushort* qs = (device const ushort*)(qb->qs) + il/2;\n"
+"    for (int i = 0; i < 8; i += 2) {\n"
+"        acc0 += yl[i+0] * (qs[i/2] & 0x000F);\n"
+"        acc1 += yl[i+1] * (qs[i/2] & 0x0F00);\n"
+"        acc2 += yl[i+8] * (qs[i/2] & 0x00F0);\n"
+"        acc3 += yl[i+9] * (qs[i/2] & 0xF000);\n"
+"    }\n"
+"    return d * (sumy * -8.0f + acc0 + acc1 + acc2 + acc3);\n"
+"}\n"
 "kernel void q4_matvec(\n"
 "    device const float* act     [[buffer(0)]],\n"
-"    device const uchar* weight  [[buffer(1)]],  // [N, K/2] packed\n"
-"    device const float* scales  [[buffer(2)]],  // [N]\n"
-"    device float* out           [[buffer(3)]],  // [N]\n"
-"    device const uint* p_K      [[buffer(4)]],\n"
-"    device const uint* p_N      [[buffer(5)]],\n"
-"    uint tgid [[threadgroup_position_in_grid]],\n"
+"    device const uchar* weight  [[buffer(1)]],  // block_q4_0 format\n"
+"    device float* out           [[buffer(2)]],\n"
+"    device const uint* p_K      [[buffer(3)]],\n"
+"    device const uint* p_N      [[buffer(4)]],\n"
+"    uint3 tgpig [[threadgroup_position_in_grid]],\n"
 "    ushort tiisg [[thread_index_in_simdgroup]],\n"
 "    ushort sgitg [[simdgroup_index_in_threadgroup]])\n"
 "{\n"
 "    uint K = p_K[0], N = p_N[0];\n"
-"    uint halfK = K / 2;\n"
-"    uint row = tgid * 4 + sgitg / 2;\n"
-"    if (row >= N) return;\n"
-"    ushort half_sg = sgitg % 2;\n"
-"    device const uchar* wRow = weight + row * halfK;\n"
-"    float scale = scales[row];\n"
-"    float sum = 0.0f;\n"
-"    uint tid_in_row = half_sg * 32 + tiisg;\n"
-"    for (uint k = tid_in_row; k < halfK; k += 64) {\n"
-"        uchar packed = wRow[k];\n"
-"        float w0 = float(int(packed & 0xF) - 8);\n"
-"        float w1 = float(int(packed >> 4) - 8);\n"
-"        sum += act[k * 2] * w0 + act[k * 2 + 1] * w1;\n"
+"    constant uint QK = 32;\n"
+"    constant short NR0 = 4;\n"
+"    constant short NQ = 16;\n"
+"    uint nb = K / QK;\n"
+"    uint r0 = (tgpig.x * 2 + sgitg) * NR0;  // NSG=2, NR0=4 → 8 rows/tg\n"
+"    if (r0 >= N) return;\n"
+"    device const block_q4_0* ax[4];\n"
+"    for (short row = 0; row < NR0; row++)\n"
+"        ax[row] = (device const block_q4_0*)(weight + (r0+row) * nb * 18);\n"
+"    float sumf[4] = {0,0,0,0};\n"
+"    short ix = tiisg / 2;\n"
+"    short il = (tiisg % 2) * 8;\n"
+"    uint ib0 = ix;\n"
+"    device const float* yb = act + ib0 * QK + il;\n"
+"    for (uint ib = ib0; ib < nb; ib += NQ) {\n"
+"        float sumy[2] = {0,0};\n"
+"        float yl[16];\n"
+"        for (short i = 0; i < 8; i += 2) {\n"
+"            sumy[0] += yb[i] + yb[i+1];\n"
+"            yl[i]   = yb[i];\n"
+"            yl[i+1] = yb[i+1] / 256.0f;\n"
+"            sumy[1] += yb[i+16] + yb[i+17];\n"
+"            yl[i+8] = yb[i+16] / 16.0f;\n"
+"            yl[i+9] = yb[i+17] / 4096.0f;\n"
+"        }\n"
+"        for (short row = 0; row < NR0 && r0+row < N; row++)\n"
+"            sumf[row] += bq4_dot_y(ax[row] + ib, sumy[0]+sumy[1], yl, il);\n"
+"        yb += QK * NQ;\n"
 "    }\n"
-"    sum *= scale;\n"
-"    sum = simd_sum(sum);\n"
-"    threadgroup float shmem[8];\n"
-"    if (tiisg == 0) shmem[sgitg] = sum;\n"
-"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-"    if (sgitg % 2 == 0 && tiisg == 0) {\n"
-"        out[row] = shmem[sgitg] + shmem[sgitg + 1];\n"
+"    for (short row = 0; row < NR0 && r0+row < N; row++) {\n"
+"        float tot = simd_sum(sumf[row]);\n"
+"        if (tiisg == 0) out[r0+row] = tot;\n"
 "    }\n"
 "}\n"
 "\n"
@@ -5666,10 +5690,10 @@ static inf_weight_t inf_weight_alloc(int rows, int cols) {
     w.rows = rows; w.cols = cols; w.q4 = g_inf_use_q4; w.fp32 = g_inf.metal4;
     int dataBytes;
     if (w.fp32)       dataBytes = rows * cols * sizeof(float);
-    else if (w.q4)    dataBytes = rows * (cols / 2);
+    else if (w.q4)    dataBytes = rows * (cols / 32) * 18; // block_q4_0: 18 bytes per 32 elements
     else              dataBytes = rows * cols; // Q8 per-row
     w.data = (__bridge_retained void*)[g_device newBufferWithLength:dataBytes options:MTLResourceStorageModeShared];
-    w.scales = w.fp32 ? NULL : (__bridge_retained void*)[g_device newBufferWithLength:rows * sizeof(float) options:MTLResourceStorageModeShared];
+    w.scales = (w.fp32 || w.q4) ? NULL : (__bridge_retained void*)[g_device newBufferWithLength:rows * sizeof(float) options:MTLResourceStorageModeShared];
     return w;
 }
 
@@ -5680,24 +5704,31 @@ static void inf_weight_upload(inf_weight_t* w, const float* fp32, int rows, int 
     }
     float* scales = (float*)((__bridge id<MTLBuffer>)w->scales).contents;
     if (w->q4) {
+        // block_q4_0: per-32-element blocks. {half d, uint8_t qs[16]}
         uint8_t* dst = (uint8_t*)((__bridge id<MTLBuffer>)w->data).contents;
+        int nGroups = cols / 32;
         for (int r = 0; r < rows; r++) {
-            float absMax = 0;
-            for (int c = 0; c < cols; c++) {
-                float v = fp32[r * cols + c]; if (v < 0) v = -v;
-                if (v > absMax) absMax = v;
-            }
-            scales[r] = absMax / 7.0f; // pre-divided for kernel
-            float invScale = absMax > 0 ? 7.0f / absMax : 0;
-            int halfCols = cols / 2;
-            for (int c = 0; c < halfCols; c++) {
-                float v0 = fp32[r * cols + c * 2] * invScale;
-                float v1 = fp32[r * cols + c * 2 + 1] * invScale;
-                int q0 = (int)(v0 + (v0 > 0 ? 0.5f : -0.5f)) + 8;
-                int q1 = (int)(v1 + (v1 > 0 ? 0.5f : -0.5f)) + 8;
-                if (q0 < 0) q0 = 0; if (q0 > 15) q0 = 15;
-                if (q1 < 0) q1 = 0; if (q1 > 15) q1 = 15;
-                dst[r * halfCols + c] = (uint8_t)(q0 | (q1 << 4));
+            for (int g = 0; g < nGroups; g++) {
+                const float* src = fp32 + r * cols + g * 32;
+                float absMax = 0;
+                for (int j = 0; j < 32; j++) {
+                    float v = src[j]; if (v < 0) v = -v;
+                    if (v > absMax) absMax = v;
+                }
+                uint8_t* block = dst + (r * nGroups + g) * 18;
+                __fp16 d = (__fp16)(absMax / 8.0f); // Q4 range: -8..7, scale = absMax/8
+                memcpy(block, &d, 2);
+                float invScale = absMax > 0 ? 8.0f / absMax : 0;
+                uint8_t* qs = block + 2;
+                for (int j = 0; j < 16; j++) {
+                    float v0 = src[j * 2] * invScale;
+                    float v1 = src[j * 2 + 1] * invScale;
+                    int q0 = (int)(v0 + (v0 > 0 ? 0.5f : -0.5f)) + 8;
+                    int q1 = (int)(v1 + (v1 > 0 ? 0.5f : -0.5f)) + 8;
+                    if (q0 < 0) q0 = 0; if (q0 > 15) q0 = 15;
+                    if (q1 < 0) q1 = 0; if (q1 > 15) q1 = 15;
+                    qs[j] = (uint8_t)(q0 | (q1 << 4));
+                }
             }
         }
     } else {
@@ -5860,8 +5891,8 @@ int mtl_fused_set_weight(int idx, const float* data, int nFloats) {
         NSUInteger sw = g_ps_gemm4f_bt.threadExecutionWidth; \
         DTG(((w).rows+31)/32, 1, 1, sw*4, 1, 1); \
     } else if ((w).q4) { \
-        PS(g_ps_q4mv); BUF(act, 0); BUF((w).data, 1); BUF((w).scales, 2); BUF(out, 3); CB(cb_K, 4); CB(cb_N, 5); \
-        DTG(((w).rows + 3) / 4, 1, 1, 256, 1, 1); \
+        PS(g_ps_q4mv); BUF(act, 0); BUF((w).data, 1); BUF(out, 2); CB(cb_K, 3); CB(cb_N, 4); \
+        DTG(((w).rows + 7) / 8, 1, 1, 64, 1, 1); \
     } else { \
         PS(g_ps_q8mv); BUF(act, 0); BUF((w).data, 1); BUF((w).scales, 2); BUF(out, 3); CB(cb_K, 4); CB(cb_N, 5); \
         DTG(((w).rows + 3) / 4, 1, 1, 256, 1, 1); \
