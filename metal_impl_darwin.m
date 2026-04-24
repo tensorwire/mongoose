@@ -5468,43 +5468,69 @@ static NSString* g_infer_kernel_src =
 @"#include <metal_stdlib>\n"
 "using namespace metal;\n"
 "\n"
-"// Q8 fused dequant matvec: one threadgroup per output row, SIMD reduction.\n"
-"// Vectorized 4-wide loads for memory bandwidth.\n"
+"// Q8 matvec — llama.cpp pattern: 8 rows/threadgroup, 128 threads.\n"
+"// NR0=2 rows per simdgroup, NSG=4 simdgroups. NQ=8 elements per thread.\n"
+"// Activation loaded once, reused for NR0 rows (bandwidth amortization).\n"
+"// Per-row scale (pre-divided by 127 at quantize time).\n"
+"constant short NR0 = 2;\n"
+"constant short NSG = 4;\n"
+"constant short NQ  = 8;\n"
 "kernel void q8_matvec(\n"
 "    device const float* act   [[buffer(0)]],  // [K]\n"
-"    device const char* weight  [[buffer(1)]],  // [N, K] int8\n"
+"    device const int8_t* weight [[buffer(1)]],  // [N, K] int8\n"
 "    device const float* scales [[buffer(2)]],  // [N]\n"
 "    device float* out          [[buffer(3)]],  // [N]\n"
 "    device const uint* p_K     [[buffer(4)]],\n"
-"    uint row [[threadgroup_position_in_grid]],\n"
-"    uint tid [[thread_index_in_threadgroup]],\n"
-"    uint tpg [[threads_per_threadgroup]])\n"
+"    device const uint* p_N     [[buffer(5)]],\n"
+"    uint3 tgpig [[threadgroup_position_in_grid]],\n"
+"    ushort tiisg [[thread_index_in_simdgroup]],\n"
+"    ushort sgitg [[simdgroup_index_in_threadgroup]])\n"
 "{\n"
-"    uint K = p_K[0];\n"
-"    float scale = scales[row];\n"  // pre-divided at quantize time
-"    device const char* wRow = weight + row * K;\n"
-"    float sum = 0.0f;\n"
-"    // Vectorized loop: process 4 elements at a time\n"
-"    uint k = tid * 4;\n"
-"    for (; k + 3 < K; k += tpg * 4) {\n"
-"        float4 a = float4(act[k], act[k+1], act[k+2], act[k+3]);\n"
-"        float4 w = float4(float(wRow[k]), float(wRow[k+1]), float(wRow[k+2]), float(wRow[k+3]));\n"
-"        sum += dot(a, w);\n"
+"    uint K = p_K[0], N = p_N[0];\n"
+"    uint r0 = tgpig.x * (NR0 * NSG) + sgitg * NR0;\n"
+"    if (r0 >= N) return;\n"
+"    // Thread indexing: NQ=8 elements per thread, 4 threads per 32-element block\n"
+"    short ix = tiisg / (32/NQ);  // which block within simdgroup's stride\n"
+"    short il = tiisg % (32/NQ);  // position within block (0..3)\n"
+"    uint ib0 = sgitg * NQ + ix;  // starting block index\n"
+"    uint nb = K / 32;            // total blocks per row\n"
+"    float sumf[NR0] = {0.0f};\n"
+"    float yl[NQ];\n"
+"    // Inner loop: stride across blocks, NQ elements at a time\n"
+"    for (uint ib = ib0; ib < nb; ib += NSG * NQ) {\n"
+"        // Load 8 activation values (shared across rows)\n"
+"        device const float* yb = act + ib * 32 + il * NQ;\n"
+"        for (short i = 0; i < NQ; i++) yl[i] = yb[i];\n"
+"        // Dot product against each row's weights\n"
+"        for (short row = 0; row < NR0; row++) {\n"
+"            uint r = r0 + row;\n"
+"            if (r >= N) break;\n"
+"            device const int8_t* qs = (device const int8_t*)(weight + r * K + ib * 32 + il * NQ);\n"
+"            float s = 0.0f;\n"
+"            for (short i = 0; i < NQ; i++) s += float(qs[i]) * yl[i];\n"
+"            sumf[row] += s;\n"
+"        }\n"
 "    }\n"
-"    // Tail\n"
-"    for (; k < K; k += tpg)\n"
-"        sum += act[k] * float(wRow[k]);\n"
-"    sum *= scale;\n"
-"    sum = simd_sum(sum);\n"
-"    threadgroup float shared[32];\n"
-"    uint lane = tid % 32, warp = tid / 32;\n"
-"    if (lane == 0) shared[warp] = sum;\n"
+"    // Apply per-row scale\n"
+"    for (short row = 0; row < NR0; row++) {\n"
+"        uint r = r0 + row;\n"
+"        if (r < N) sumf[row] *= scales[r];\n"
+"    }\n"
+"    // Reduction: simd_sum per row, then cross-simdgroup via shared memory\n"
+"    threadgroup float shmem[NR0 * 32];\n"
+"    for (short row = 0; row < NR0; row++) {\n"
+"        sumf[row] = simd_sum(sumf[row]);\n"
+"        if (sgitg == 0) shmem[row * 32 + tiisg] = 0.0f;\n"
+"    }\n"
 "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-"    if (warp == 0) {\n"
-"        sum = (lane < (tpg + 31) / 32) ? shared[lane] : 0.0f;\n"
-"        sum = simd_sum(sum);\n"
+"    for (short row = 0; row < NR0; row++) {\n"
+"        if (tiisg == 0) shmem[row * 32 + sgitg] = sumf[row];\n"
 "    }\n"
-"    if (tid == 0) out[row] = sum;\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    for (short row = 0; row < NR0 && r0 + row < N; row++) {\n"
+"        float tot = simd_sum(shmem[row * 32 + tiisg]);\n"
+"        if (tiisg == 0 && sgitg == 0) out[r0 + row] = tot;\n"
+"    }\n"
 "}\n"
 "\n"
 "// Q4 fused dequant matvec: packed 4-bit weights, 2 values per byte.\n"
@@ -5663,7 +5689,7 @@ static inf_weight_t inf_weight_alloc(int rows, int cols) {
     int dataBytes;
     if (w.fp32)       dataBytes = rows * cols * sizeof(float);
     else if (w.q4)    dataBytes = rows * (cols / 2);
-    else              dataBytes = rows * cols; // Q8
+    else              dataBytes = rows * cols; // Q8 per-row
     w.data = (__bridge_retained void*)[g_device newBufferWithLength:dataBytes options:MTLResourceStorageModeShared];
     w.scales = w.fp32 ? NULL : (__bridge_retained void*)[g_device newBufferWithLength:rows * sizeof(float) options:MTLResourceStorageModeShared];
     return w;
@@ -5697,6 +5723,7 @@ static void inf_weight_upload(inf_weight_t* w, const float* fp32, int rows, int 
             }
         }
     } else {
+        // Q8 per-row: contiguous int8 + per-row scale (pre-divided by 127)
         int8_t* dst = (int8_t*)((__bridge id<MTLBuffer>)w->data).contents;
         for (int r = 0; r < rows; r++) {
             float absMax = 0;
@@ -5704,7 +5731,7 @@ static void inf_weight_upload(inf_weight_t* w, const float* fp32, int rows, int 
                 float v = fp32[r * cols + c]; if (v < 0) v = -v;
                 if (v > absMax) absMax = v;
             }
-            scales[r] = absMax / 127.0f; // pre-divided for kernel
+            scales[r] = absMax / 127.0f;
             float invScale = absMax > 0 ? 127.0f / absMax : 0;
             for (int c = 0; c < cols; c++) {
                 float v = fp32[r * cols + c] * invScale;
@@ -5847,7 +5874,7 @@ int mtl_fused_set_weight(int idx, const float* data, int nFloats) {
 #define DT(x,y,z, tx,ty,tz) [enc dispatchThreads:MTLSizeMake(x,y,z) threadsPerThreadgroup:MTLSizeMake(tx,ty,tz)]
 #define DTG(gx,gy,gz, tx,ty,tz) [enc dispatchThreadgroups:MTLSizeMake(gx,gy,gz) threadsPerThreadgroup:MTLSizeMake(tx,ty,tz)]
 #define BARRIER() [enc memoryBarrierWithScope:MTLBarrierScopeBuffers]
-// Matvec dispatch: Metal 4 FP32 hardware matmul, or Q8/Q4 fused dequant kernel.
+// Matvec dispatch: Metal 4 FP32, Q8 group (8 rows/tg), or Q4.
 #define MV(act, w, out, cb_K, cb_N) do { \
     if ((w).fp32) { \
         PS(g_ps_gemm4f_bt); BUF(act, 0); BUF((w).data, 1); BUF(out, 2); \
@@ -5858,8 +5885,8 @@ int mtl_fused_set_weight(int idx, const float* data, int nFloats) {
         PS(g_ps_q4mv); BUF(act, 0); BUF((w).data, 1); BUF((w).scales, 2); BUF(out, 3); CB(cb_K, 4); \
         DTG((w).rows, 1, 1, MIN(256, (int)g_ps_q4mv.maxTotalThreadsPerThreadgroup), 1, 1); \
     } else { \
-        PS(g_ps_q8mv); BUF(act, 0); BUF((w).data, 1); BUF((w).scales, 2); BUF(out, 3); CB(cb_K, 4); \
-        DTG((w).rows, 1, 1, MIN(256, (int)g_ps_q8mv.maxTotalThreadsPerThreadgroup), 1, 1); \
+        PS(g_ps_q8mv); BUF(act, 0); BUF((w).data, 1); BUF((w).scales, 2); BUF(out, 3); CB(cb_K, 4); CB(cb_N, 5); \
+        DTG(((w).rows + 7) / 8, 1, 1, 128, 1, 1); \
     } \
 } while(0)
 
