@@ -57,8 +57,7 @@ Helix LoRA: frozen INT8 base + rank-8 FP32 adapters, DNA-paired optimizer (gate+
 
 ```
 RTX 5090     182.2 tok/s    CUDA Q8 fused matvec
-M4 Max        54.3 tok/s    Metal fused compute
-M1 Pro        22.0 tok/s    Metal inference graph
+M1 Pro       119.5 tok/s    Metal fused Q8 inference
 ```
 
 ## How it works
