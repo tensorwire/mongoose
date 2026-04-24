@@ -1943,10 +1943,7 @@ __global__ void helix_needle_sparse_kernel(
     delta_buf[ci] = __float2half(delta);
 }
 
-static int g_helix_needle_sparse_loaded = 1;
-int tw_helix_needle_sparse_loaded() { return g_helix_needle_sparse_loaded; }
-
-void tw_k_helix_needle_sparse(
+void mongoose_helix_needle_sparse(
     void* data_int8, float* scales, float* fp32_cache,
     void* mom, void* delta_buf, const int* hotIdx,
     float signalScale, float lr, float beta1,

@@ -97,6 +97,8 @@ static fn_softmax_ce        k_softmax_ce = NULL;
 static fn_helix_dna_step    k_helix_dna_step = NULL;
 static fn_helix_needle      k_helix_needle = NULL;
 static fn_helix_needle_paired k_helix_needle_paired = NULL;
+typedef void (*fn_helix_needle_sparse)(void*, float*, float*, void*, void*, const int*, float, float, float, float, int, int, cudaStream_t);
+static fn_helix_needle_sparse k_helix_needle_sparse = NULL;
 static fn_dequant_int8_fp16 k_dequant_int8_fp16 = NULL;
 static fn_dequant_int8_fp32 k_dequant_int8_fp32 = NULL;
 static fn_dequant_int8_delta k_dequant_int8_delta = NULL;
@@ -157,6 +159,7 @@ int tw_load_kernels(const char* path) {
     k_helix_dna_step      = (fn_helix_dna_step)dlsym(kernel_lib, "mongoose_helix_dna_step");
     k_helix_needle        = (fn_helix_needle)dlsym(kernel_lib, "mongoose_helix_needle");
     k_helix_needle_paired = (fn_helix_needle_paired)dlsym(kernel_lib, "mongoose_helix_needle_paired");
+    k_helix_needle_sparse = (fn_helix_needle_sparse)dlsym(kernel_lib, "mongoose_helix_needle_sparse");
     k_dequant_int8_fp16   = (fn_dequant_int8_fp16)dlsym(kernel_lib, "mongoose_dequant_int8_to_fp16");
     k_dequant_int8_fp32   = (fn_dequant_int8_fp32)dlsym(kernel_lib, "mongoose_dequant_int8_to_fp32");
     k_dequant_int8_delta  = (fn_dequant_int8_delta)dlsym(kernel_lib, "mongoose_dequant_int8_delta");
@@ -419,10 +422,13 @@ void tw_k_silu_gate_bwd_fp16(const void* dOut, const void* gate, const void* up,
 }
 
 // Sparse needle: forward-only, conductor-driven
-extern int tw_helix_needle_sparse_loaded();
-extern void tw_k_helix_needle_sparse(void* data, float* scales, float* cache,
+int tw_helix_needle_sparse_loaded() { return k_helix_needle_sparse != NULL ? 1 : 0; }
+void tw_k_helix_needle_sparse(void* data, float* scales, float* cache,
     void* mom, void* delta, const int* hotIdx,
-    float signalScale, float lr, float beta1, float wd, int nHot, int cols, void* stream);
+    float signalScale, float lr, float beta1, float wd, int nHot, int cols, void* stream) {
+    if (k_helix_needle_sparse) k_helix_needle_sparse(data, scales, cache, mom, delta, hotIdx,
+        signalScale, lr, beta1, wd, nHot, cols, (cudaStream_t)stream);
+}
 */
 import "C"
 
@@ -893,5 +899,5 @@ func KNeedleSparse(dataPtr, scalesPtr, cachePtr, momPtr, deltaPtr, hotIdxPtr uns
 	C.tw_k_helix_needle_sparse(dataPtr, (*C.float)(scalesPtr), (*C.float)(cachePtr),
 		momPtr, deltaPtr, (*C.int)(hotIdxPtr),
 		C.float(signalScale), C.float(lr), C.float(beta1),
-		C.float(wd), C.int(nHot), C.int(cols), 0)
+		C.float(wd), C.int(nHot), C.int(cols), nil)
 }

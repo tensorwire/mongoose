@@ -341,6 +341,46 @@ func (d *XeDaemon) XeRegion(byteOffset, count int) []float32 {
 //   5. Go reads losses + grad from Xe region
 //
 // Socket dispatch + sync are the memory barriers. Zero data copies.
+// CEBuffers holds L0 shared memory pointers for cross-entropy.
+// Go writes directly to these. Xe reads directly. Zero copies.
+type CEBuffers struct {
+	Logits  unsafe.Pointer
+	Targets unsafe.Pointer
+	Losses  unsafe.Pointer
+	Grad    unsafe.Pointer
+}
+
+// AllocCEBuffers allocates L0 shared memory for cross-entropy on Xe.
+func (d *XeDaemon) AllocCEBuffers(nPos, vocabSize int) *CEBuffers {
+	resp := d.cmd("cebufs %d %d", nPos, vocabSize)
+	if !strings.HasPrefix(resp, "OK ") {
+		log.Printf("[xe] cebufs failed: %s", resp)
+		return nil
+	}
+	var lp, tp, op, gp uint64
+	fmt.Sscanf(resp[3:], "0x%x 0x%x 0x%x 0x%x", &lp, &tp, &op, &gp)
+	if lp == 0 {
+		return nil
+	}
+	return &CEBuffers{
+		Logits: unsafe.Pointer(uintptr(lp)), Targets: unsafe.Pointer(uintptr(tp)),
+		Losses: unsafe.Pointer(uintptr(op)), Grad: unsafe.Pointer(uintptr(gp)),
+	}
+}
+
+func (b *CEBuffers) CELogitsFloat32(n int) []float32 {
+	return unsafe.Slice((*float32)(b.Logits), n)
+}
+func (b *CEBuffers) CETargetsInt32(n int) []int32 {
+	return unsafe.Slice((*int32)(b.Targets), n)
+}
+func (b *CEBuffers) CELossesFloat32(n int) []float32 {
+	return unsafe.Slice((*float32)(b.Losses), n)
+}
+
+// DispatchCrossEntropy fires the Xe CE kernel reading from arena offsets.
+// Go must write logits+targets to arena Go region BEFORE calling.
+// After dispatch+Sync, read losses from arena Xe region.
 func (d *XeDaemon) DispatchCrossEntropy(kernelIdx int,
 	logitsOff, targetsOff, lossesOff, gradOff uint32,
 	nPos, vocabSize uint32, invN float32) {

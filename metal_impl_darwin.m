@@ -5487,13 +5487,12 @@ static NSString* g_infer_kernel_src =
 "    uint row = tgid * 4 + sgitg / 2;\n"
 "    if (row >= N) return;\n"
 "    ushort half_sg = sgitg % 2;  // which half of the row\n"
-"    device const int8_t* wRow = weight + row * K;\n"
+"    uint wOff = row * K;\n"
 "    float sum = 0.0f;\n"
-"    // 64 threads per row (2 simdgroups). Each thread processes K/64 elements.\n"
 "    uint tid_in_row = half_sg * 32 + tiisg;\n"
 "    for (uint k = tid_in_row * 4; k + 3 < K; k += 256) {\n"
 "        float4 a = float4(act[k], act[k+1], act[k+2], act[k+3]);\n"
-"        sum += a.x * wRow[k] + a.y * wRow[k+1] + a.z * wRow[k+2] + a.w * wRow[k+3];\n"
+"        sum += a.x * weight[wOff+k] + a.y * weight[wOff+k+1] + a.z * weight[wOff+k+2] + a.w * weight[wOff+k+3];\n"
 "    }\n"
 "    sum *= scales[row];\n"
 "    // Reduce within simdgroup\n"
@@ -5514,12 +5513,13 @@ static NSString* g_infer_kernel_src =
 "inline float bq4_dot_y(device const block_q4_0* qb, float sumy, thread float* yl, int il) {\n"
 "    float d = float(qb->d);\n"
 "    float acc0=0, acc1=0, acc2=0, acc3=0;\n"
-"    device const ushort* qs = (device const ushort*)(qb->qs) + il/2;\n"
+"    uint qs_off = il/2;\n"
 "    for (int i = 0; i < 8; i += 2) {\n"
-"        acc0 += yl[i+0] * (qs[i/2] & 0x000F);\n"
-"        acc1 += yl[i+1] * (qs[i/2] & 0x0F00);\n"
-"        acc2 += yl[i+8] * (qs[i/2] & 0x00F0);\n"
-"        acc3 += yl[i+9] * (qs[i/2] & 0xF000);\n"
+"        ushort v = ((device const ushort*)(qb->qs))[qs_off + i/2];\n"
+"        acc0 += yl[i+0] * (v & 0x000F);\n"
+"        acc1 += yl[i+1] * (v & 0x0F00);\n"
+"        acc2 += yl[i+8] * (v & 0x00F0);\n"
+"        acc3 += yl[i+9] * (v & 0xF000);\n"
 "    }\n"
 "    return d * (sumy * -8.0f + acc0 + acc1 + acc2 + acc3);\n"
 "}\n"
@@ -5540,28 +5540,28 @@ static NSString* g_infer_kernel_src =
 "    uint nb = K / QK;\n"
 "    uint r0 = (tgpig.x * 2 + sgitg) * NR0;  // NSG=2, NR0=4 → 8 rows/tg\n"
 "    if (r0 >= N) return;\n"
-"    device const block_q4_0* ax[4];\n"
+"    // Store block offsets per row (avoid device ptr array on stack)\n"
 "    for (short row = 0; row < NR0; row++)\n"
-"        ax[row] = (device const block_q4_0*)(weight + (r0+row) * nb * 18);\n"
+"        // offset computed inline below\n"
 "    float sumf[4] = {0,0,0,0};\n"
 "    short ix = tiisg / 2;\n"
 "    short il = (tiisg % 2) * 8;\n"
 "    uint ib0 = ix;\n"
-"    device const float* yb = act + ib0 * QK + il;\n"
+"    uint yOff = ib0 * QK + il;\n"
 "    for (uint ib = ib0; ib < nb; ib += NQ) {\n"
 "        float sumy[2] = {0,0};\n"
 "        float yl[16];\n"
 "        for (short i = 0; i < 8; i += 2) {\n"
-"            sumy[0] += yb[i] + yb[i+1];\n"
-"            yl[i]   = yb[i];\n"
-"            yl[i+1] = yb[i+1] / 256.0f;\n"
-"            sumy[1] += yb[i+16] + yb[i+17];\n"
-"            yl[i+8] = yb[i+16] / 16.0f;\n"
-"            yl[i+9] = yb[i+17] / 4096.0f;\n"
+"            sumy[0] += act[yOff+i] + act[yOff+i+1];\n"
+"            yl[i]   = act[yOff+i];\n"
+"            yl[i+1] = act[yOff+i+1] / 256.0f;\n"
+"            sumy[1] += act[yOff+i+16] + act[yOff+i+17];\n"
+"            yl[i+8] = act[yOff+i+16] / 16.0f;\n"
+"            yl[i+9] = act[yOff+i+17] / 4096.0f;\n"
 "        }\n"
 "        for (short row = 0; row < NR0 && r0+row < N; row++)\n"
-"            sumf[row] += bq4_dot_y(ax[row] + ib, sumy[0]+sumy[1], yl, il);\n"
-"        yb += QK * NQ;\n"
+"            sumf[row] += bq4_dot_y((device const block_q4_0*)(weight + (r0+row)*nb*18) + ib, sumy[0]+sumy[1], yl, il);\n"
+"        yOff += QK * NQ;\n"
 "    }\n"
 "    for (short row = 0; row < NR0 && r0+row < N; row++) {\n"
 "        float tot = simd_sum(sumf[row]);\n"
@@ -5770,10 +5770,28 @@ int mtl_fused_build(int dim, int kvDim, int headDim,
     if (g_inf.built) return 0;
     if (!g_device || !g_ps_rmsnorm_save || !g_ps_gemm_bt || !g_ps_copy_mem) return -1;
 
-    // Compile inference-only kernels
+    // Load inference kernels from pre-compiled metallib
     NSError* err = nil;
-    id<MTLLibrary> lib = [g_device newLibraryWithSource:g_infer_kernel_src options:nil error:&err];
-    if (!lib) { NSLog(@"infer kernel compile: %@", err); return -1; }
+    id<MTLLibrary> lib = nil;
+    NSArray* searchPaths = @[
+        [[[NSBundle mainBundle] executablePath] stringByDeletingLastPathComponent],
+        [[[[NSBundle mainBundle] executablePath] stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"kernels"],
+        @".", @"kernels",
+        [[NSFileManager defaultManager] currentDirectoryPath]
+    ];
+    for (NSString* dir in searchPaths) {
+        NSString* path = [dir stringByAppendingPathComponent:@"infer.metallib"];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
+            lib = [g_device newLibraryWithURL:[NSURL fileURLWithPath:path] error:&err];
+            if (lib) { NSLog(@"mongoose: inference kernels loaded from %@", path); break; }
+        }
+    }
+    if (!lib) {
+        // Fallback: compile from source at runtime
+        lib = [g_device newLibraryWithSource:g_infer_kernel_src options:nil error:&err];
+        if (lib) NSLog(@"mongoose: inference kernels compiled from source");
+    }
+    if (!lib) { NSLog(@"infer kernel load failed: %@", err); return -1; }
     g_ps_rope_rh = [g_device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rope_rotate_half"] error:&err];
     g_ps_dec_attn = [g_device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"decode_attn"] error:&err];
     g_ps_q8mv = [g_device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"q8_matvec"] error:&err];

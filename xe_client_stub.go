@@ -22,3 +22,15 @@ func (d *XeDaemon) GoRegion(off, n int) []float32     { return nil }
 func (d *XeDaemon) GoRegionInt32(off, n int) []int32   { return nil }
 func (d *XeDaemon) XeRegion(off, n int) []float32     { return nil }
 func (d *XeDaemon) DispatchCrossEntropy(ki int, lo, to, oo, go2 uint32, np, vs uint32, in2 float32) {}
+func (d *XeDaemon) AllocCEBuffers(nPos, vocabSize int) *CEBuffers { return nil }
+
+type CEBuffers struct {
+	Logits  unsafe.Pointer
+	Targets unsafe.Pointer
+	Losses  unsafe.Pointer
+	Grad    unsafe.Pointer
+}
+
+func (b *CEBuffers) CELogitsFloat32(n int) []float32  { return nil }
+func (b *CEBuffers) CETargetsInt32(n int) []int32     { return nil }
+func (b *CEBuffers) CELossesFloat32(n int) []float32  { return nil }

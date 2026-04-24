@@ -12,3 +12,5 @@ require (
 	github.com/gogpu/naga v0.17.3 // indirect
 	golang.org/x/sys v0.43.0 // indirect
 )
+
+replace github.com/open-ai-org/mongoose => ../mongoose-m4infer

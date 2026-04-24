@@ -178,22 +178,22 @@ static int dispatch_cross_entropy(int kidx, uint32_t logits_off, uint32_t target
     if (logits_off >= ARENA_HALF || targets_off >= ARENA_HALF) return -3;
     if (losses_off < ARENA_XE_START || grad_off < ARENA_XE_START) return -4;
 
-    void* logits_ptr  = (char*)g_arena_base + logits_off;
-    void* targets_ptr = (char*)g_arena_base + targets_off;
-    void* losses_ptr  = (char*)g_arena_base + losses_off;
-    void* grad_ptr    = (char*)g_arena_base + grad_off;
+    // Arena pointers are mmap'd host memory — not L0 accessible.
+    // Copy to L0 shared buffers, dispatch there, copy results back.
+    size_t logits_bytes = (size_t)n_pos * vocab_size * sizeof(float);
+    if (ensure_ce_buffers(n_pos, vocab_size) != 0) return -5;
 
-    ze_kernel_handle_t k = g_kernels[kidx];
-    zeKernelSetGroupSize(k, 256, 1, 1);
-    zeKernelSetArgumentValue(k, 0, sizeof(void*), &logits_ptr);
-    zeKernelSetArgumentValue(k, 1, sizeof(void*), &targets_ptr);
-    zeKernelSetArgumentValue(k, 2, sizeof(void*), &losses_ptr);
-    zeKernelSetArgumentValue(k, 3, sizeof(void*), &grad_ptr);
-    zeKernelSetArgumentValue(k, 4, sizeof(uint32_t), &vocab_size);
-    zeKernelSetArgumentValue(k, 5, sizeof(float), &inv_n);
+    memcpy(g_ce_logits, (char*)g_arena_base + logits_off, logits_bytes);
+    memcpy(g_ce_targets, (char*)g_arena_base + targets_off, n_pos * sizeof(int));
 
-    ze_group_count_t disp = {n_pos, 1, 1};
-    zeCommandListAppendLaunchKernel(g_cmdlist, k, &disp, NULL, 0, NULL);
+    int ret = dispatch_cross_entropy_direct(kidx, n_pos, vocab_size, inv_n);
+    if (ret != 0) return ret;
+
+    // Sync and copy results back to arena
+    zeCommandListHostSynchronize(g_cmdlist, UINT64_MAX);
+    zeCommandListReset(g_cmdlist);
+    memcpy((char*)g_arena_base + losses_off, g_ce_losses, n_pos * sizeof(float));
+    memcpy((char*)g_arena_base + grad_off, g_ce_grad, logits_bytes);
     return 0;
 }
 
