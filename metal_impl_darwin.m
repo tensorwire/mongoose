@@ -6194,6 +6194,186 @@ int mtl_fused_partial_step(const float* hiddenIn, int pos,
     return mtl_fused_partial_step_slot(0, hiddenIn, pos, layerStart, layerEnd, hiddenOut, logitsOut);
 }
 
+// Streaming inference state — ping-pong weight buffers for 19x less VRAM.
+// Only 2 layers' worth of weights in GPU memory at any time.
+static struct {
+    bool built;
+    inf_weight_t wA[12]; // weight set A (norm1, wq, wk, wv, bq, bk, bv, wo, norm2, gate, up, down)
+    inf_weight_t wB[12]; // weight set B (ping-pong)
+    void* normA; void* normB;         // norm buffers (FP32, set A/B)
+    void* norm2A; void* norm2B;
+    void* bqA; void* bkA; void* bvA;
+    void* bqB; void* bkB; void* bvB;
+} g_stream = {0};
+
+int mtl_stream_build(void) {
+    if (!g_inf.built) return -1;
+    if (g_stream.built) return 0;
+    int dim=g_inf.dim, kvDim=g_inf.kvDim, ffnDim=g_inf.ffnDim;
+    // Allocate two sets of weight buffers
+    g_stream.wA[0]=inf_weight_alloc(dim, dim);   g_stream.wB[0]=inf_weight_alloc(dim, dim);   // wq
+    g_stream.wA[1]=inf_weight_alloc(kvDim, dim); g_stream.wB[1]=inf_weight_alloc(kvDim, dim); // wk
+    g_stream.wA[2]=inf_weight_alloc(kvDim, dim); g_stream.wB[2]=inf_weight_alloc(kvDim, dim); // wv
+    g_stream.wA[3]=inf_weight_alloc(dim, dim);   g_stream.wB[3]=inf_weight_alloc(dim, dim);   // wo
+    g_stream.wA[4]=inf_weight_alloc(ffnDim, dim); g_stream.wB[4]=inf_weight_alloc(ffnDim, dim); // gate
+    g_stream.wA[5]=inf_weight_alloc(ffnDim, dim); g_stream.wB[5]=inf_weight_alloc(ffnDim, dim); // up
+    g_stream.wA[6]=inf_weight_alloc(dim, ffnDim); g_stream.wB[6]=inf_weight_alloc(dim, ffnDim); // down
+    g_stream.normA=inf_buf(dim); g_stream.normB=inf_buf(dim);
+    g_stream.norm2A=inf_buf(dim); g_stream.norm2B=inf_buf(dim);
+    g_stream.bqA=inf_buf(dim); g_stream.bqB=inf_buf(dim);
+    g_stream.bkA=inf_buf(kvDim); g_stream.bkB=inf_buf(kvDim);
+    g_stream.bvA=inf_buf(kvDim); g_stream.bvB=inf_buf(kvDim);
+    g_stream.built = true;
+    return 0;
+}
+
+// Upload one layer's weights into the specified ping-pong set (0=A, 1=B).
+void mtl_stream_upload_layer(int set, int layer,
+    const float* norm1, const float* wq, const float* wk, const float* wv,
+    const float* bq, const float* bk, const float* bv, const float* wo,
+    const float* norm2, const float* gate, const float* up, const float* down) {
+    int dim=g_inf.dim, kvDim=g_inf.kvDim, ffnDim=g_inf.ffnDim;
+    inf_weight_t* w = (set == 0) ? g_stream.wA : g_stream.wB;
+    void* norm = (set == 0) ? g_stream.normA : g_stream.normB;
+    void* n2 = (set == 0) ? g_stream.norm2A : g_stream.norm2B;
+    void* bqBuf = (set == 0) ? g_stream.bqA : g_stream.bqB;
+    void* bkBuf = (set == 0) ? g_stream.bkA : g_stream.bkB;
+    void* bvBuf = (set == 0) ? g_stream.bvA : g_stream.bvB;
+
+    memcpy(((__bridge id<MTLBuffer>)norm).contents, norm1, dim * sizeof(float));
+    inf_weight_upload(&w[0], wq, dim, dim);
+    inf_weight_upload(&w[1], wk, kvDim, dim);
+    inf_weight_upload(&w[2], wv, kvDim, dim);
+    if (bq) memcpy(((__bridge id<MTLBuffer>)bqBuf).contents, bq, dim * sizeof(float));
+    else    memset(((__bridge id<MTLBuffer>)bqBuf).contents, 0, dim * sizeof(float));
+    if (bk) memcpy(((__bridge id<MTLBuffer>)bkBuf).contents, bk, kvDim * sizeof(float));
+    else    memset(((__bridge id<MTLBuffer>)bkBuf).contents, 0, kvDim * sizeof(float));
+    if (bv) memcpy(((__bridge id<MTLBuffer>)bvBuf).contents, bv, kvDim * sizeof(float));
+    else    memset(((__bridge id<MTLBuffer>)bvBuf).contents, 0, kvDim * sizeof(float));
+    inf_weight_upload(&w[3], wo, dim, dim);
+    memcpy(((__bridge id<MTLBuffer>)n2).contents, norm2, dim * sizeof(float));
+    inf_weight_upload(&w[4], gate, ffnDim, dim);
+    inf_weight_upload(&w[5], up, ffnDim, dim);
+    inf_weight_upload(&w[6], down, dim, ffnDim);
+}
+
+// Run one layer using the specified ping-pong set's weights.
+// Per-layer command buffer — caller manages the ping-pong timing.
+int mtl_stream_step_layer(int set, int layer, int pos) {
+    if (!g_inf.built || !g_stream.built) return -1;
+    inf_slot_t* sl = &g_inf.slots[0];
+    inf_weight_t* w = (set == 0) ? g_stream.wA : g_stream.wB;
+    void* norm = (set == 0) ? g_stream.normA : g_stream.normB;
+    void* n2 = (set == 0) ? g_stream.norm2A : g_stream.norm2B;
+    void* bqBuf = (set == 0) ? g_stream.bqA : g_stream.bqB;
+    void* bkBuf = (set == 0) ? g_stream.bkA : g_stream.bkB;
+    void* bvBuf = (set == 0) ? g_stream.bvA : g_stream.bvB;
+
+    int dim=g_inf.dim, kvDim=g_inf.kvDim, headDim=g_inf.headDim;
+    int nHeads=g_inf.nHeads, nKVHeads=g_inf.nKVHeads, ffnDim=g_inf.ffnDim;
+    int seqLen = pos + 1;
+
+    uint32_t upos = (uint32_t)pos, useq = (uint32_t)seqLen;
+    id<MTLBuffer> cb_pos = [g_device newBufferWithBytes:&upos length:4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> cb_seq = [g_device newBufferWithBytes:&useq length:4 options:MTLResourceStorageModeShared];
+
+    id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+
+    NSUInteger tpg_norm = (dim / 32) * 32; if (tpg_norm == 0) tpg_norm = 32;
+    if (tpg_norm > g_ps_rmsnorm_save.maxTotalThreadsPerThreadgroup) tpg_norm = g_ps_rmsnorm_save.maxTotalThreadsPerThreadgroup;
+
+    PS(g_ps_copy_mem); BUF(sl->hidden, 0); BUF(sl->normed, 1);
+    DT(dim,1,1, 256,1,1); BARRIER();
+
+    PS(g_ps_rmsnorm_save); BUF(sl->normed, 0); BUF(norm, 1); BUF(sl->rmsScale, 2);
+    CB(g_inf.cb_dim, 3); CB(g_inf.cb_eps, 4); DTG(1,1,1, tpg_norm,1,1); BARRIER();
+
+    MV(sl->normed, w[0], sl->Q, g_inf.cb_Kdim, g_inf.cb_dim);
+    MV(sl->normed, w[1], sl->K, g_inf.cb_Kdim, g_inf.cb_Nkvdim);
+    MV(sl->normed, w[2], sl->V, g_inf.cb_Kdim, g_inf.cb_Nkvdim);
+    BARRIER();
+
+    PS(g_ps_bias_add);
+    BUF(sl->Q, 0); BUF(bqBuf, 1); CB(g_inf.cb_dim, 2); DT(dim,1,1, 256,1,1);
+    BUF(sl->K, 0); BUF(bkBuf, 1); CB(g_inf.cb_kvDim, 2); DT(kvDim,1,1, 256,1,1);
+    BUF(sl->V, 0); BUF(bvBuf, 1); CB(g_inf.cb_kvDim, 2); DT(kvDim,1,1, 256,1,1);
+    BARRIER();
+
+    int nPQ = nHeads * (headDim / 2), nPK = nKVHeads * (headDim / 2);
+    PS(g_ps_rope_rh);
+    BUF(sl->Q, 0); CB(g_inf.cb_headDim, 1); CB(g_inf.cb_nHeads, 2); CB(cb_pos, 3); CB(g_inf.cb_theta, 4);
+    DT(nPQ,1,1, MIN(256,(int)g_ps_rope_rh.maxTotalThreadsPerThreadgroup),1,1);
+    BUF(sl->K, 0); CB(g_inf.cb_headDim, 1); CB(g_inf.cb_nKVHeads, 2); CB(cb_pos, 3); CB(g_inf.cb_theta, 4);
+    DT(nPK,1,1, MIN(256,(int)g_ps_rope_rh.maxTotalThreadsPerThreadgroup),1,1);
+    BARRIER();
+
+    int cOff = pos * kvDim * (int)sizeof(float);
+    PS(g_ps_copy_mem);
+    BUF(sl->K, 0); BUFO(sl->kCache[layer], cOff, 1); DT(kvDim,1,1, 256,1,1);
+    BUF(sl->V, 0); BUFO(sl->vCache[layer], cOff, 1); DT(kvDim,1,1, 256,1,1);
+    BARRIER();
+
+    PS(g_ps_dec_attn);
+    BUF(sl->Q, 0); BUF(sl->kCache[layer], 1); BUF(sl->vCache[layer], 2); BUF(sl->attnOut, 3);
+    CB(g_inf.cb_kvDim, 4); CB(g_inf.cb_headDim, 5); CB(g_inf.cb_nHeads, 6);
+    CB(g_inf.cb_nKVHeads, 7); CB(cb_seq, 8);
+    DTG(nHeads,1,1, headDim,1,1); BARRIER();
+
+    MV(sl->attnOut, w[3], sl->proj, g_inf.cb_Kdim, g_inf.cb_dim); BARRIER();
+    PS(g_ps_add_inplace); BUF(sl->hidden, 0); BUF(sl->proj, 1);
+    DT(dim,1,1, 256,1,1); BARRIER();
+
+    PS(g_ps_copy_mem); BUF(sl->hidden, 0); BUF(sl->normed2, 1);
+    DT(dim,1,1, 256,1,1); BARRIER();
+    PS(g_ps_rmsnorm_save); BUF(sl->normed2, 0); BUF(n2, 1); BUF(sl->rmsScale2, 2);
+    CB(g_inf.cb_dim, 3); CB(g_inf.cb_eps, 4); DTG(1,1,1, tpg_norm,1,1); BARRIER();
+
+    MV(sl->normed2, w[4], sl->gatePre, g_inf.cb_Kdim, g_inf.cb_Nffn);
+    MV(sl->normed2, w[5], sl->upOut, g_inf.cb_Kdim, g_inf.cb_Nffn);
+    BARRIER();
+    PS(g_ps_silu_gate_mul); BUF(sl->gatePre, 0); BUF(sl->upOut, 1); BUF(sl->ffnMid, 2);
+    DT(ffnDim,1,1, 256,1,1); BARRIER();
+    MV(sl->ffnMid, w[6], sl->proj, g_inf.cb_Nffn, g_inf.cb_dim); BARRIER();
+    PS(g_ps_add_inplace); BUF(sl->hidden, 0); BUF(sl->proj, 1);
+    DT(dim,1,1, 256,1,1);
+
+    [enc endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    return 0;
+}
+
+// Run final norm + lm_head after all layers. Uses resident finalNorm + lmHead.
+int mtl_stream_step_final(int pos, float* logitsOut) {
+    if (!g_inf.built) return -1;
+    inf_slot_t* sl = &g_inf.slots[0];
+    int dim=g_inf.dim, vocabSize=g_inf.vocabSize;
+
+    NSUInteger tpg_norm = (dim / 32) * 32; if (tpg_norm == 0) tpg_norm = 32;
+    if (tpg_norm > g_ps_rmsnorm_save.maxTotalThreadsPerThreadgroup) tpg_norm = g_ps_rmsnorm_save.maxTotalThreadsPerThreadgroup;
+
+    id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+
+    PS(g_ps_rmsnorm_save); BUF(sl->hidden, 0); BUF(g_inf.finalNorm, 1); BUF(sl->rmsScale, 2);
+    CB(g_inf.cb_dim, 3); CB(g_inf.cb_eps, 4); DTG(1,1,1, tpg_norm,1,1); BARRIER();
+    MV(sl->hidden, g_inf.lmHead, sl->logits, g_inf.cb_Kdim, g_inf.cb_Nvocab);
+
+    [enc endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+
+    memcpy(logitsOut, ((__bridge id<MTLBuffer>)sl->logits).contents, vocabSize * sizeof(float));
+    return 0;
+}
+
+// Upload hidden state into slot 0 (call before streaming layer loop).
+void mtl_stream_set_hidden(const float* hiddenIn) {
+    if (!g_inf.built) return;
+    memcpy(((__bridge id<MTLBuffer>)g_inf.slots[0].hidden).contents, hiddenIn, g_inf.dim * sizeof(float));
+}
+
 #undef PS
 #undef BUF
 #undef BUFO
