@@ -53,11 +53,12 @@ dim       params     steps/s
 
 Helix LoRA: frozen INT8 base + rank-8 FP32 adapters, DNA-paired optimizer (gate+up G≡C, wk+wv A=T). AdamW full: dequant→KAdamW→requant on all weights every step. PyTorch: bitsandbytes INT8 + LoRA rank-8 + AdamW.
 
-## Inference — Qwen2.5-0.5B (200 tokens)
+## Inference — Qwen2.5-0.5B (200 tokens, warm)
 
 ```
-RTX 5090     182.4 tok/s    Q8 fused matvec
-M4 Max        54.3 tok/s    GPU-resident
+RTX 5090     182.2 tok/s    CUDA Q8 fused matvec
+M4 Max        54.3 tok/s    Metal fused compute
+M1 Pro        22.0 tok/s    Metal inference graph
 ```
 
 ## How it works
