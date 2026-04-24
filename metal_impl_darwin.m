@@ -5655,21 +5655,32 @@ typedef struct {
     bool fp32;    // true = FP32 (Metal 4 path)
 } inf_weight_t;
 
+// Per-slot state: KV cache + scratch buffers. Slots run on separate command queues.
+#define INF_NUM_SLOTS 2
+
+typedef struct {
+    void** kCache; void** vCache;
+    void* hidden; void* normed; void* Q; void* K; void* V; void* attnOut;
+    void* rmsScale; void* normed2; void* rmsScale2;
+    void* gatePre; void* upOut; void* ffnMid; void* proj; void* logits;
+} inf_slot_t;
+
 // Inference state
 static struct {
     int dim, kvDim, headDim, nHeads, nKVHeads, ffnDim, vocabSize, nLayers, maxSeq;
     bool built, metal4;
-    // Per-layer weights
-    void** norm1; void** norm2;           // [dim] FP32 (norms)
+    // Per-layer weights (shared across slots — read-only)
+    void** norm1; void** norm2;
     inf_weight_t* wq; inf_weight_t* wk; inf_weight_t* wv; inf_weight_t* wo;
     inf_weight_t* wgate; inf_weight_t* wup; inf_weight_t* wdown;
-    void** bq; void** bk; void** bv;     // bias FP32
-    // KV cache per layer
-    void** kCache; void** vCache;
-    // Final
+    void** bq; void** bk; void** bv;
+    // Final (shared)
     void* finalNorm;
     inf_weight_t lmHead;
-    // Scratch
+    // Per-slot state
+    inf_slot_t slots[INF_NUM_SLOTS];
+    // Legacy aliases (slot 0) for backward compat
+    void** kCache; void** vCache;
     void* hidden; void* normed; void* Q; void* K; void* V; void* attnOut;
     void* rmsScale; void* normed2; void* rmsScale2;
     void* gatePre; void* upOut; void* ffnMid; void* proj; void* logits;
@@ -5839,7 +5850,6 @@ int mtl_fused_build(int dim, int kvDim, int headDim,
     g_inf.wgate=(inf_weight_t*)calloc(nLayers,sizeof(inf_weight_t));
     g_inf.wup=(inf_weight_t*)calloc(nLayers,sizeof(inf_weight_t));
     g_inf.wdown=(inf_weight_t*)calloc(nLayers,sizeof(inf_weight_t));
-    g_inf.kCache=(void**)calloc(nLayers,8); g_inf.vCache=(void**)calloc(nLayers,8);
     for (int l = 0; l < nLayers; l++) {
         g_inf.norm1[l]=inf_buf(dim); g_inf.norm2[l]=inf_buf(dim);
         g_inf.bq[l]=inf_buf(dim); g_inf.bk[l]=inf_buf(kvDim); g_inf.bv[l]=inf_buf(kvDim);
@@ -5850,18 +5860,34 @@ int mtl_fused_build(int dim, int kvDim, int headDim,
         g_inf.wgate[l]=inf_weight_alloc(ffnDim, dim);
         g_inf.wup[l]=inf_weight_alloc(ffnDim, dim);
         g_inf.wdown[l]=inf_weight_alloc(dim, ffnDim);
-        g_inf.kCache[l]=inf_buf(maxSeq*kvDim); g_inf.vCache[l]=inf_buf(maxSeq*kvDim);
     }
     g_inf.finalNorm=inf_buf(dim);
     g_inf.lmHead=inf_weight_alloc(vocabSize, dim);
 
-    // Scratch
-    g_inf.hidden=inf_buf(dim); g_inf.normed=inf_buf(dim);
-    g_inf.Q=inf_buf(dim); g_inf.K=inf_buf(kvDim); g_inf.V=inf_buf(kvDim);
-    g_inf.attnOut=inf_buf(dim); g_inf.rmsScale=inf_buf(1); g_inf.rmsScale2=inf_buf(1);
-    g_inf.normed2=inf_buf(dim); g_inf.gatePre=inf_buf(ffnDim);
-    g_inf.upOut=inf_buf(ffnDim); g_inf.ffnMid=inf_buf(ffnDim);
-    g_inf.proj=inf_buf(dim); g_inf.logits=inf_buf(vocabSize);
+    // Per-slot: KV cache + scratch buffers
+    for (int s = 0; s < INF_NUM_SLOTS; s++) {
+        inf_slot_t* sl = &g_inf.slots[s];
+        sl->kCache=(void**)calloc(nLayers,8); sl->vCache=(void**)calloc(nLayers,8);
+        for (int l = 0; l < nLayers; l++) {
+            sl->kCache[l]=inf_buf(maxSeq*kvDim); sl->vCache[l]=inf_buf(maxSeq*kvDim);
+        }
+        sl->hidden=inf_buf(dim); sl->normed=inf_buf(dim);
+        sl->Q=inf_buf(dim); sl->K=inf_buf(kvDim); sl->V=inf_buf(kvDim);
+        sl->attnOut=inf_buf(dim); sl->rmsScale=inf_buf(1); sl->rmsScale2=inf_buf(1);
+        sl->normed2=inf_buf(dim); sl->gatePre=inf_buf(ffnDim);
+        sl->upOut=inf_buf(ffnDim); sl->ffnMid=inf_buf(ffnDim);
+        sl->proj=inf_buf(dim); sl->logits=inf_buf(vocabSize);
+    }
+
+    // Legacy aliases → slot 0 (backward compat with mtl_fused_step)
+    g_inf.kCache=g_inf.slots[0].kCache; g_inf.vCache=g_inf.slots[0].vCache;
+    g_inf.hidden=g_inf.slots[0].hidden; g_inf.normed=g_inf.slots[0].normed;
+    g_inf.Q=g_inf.slots[0].Q; g_inf.K=g_inf.slots[0].K; g_inf.V=g_inf.slots[0].V;
+    g_inf.attnOut=g_inf.slots[0].attnOut; g_inf.rmsScale=g_inf.slots[0].rmsScale;
+    g_inf.normed2=g_inf.slots[0].normed2; g_inf.rmsScale2=g_inf.slots[0].rmsScale2;
+    g_inf.gatePre=g_inf.slots[0].gatePre; g_inf.upOut=g_inf.slots[0].upOut;
+    g_inf.ffnMid=g_inf.slots[0].ffnMid; g_inf.proj=g_inf.slots[0].proj;
+    g_inf.logits=g_inf.slots[0].logits;
 
     // Cached constants (allocated once, never change)
     g_inf.cb_dim=inf_const(dim); g_inf.cb_kvDim=inf_const(kvDim);
@@ -6036,6 +6062,138 @@ int mtl_fused_step(const float* hiddenIn, const float* cosData, const float* sin
     return 0;
 }
 
+// Reset KV cache — zero all layers in slot 0. Call between conversations.
+void mtl_fused_reset_kv(void) {
+    if (!g_inf.built) return;
+    int kvDim = g_inf.kvDim, maxSeq = g_inf.maxSeq;
+    for (int l = 0; l < g_inf.nLayers; l++) {
+        memset(((__bridge id<MTLBuffer>)g_inf.slots[0].kCache[l]).contents, 0, maxSeq * kvDim * sizeof(float));
+        memset(((__bridge id<MTLBuffer>)g_inf.slots[0].vCache[l]).contents, 0, maxSeq * kvDim * sizeof(float));
+    }
+}
+
+void mtl_fused_reset_kv_slot(int slot) {
+    if (!g_inf.built || slot < 0 || slot >= INF_NUM_SLOTS) return;
+    inf_slot_t* sl = &g_inf.slots[slot];
+    int kvDim = g_inf.kvDim, maxSeq = g_inf.maxSeq;
+    for (int l = 0; l < g_inf.nLayers; l++) {
+        memset(((__bridge id<MTLBuffer>)sl->kCache[l]).contents, 0, maxSeq * kvDim * sizeof(float));
+        memset(((__bridge id<MTLBuffer>)sl->vCache[l]).contents, 0, maxSeq * kvDim * sizeof(float));
+    }
+}
+
+int mtl_fused_num_slots(void) { return INF_NUM_SLOTS; }
+
+// Partial step on a specific slot: run layers [layerStart, layerEnd) using slot's
+// independent KV cache and scratch buffers. Slot 0 uses g_queue, slot 1 uses g_queue2.
+int mtl_fused_partial_step_slot(int slot, const float* hiddenIn, int pos,
+                                int layerStart, int layerEnd,
+                                float* hiddenOut, float* logitsOut) {
+    if (!g_inf.built || slot < 0 || slot >= INF_NUM_SLOTS) return -1;
+    inf_slot_t* sl = &g_inf.slots[slot];
+    id<MTLCommandQueue> queue = (slot == 0) ? g_queue : g_queue2;
+
+    int dim=g_inf.dim, kvDim=g_inf.kvDim, headDim=g_inf.headDim;
+    int nHeads=g_inf.nHeads, nKVHeads=g_inf.nKVHeads, ffnDim=g_inf.ffnDim;
+    int nLayers=g_inf.nLayers, vocabSize=g_inf.vocabSize;
+    int seqLen = pos + 1;
+    if (layerEnd > nLayers) layerEnd = nLayers;
+
+    memcpy(((__bridge id<MTLBuffer>)sl->hidden).contents, hiddenIn, dim * sizeof(float));
+
+    uint32_t upos = (uint32_t)pos, useq = (uint32_t)seqLen;
+    id<MTLBuffer> cb_pos = [g_device newBufferWithBytes:&upos length:4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> cb_seq = [g_device newBufferWithBytes:&useq length:4 options:MTLResourceStorageModeShared];
+
+    id<MTLCommandBuffer> cmd = [queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+
+    NSUInteger tpg_norm = (dim / 32) * 32; if (tpg_norm == 0) tpg_norm = 32;
+    if (tpg_norm > g_ps_rmsnorm_save.maxTotalThreadsPerThreadgroup) tpg_norm = g_ps_rmsnorm_save.maxTotalThreadsPerThreadgroup;
+
+    for (int l = layerStart; l < layerEnd; l++) {
+        PS(g_ps_copy_mem); BUF(sl->hidden, 0); BUF(sl->normed, 1);
+        DT(dim,1,1, 256,1,1); BARRIER();
+
+        PS(g_ps_rmsnorm_save); BUF(sl->normed, 0); BUF(g_inf.norm1[l], 1); BUF(sl->rmsScale, 2);
+        CB(g_inf.cb_dim, 3); CB(g_inf.cb_eps, 4); DTG(1,1,1, tpg_norm,1,1); BARRIER();
+
+        MV(sl->normed, g_inf.wq[l], sl->Q, g_inf.cb_Kdim, g_inf.cb_dim);
+        MV(sl->normed, g_inf.wk[l], sl->K, g_inf.cb_Kdim, g_inf.cb_Nkvdim);
+        MV(sl->normed, g_inf.wv[l], sl->V, g_inf.cb_Kdim, g_inf.cb_Nkvdim);
+        BARRIER();
+
+        PS(g_ps_bias_add);
+        BUF(sl->Q, 0); BUF(g_inf.bq[l], 1); CB(g_inf.cb_dim, 2); DT(dim,1,1, 256,1,1);
+        BUF(sl->K, 0); BUF(g_inf.bk[l], 1); CB(g_inf.cb_kvDim, 2); DT(kvDim,1,1, 256,1,1);
+        BUF(sl->V, 0); BUF(g_inf.bv[l], 1); CB(g_inf.cb_kvDim, 2); DT(kvDim,1,1, 256,1,1);
+        BARRIER();
+
+        int nPQ = nHeads * (headDim / 2), nPK = nKVHeads * (headDim / 2);
+        PS(g_ps_rope_rh);
+        BUF(sl->Q, 0); CB(g_inf.cb_headDim, 1); CB(g_inf.cb_nHeads, 2); CB(cb_pos, 3); CB(g_inf.cb_theta, 4);
+        DT(nPQ,1,1, MIN(256,(int)g_ps_rope_rh.maxTotalThreadsPerThreadgroup),1,1);
+        BUF(sl->K, 0); CB(g_inf.cb_headDim, 1); CB(g_inf.cb_nKVHeads, 2); CB(cb_pos, 3); CB(g_inf.cb_theta, 4);
+        DT(nPK,1,1, MIN(256,(int)g_ps_rope_rh.maxTotalThreadsPerThreadgroup),1,1);
+        BARRIER();
+
+        int cOff = pos * kvDim * (int)sizeof(float);
+        PS(g_ps_copy_mem);
+        BUF(sl->K, 0); BUFO(sl->kCache[l], cOff, 1); DT(kvDim,1,1, 256,1,1);
+        BUF(sl->V, 0); BUFO(sl->vCache[l], cOff, 1); DT(kvDim,1,1, 256,1,1);
+        BARRIER();
+
+        PS(g_ps_dec_attn);
+        BUF(sl->Q, 0); BUF(sl->kCache[l], 1); BUF(sl->vCache[l], 2); BUF(sl->attnOut, 3);
+        CB(g_inf.cb_kvDim, 4); CB(g_inf.cb_headDim, 5); CB(g_inf.cb_nHeads, 6);
+        CB(g_inf.cb_nKVHeads, 7); CB(cb_seq, 8);
+        DTG(nHeads,1,1, headDim,1,1); BARRIER();
+
+        MV(sl->attnOut, g_inf.wo[l], sl->proj, g_inf.cb_Kdim, g_inf.cb_dim); BARRIER();
+        PS(g_ps_add_inplace); BUF(sl->hidden, 0); BUF(sl->proj, 1);
+        DT(dim,1,1, 256,1,1); BARRIER();
+
+        PS(g_ps_copy_mem); BUF(sl->hidden, 0); BUF(sl->normed2, 1);
+        DT(dim,1,1, 256,1,1); BARRIER();
+        PS(g_ps_rmsnorm_save); BUF(sl->normed2, 0); BUF(g_inf.norm2[l], 1); BUF(sl->rmsScale2, 2);
+        CB(g_inf.cb_dim, 3); CB(g_inf.cb_eps, 4); DTG(1,1,1, tpg_norm,1,1); BARRIER();
+
+        MV(sl->normed2, g_inf.wgate[l], sl->gatePre, g_inf.cb_Kdim, g_inf.cb_Nffn);
+        MV(sl->normed2, g_inf.wup[l], sl->upOut, g_inf.cb_Kdim, g_inf.cb_Nffn);
+        BARRIER();
+        PS(g_ps_silu_gate_mul); BUF(sl->gatePre, 0); BUF(sl->upOut, 1); BUF(sl->ffnMid, 2);
+        DT(ffnDim,1,1, 256,1,1); BARRIER();
+        MV(sl->ffnMid, g_inf.wdown[l], sl->proj, g_inf.cb_Nffn, g_inf.cb_dim); BARRIER();
+        PS(g_ps_add_inplace); BUF(sl->hidden, 0); BUF(sl->proj, 1);
+        DT(dim,1,1, 256,1,1); BARRIER();
+    }
+
+    if (layerEnd >= nLayers && logitsOut) {
+        PS(g_ps_rmsnorm_save); BUF(sl->hidden, 0); BUF(g_inf.finalNorm, 1); BUF(sl->rmsScale, 2);
+        CB(g_inf.cb_dim, 3); CB(g_inf.cb_eps, 4); DTG(1,1,1, tpg_norm,1,1); BARRIER();
+        MV(sl->hidden, g_inf.lmHead, sl->logits, g_inf.cb_Kdim, g_inf.cb_Nvocab);
+    }
+
+    [enc endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+
+    if (hiddenOut && layerEnd < nLayers) {
+        memcpy(hiddenOut, ((__bridge id<MTLBuffer>)sl->hidden).contents, dim * sizeof(float));
+    }
+    if (logitsOut && layerEnd >= nLayers) {
+        memcpy(logitsOut, ((__bridge id<MTLBuffer>)sl->logits).contents, vocabSize * sizeof(float));
+    }
+    return 0;
+}
+
+// Convenience: partial step on slot 0.
+int mtl_fused_partial_step(const float* hiddenIn, int pos,
+                           int layerStart, int layerEnd,
+                           float* hiddenOut, float* logitsOut) {
+    return mtl_fused_partial_step_slot(0, hiddenIn, pos, layerStart, layerEnd, hiddenOut, logitsOut);
+}
+
 #undef PS
 #undef BUF
 #undef BUFO
@@ -6044,13 +6202,3 @@ int mtl_fused_step(const float* hiddenIn, const float* cosData, const float* sin
 #undef DTG
 #undef BARRIER
 #undef MV
-
-// Reset KV cache — zero all layers. Call between conversations.
-void mtl_fused_reset_kv(void) {
-    if (!g_inf.built) return;
-    int kvDim = g_inf.kvDim, maxSeq = g_inf.maxSeq;
-    for (int l = 0; l < g_inf.nLayers; l++) {
-        memset(((__bridge id<MTLBuffer>)g_inf.kCache[l]).contents, 0, maxSeq * kvDim * sizeof(float));
-        memset(((__bridge id<MTLBuffer>)g_inf.vCache[l]).contents, 0, maxSeq * kvDim * sizeof(float));
-    }
-}

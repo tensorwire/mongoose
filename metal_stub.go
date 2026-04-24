@@ -56,6 +56,10 @@ func (m *Metal) FusedNumWeights() int { return 0 }
 func (m *Metal) FusedSetWeight(idx int, data []float32) int { return -1 }
 func (m *Metal) FusedStep(hidden []float32, cosSlice, sinSlice []float32, pos int, logitsOut []float32) int { return -1 }
 func (m *Metal) FusedResetKV() {}
+func (m *Metal) FusedResetKVSlot(slot int) {}
+func (m *Metal) FusedNumSlots() int { return 0 }
+func (m *Metal) FusedPartialStep(hiddenIn []float32, pos, layerStart, layerEnd int, hiddenOut, logitsOut []float32) int { return -1 }
+func (m *Metal) FusedPartialStepSlot(slot int, hiddenIn []float32, pos, layerStart, layerEnd int, hiddenOut, logitsOut []float32) int { return -1 }
 func (m *Metal) BuildFusedInfer(dim, kvDim, headDim, nHeads, nKVHeads, ffnDim, vocabSize, nLayers, maxSeq int, ropeTheta float64) int { return -1 }
 func (m *Metal) FusedInferNumWeights() int { return 0 }
 func (m *Metal) FusedInferSetWeight(idx int, data []float32) int { return -1 }

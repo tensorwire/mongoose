@@ -71,6 +71,14 @@ int mtl_fused_set_weight(int idx, const float* data, int nFloats);
 int mtl_fused_step(const float* hiddenIn, const float* cosData, const float* sinData,
                    int pos, float* logitsOut);
 void mtl_fused_reset_kv(void);
+void mtl_fused_reset_kv_slot(int slot);
+int mtl_fused_num_slots(void);
+int mtl_fused_partial_step(const float* hiddenIn, int pos,
+                           int layerStart, int layerEnd,
+                           float* hiddenOut, float* logitsOut);
+int mtl_fused_partial_step_slot(int slot, const float* hiddenIn, int pos,
+                                int layerStart, int layerEnd,
+                                float* hiddenOut, float* logitsOut);
 
 // Fused single-dispatch inference (MPSGraph — deprecated)
 int mtl_fused_infer_build(int dim, int kvDim, int headDim,
@@ -499,6 +507,40 @@ func (m *Metal) FusedStep(hidden []float32, cosSlice, sinSlice []float32, pos in
 
 func (m *Metal) FusedResetKV() {
 	C.mtl_fused_reset_kv()
+}
+
+func (m *Metal) FusedResetKVSlot(slot int) {
+	C.mtl_fused_reset_kv_slot(C.int(slot))
+}
+
+func (m *Metal) FusedNumSlots() int {
+	return int(C.mtl_fused_num_slots())
+}
+
+func (m *Metal) FusedPartialStep(hiddenIn []float32, pos, layerStart, layerEnd int, hiddenOut, logitsOut []float32) int {
+	var hOut, lOut *C.float
+	if hiddenOut != nil {
+		hOut = (*C.float)(unsafe.Pointer(&hiddenOut[0]))
+	}
+	if logitsOut != nil {
+		lOut = (*C.float)(unsafe.Pointer(&logitsOut[0]))
+	}
+	return int(C.mtl_fused_partial_step(
+		(*C.float)(unsafe.Pointer(&hiddenIn[0])), C.int(pos),
+		C.int(layerStart), C.int(layerEnd), hOut, lOut))
+}
+
+func (m *Metal) FusedPartialStepSlot(slot int, hiddenIn []float32, pos, layerStart, layerEnd int, hiddenOut, logitsOut []float32) int {
+	var hOut, lOut *C.float
+	if hiddenOut != nil {
+		hOut = (*C.float)(unsafe.Pointer(&hiddenOut[0]))
+	}
+	if logitsOut != nil {
+		lOut = (*C.float)(unsafe.Pointer(&logitsOut[0]))
+	}
+	return int(C.mtl_fused_partial_step_slot(C.int(slot),
+		(*C.float)(unsafe.Pointer(&hiddenIn[0])), C.int(pos),
+		C.int(layerStart), C.int(layerEnd), hOut, lOut))
 }
 
 func (m *Metal) BuildFusedInfer(dim, kvDim, headDim, nHeads, nKVHeads, ffnDim, vocabSize, nLayers, maxSeq int, ropeTheta float64) int {
