@@ -592,6 +592,10 @@ func (c *CUDA) ToHost(t *Tensor) []float32 {
 	return data
 }
 
+func (c *CUDA) DownloadRawBytes(src unsafe.Pointer, dst []byte) {
+	C.tw_gpu_download(unsafe.Pointer(&dst[0]), src, C.size_t(len(dst)))
+}
+
 func (c *CUDA) Release(t *Tensor) {
 	if t.device != nil {
 		cu := t.device.(*cuPtr)
@@ -932,6 +936,11 @@ func (c *CUDA) UploadRawBytes(dst *Tensor, data unsafe.Pointer, nBytes int) {
 func (c *CUDA) UploadSlice(dst *Tensor, offsetFloats int, data []float32) {
 	dstPtr := unsafe.Add(dst.device.(*cuPtr).ptr, offsetFloats*4)
 	C.tw_gpu_upload(dstPtr, unsafe.Pointer(&data[0]), C.size_t(len(data)*4))
+}
+
+func (c *CUDA) DownloadSlice(src *Tensor, offsetFloats int, dst []float32) {
+	srcPtr := unsafe.Add(src.device.(*cuPtr).ptr, offsetFloats*4)
+	C.tw_gpu_download(unsafe.Pointer(&dst[0]), srcPtr, C.size_t(len(dst)*4))
 }
 
 func (c *CUDA) AddT(a, b *Tensor) *Tensor {

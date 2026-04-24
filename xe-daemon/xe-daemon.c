@@ -168,6 +168,36 @@ static int init_arena_from_fd(int fd) {
 // Dispatch fused cross-entropy on the split arena.
 // logits + targets are in GO REGION (offsets < ARENA_HALF).
 // losses + grad are written to XE REGION (offsets >= ARENA_XE_START).
+// L0 shared memory buffers for cross-entropy (allocated on first use)
+static void* g_ce_logits = NULL;
+static void* g_ce_targets = NULL;
+static void* g_ce_losses = NULL;
+static void* g_ce_grad = NULL;
+static size_t g_ce_logits_bytes = 0;
+
+static int ensure_ce_buffers(uint32_t n_pos, uint32_t vocab_size) {
+    size_t logits_bytes = (size_t)n_pos * vocab_size * sizeof(float);
+    if (g_ce_logits && g_ce_logits_bytes >= logits_bytes) return 0;
+    if (g_ce_logits) { zeMemFree(g_context, g_ce_logits); g_ce_logits = NULL; }
+    if (g_ce_targets) { zeMemFree(g_context, g_ce_targets); g_ce_targets = NULL; }
+    if (g_ce_losses) { zeMemFree(g_context, g_ce_losses); g_ce_losses = NULL; }
+    if (g_ce_grad) { zeMemFree(g_context, g_ce_grad); g_ce_grad = NULL; }
+    ze_device_mem_alloc_desc_t devDesc = {.stype = ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC};
+    ze_host_mem_alloc_desc_t hostDesc = {.stype = ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC};
+    zeMemAllocShared(g_context, &devDesc, &hostDesc, logits_bytes, 64, g_device, &g_ce_logits);
+    zeMemAllocShared(g_context, &devDesc, &hostDesc, n_pos * sizeof(int), 64, g_device, &g_ce_targets);
+    zeMemAllocShared(g_context, &devDesc, &hostDesc, n_pos * sizeof(float), 64, g_device, &g_ce_losses);
+    zeMemAllocShared(g_context, &devDesc, &hostDesc, logits_bytes, 64, g_device, &g_ce_grad);
+    g_ce_logits_bytes = logits_bytes;
+    if (!g_ce_logits || !g_ce_targets || !g_ce_losses || !g_ce_grad) {
+        fprintf(stderr, "[xe-daemon] CE buffer alloc failed\n");
+        return -1;
+    }
+    fprintf(stderr, "[xe-daemon] CE L0 shared: %.1f MB\n",
+            (float)(logits_bytes*2 + n_pos*8) / (1024*1024));
+    return 0;
+}
+
 static int dispatch_cross_entropy(int kidx, uint32_t logits_off, uint32_t targets_off,
                                    uint32_t losses_off, uint32_t grad_off,
                                    uint32_t n_pos, uint32_t vocab_size, float inv_n) {
@@ -186,10 +216,19 @@ static int dispatch_cross_entropy(int kidx, uint32_t logits_off, uint32_t target
     memcpy(g_ce_logits, (char*)g_arena_base + logits_off, logits_bytes);
     memcpy(g_ce_targets, (char*)g_arena_base + targets_off, n_pos * sizeof(int));
 
-    int ret = dispatch_cross_entropy_direct(kidx, n_pos, vocab_size, inv_n);
-    if (ret != 0) return ret;
+    // Dispatch on L0 buffers
+    ze_kernel_handle_t k = g_kernels[kidx];
+    zeKernelSetGroupSize(k, 256, 1, 1);
+    zeKernelSetArgumentValue(k, 0, sizeof(void*), &g_ce_logits);
+    zeKernelSetArgumentValue(k, 1, sizeof(void*), &g_ce_targets);
+    zeKernelSetArgumentValue(k, 2, sizeof(void*), &g_ce_losses);
+    zeKernelSetArgumentValue(k, 3, sizeof(void*), &g_ce_grad);
+    zeKernelSetArgumentValue(k, 4, sizeof(uint32_t), &vocab_size);
+    zeKernelSetArgumentValue(k, 5, sizeof(float), &inv_n);
+    ze_group_count_t disp = {n_pos, 1, 1};
+    ze_result_t r = zeCommandListAppendLaunchKernel(g_cmdlist, k, &disp, NULL, 0, NULL);
+    if (r != 0) return (int)r;
 
-    // Sync and copy results back to arena
     zeCommandListHostSynchronize(g_cmdlist, UINT64_MAX);
     zeCommandListReset(g_cmdlist);
     memcpy((char*)g_arena_base + losses_off, g_ce_losses, n_pos * sizeof(float));

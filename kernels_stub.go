@@ -75,3 +75,5 @@ func KSiLUGateMulFP16(gatePtr, upPtr, outPtr unsafe.Pointer, n int) {}
 func KSiLUGateBackwardFP16(dOutPtr, gatePtr, upPtr, dGatePtr, dUpPtr unsafe.Pointer, n int) {}
 func NeedleSparseLoaded() bool                                                                    { return false }
 func KNeedleSparse(dataPtr, scalesPtr, cachePtr, momPtr, deltaPtr, hotIdxPtr unsafe.Pointer, signalScale, lr, beta1, wd float32, nHot, cols int) {}
+func NeedleInlineLoaded() bool { return false }
+func KNeedleInline(dataPtr, scalesPtr, cachePtr, momPtr, deltaPtr, maskPtr unsafe.Pointer, signalScale, lr, beta1, wd float32, n, cols int) {}

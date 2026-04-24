@@ -99,6 +99,8 @@ static fn_helix_needle      k_helix_needle = NULL;
 static fn_helix_needle_paired k_helix_needle_paired = NULL;
 typedef void (*fn_helix_needle_sparse)(void*, float*, float*, void*, void*, const int*, float, float, float, float, int, int, cudaStream_t);
 static fn_helix_needle_sparse k_helix_needle_sparse = NULL;
+typedef void (*fn_helix_needle_inline)(void*, float*, float*, void*, void*, const void*, float, float, float, float, int, int, cudaStream_t);
+static fn_helix_needle_inline k_helix_needle_inline = NULL;
 static fn_dequant_int8_fp16 k_dequant_int8_fp16 = NULL;
 static fn_dequant_int8_fp32 k_dequant_int8_fp32 = NULL;
 static fn_dequant_int8_delta k_dequant_int8_delta = NULL;
@@ -160,6 +162,7 @@ int tw_load_kernels(const char* path) {
     k_helix_needle        = (fn_helix_needle)dlsym(kernel_lib, "mongoose_helix_needle");
     k_helix_needle_paired = (fn_helix_needle_paired)dlsym(kernel_lib, "mongoose_helix_needle_paired");
     k_helix_needle_sparse = (fn_helix_needle_sparse)dlsym(kernel_lib, "mongoose_helix_needle_sparse");
+    k_helix_needle_inline = (fn_helix_needle_inline)dlsym(kernel_lib, "mongoose_helix_needle_inline");
     k_dequant_int8_fp16   = (fn_dequant_int8_fp16)dlsym(kernel_lib, "mongoose_dequant_int8_to_fp16");
     k_dequant_int8_fp32   = (fn_dequant_int8_fp32)dlsym(kernel_lib, "mongoose_dequant_int8_to_fp32");
     k_dequant_int8_delta  = (fn_dequant_int8_delta)dlsym(kernel_lib, "mongoose_dequant_int8_delta");
@@ -423,6 +426,15 @@ void tw_k_silu_gate_bwd_fp16(const void* dOut, const void* gate, const void* up,
 
 // Sparse needle: forward-only, conductor-driven
 int tw_helix_needle_sparse_loaded() { return k_helix_needle_sparse != NULL ? 1 : 0; }
+
+// Inline needle: forward-only, fires before each matmul
+int tw_helix_needle_inline_loaded() { return k_helix_needle_inline != NULL ? 1 : 0; }
+void tw_k_helix_needle_inline(void* data, float* scales, float* cache,
+    void* mom, void* delta, const void* mask,
+    float signalScale, float lr, float beta1, float wd, int n, int cols, void* stream) {
+    if (k_helix_needle_inline) k_helix_needle_inline(data, scales, cache, mom, delta, mask,
+        signalScale, lr, beta1, wd, n, cols, (cudaStream_t)stream);
+}
 void tw_k_helix_needle_sparse(void* data, float* scales, float* cache,
     void* mom, void* delta, const int* hotIdx,
     float signalScale, float lr, float beta1, float wd, int nHot, int cols, void* stream) {
@@ -900,4 +912,21 @@ func KNeedleSparse(dataPtr, scalesPtr, cachePtr, momPtr, deltaPtr, hotIdxPtr uns
 		momPtr, deltaPtr, (*C.int)(hotIdxPtr),
 		C.float(signalScale), C.float(lr), C.float(beta1),
 		C.float(wd), C.int(nHot), C.int(cols), nil)
+}
+
+// NeedleInlineLoaded returns true if the inline needle kernel is available.
+func NeedleInlineLoaded() bool {
+	return C.tw_helix_needle_inline_loaded() == 1
+}
+
+// KNeedleInline fires the forward-only inline needle on a weight matrix.
+// Updates FP32 cache in-place BEFORE the matmul reads it.
+// maskPtr: [rows] float — 0=frozen, >0 = compact_row+1
+// momPtr, deltaPtr: [nHotRows * cols] FP16 — compacted by mask
+func KNeedleInline(dataPtr, scalesPtr, cachePtr, momPtr, deltaPtr, maskPtr unsafe.Pointer,
+	signalScale, lr, beta1, wd float32, n, cols int) {
+	C.tw_k_helix_needle_inline(dataPtr, (*C.float)(scalesPtr), (*C.float)(cachePtr),
+		momPtr, deltaPtr, maskPtr,
+		C.float(signalScale), C.float(lr), C.float(beta1),
+		C.float(wd), C.int(n), C.int(cols), nil)
 }

@@ -1959,4 +1959,69 @@ void mongoose_helix_needle_sparse(
         signalScale, lr, beta1, wd, nHot, cols);
 }
 
+// === Inline needle: forward-only, updates FP32 cache before matmul ===
+// Dispatches over ALL elements (n = rows*cols), skips frozen rows via mask.
+// rowMask[row] = 0: frozen (skip). rowMask[row] > 0: compact_row + 1.
+// Momentum is compacted to [nHotRows * cols], indexed by compact row from mask.
+// FP32 cache updated in-place — the following matmul sees corrected weights.
+
+__global__ void helix_needle_inline_kernel(
+    int8_t* __restrict__ data_int8,
+    float* __restrict__ scales,
+    float* __restrict__ fp32_cache,
+    __half* __restrict__ mom,
+    __half* __restrict__ delta_buf,
+    const float* __restrict__ rowMask,
+    float signalScale,
+    float lr, float beta1,
+    float wd, int n, int cols
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    int row = i / cols;
+    int col = i % cols;
+    float maskVal = rowMask[row];
+    if (maskVal == 0.0f) return;
+    int compactRow = (int)(maskVal - 1.0f);
+    int ci = compactRow * cols + col;
+
+    float scale = scales[row] / 127.0f;
+    float mi = __half2float(mom[ci]);
+    float delta = __half2float(delta_buf[ci]);
+
+    float sg = mi * signalScale;
+    mi = beta1 * mi + (1.0f - beta1) * sg;
+    delta -= lr * (mi + wd * delta);
+
+    float bucket = scale;
+    if (delta > 0.5f * bucket || delta < -0.5f * bucket) {
+        float w = (float)data_int8[i] * scale + delta;
+        float qi = w / scale;
+        qi = fminf(fmaxf(qi, -127.0f), 127.0f);
+        float qi_r = rintf(qi);
+        data_int8[i] = (int8_t)qi_r;
+        delta = w - qi_r * scale;
+        fp32_cache[i] = qi_r * scale + delta;
+    } else {
+        fp32_cache[i] = (float)data_int8[i] * scale + delta;
+    }
+
+    mom[ci] = __float2half(mi);
+    delta_buf[ci] = __float2half(delta);
+}
+
+void mongoose_helix_needle_inline(
+    void* data_int8, float* scales, float* fp32_cache,
+    void* mom, void* delta_buf, const void* mask,
+    float signalScale, float lr, float beta1,
+    float wd, int n, int cols, cudaStream_t stream
+) {
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    helix_needle_inline_kernel<<<blocks, threads, 0, stream>>>(
+        (int8_t*)data_int8, scales, fp32_cache,
+        (__half*)mom, (__half*)delta_buf, (const float*)mask,
+        signalScale, lr, beta1, wd, n, cols);
+}
+
 } // extern "C"

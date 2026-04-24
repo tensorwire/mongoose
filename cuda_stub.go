@@ -61,6 +61,8 @@ func (c *CUDA) CopyT(src *Tensor) *Tensor                       { return nil }
 func (c *CUDA) CopyInto(dst, src *Tensor)                       {}
 func (c *CUDA) UploadInto(dst *Tensor, data []float32)           {}
 func (c *CUDA) UploadSlice(dst *Tensor, offsetFloats int, data []float32) {}
+func (c *CUDA) DownloadSlice(src *Tensor, offsetFloats int, dst []float32) {}
+func (c *CUDA) DownloadRawBytes(src unsafe.Pointer, dst []byte)            {}
 func (c *CUDA) ZerosBF16(shape []int) *Tensor                   { return nil }
 
 // INT8 stubs
