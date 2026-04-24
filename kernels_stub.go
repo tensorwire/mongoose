@@ -49,6 +49,8 @@ func SoftmaxCELoaded() bool { return false }
 func DequantKernelsLoaded() bool { return false }
 func KDequantInt8ToFP16(dataPtr, scalesPtr, outPtr unsafe.Pointer, rows, cols int) {}
 func KDequantInt8ToFP32(dataPtr, scalesPtr, outPtr unsafe.Pointer, rows, cols int) {}
+func KRequantFP32ToInt8(fp32Ptr, dataPtr, scalesPtr unsafe.Pointer, rows, cols int) {}
+func AdamWLoaded() bool { return false }
 func KDequantInt8DeltaToFP32(dataPtr, scalesPtr, deltaPtr, outPtr unsafe.Pointer, n, cols int) {}
 func KFP32ToFP16(inPtr, outPtr unsafe.Pointer, n int) {}
 func KFP16ToFP32(inPtr, outPtr unsafe.Pointer, n int) {}

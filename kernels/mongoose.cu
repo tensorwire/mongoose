@@ -1495,6 +1495,62 @@ void mongoose_dequant_int8_to_fp32(
         (const int8_t*)data_int8, scales, out_fp32, rows, cols);
 }
 
+// === Requant FP32 back to INT8: per-row absmax scaling ===
+// One block per row. Threads find absmax, compute scale, quantize.
+
+__global__ void requant_fp32_to_int8_kernel(
+    const float* fp32, int8_t* data_int8, float* scales,
+    int rows, int cols
+) {
+    int row = blockIdx.x;
+    if (row >= rows) return;
+    const float* src = fp32 + row * cols;
+    int8_t* dst = data_int8 + row * cols;
+
+    __shared__ float shared_max[32];
+    float local_max = 0.0f;
+    for (int j = threadIdx.x; j < cols; j += blockDim.x) {
+        float v = fabsf(src[j]);
+        if (v > local_max) local_max = v;
+    }
+    for (int offset = warpSize/2; offset > 0; offset /= 2)
+        local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
+    int lane = threadIdx.x % warpSize;
+    int wid = threadIdx.x / warpSize;
+    if (lane == 0) shared_max[wid] = local_max;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int nWarps = (blockDim.x + warpSize - 1) / warpSize;
+        float mx = 0.0f;
+        for (int i = 0; i < nWarps; i++) mx = fmaxf(mx, shared_max[i]);
+        shared_max[0] = mx;
+    }
+    __syncthreads();
+
+    float absmax = shared_max[0];
+    scales[row] = absmax;
+    if (absmax == 0.0f) {
+        for (int j = threadIdx.x; j < cols; j += blockDim.x)
+            dst[j] = 0;
+        return;
+    }
+    float inv_scale = 127.0f / absmax;
+    for (int j = threadIdx.x; j < cols; j += blockDim.x) {
+        float q = src[j] * inv_scale;
+        q = fminf(fmaxf(q, -127.0f), 127.0f);
+        dst[j] = (int8_t)rintf(q);
+    }
+}
+
+void mongoose_requant_fp32_to_int8(
+    const float* fp32, void* data_int8, float* scales,
+    int rows, int cols, cudaStream_t stream
+) {
+    int threads = cols < 256 ? cols : 256;
+    requant_fp32_to_int8_kernel<<<rows, threads, 0, stream>>>(
+        fp32, (int8_t*)data_int8, scales, rows, cols);
+}
+
 // === Fused Q8 matvec: out[row] = sum_k(act[k] * int8_weight[row,k] * scale[row]/127) ===
 // One block per output row. Threads cooperatively reduce the dot product.
 __global__ void q8_matvec_kernel(

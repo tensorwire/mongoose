@@ -86,6 +86,7 @@ func (c *CUDA) FromHostInt8(qt *QuantizedTensor) *Int8Tensor     { return nil }
 func (c *CUDA) ReleaseInt8(q *Int8Tensor)                        {}
 func (c *CUDA) DequantToFP16(q *Int8Tensor, fp16Buf unsafe.Pointer) {}
 func (c *CUDA) DequantToFP32(q *Int8Tensor, fp32Buf unsafe.Pointer) {}
+func (c *CUDA) RequantToInt8(q *Int8Tensor, fp32Buf unsafe.Pointer) {}
 func (c *CUDA) AllocGPU(bytes int) unsafe.Pointer                   { return nil }
 func (c *CUDA) UploadRaw(dst *Tensor, data []int8)                  {}
 func (c *CUDA) UploadRawBytes(dst *Tensor, data unsafe.Pointer, nBytes int) {}

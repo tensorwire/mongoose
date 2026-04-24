@@ -1045,6 +1045,10 @@ func (c *CUDA) DequantToFP32(q *Int8Tensor, fp32Buf unsafe.Pointer) {
 	KDequantInt8ToFP32(q.DataPtr, q.ScalePtr, fp32Buf, q.Rows, q.Cols)
 }
 
+func (c *CUDA) RequantToInt8(q *Int8Tensor, fp32Buf unsafe.Pointer) {
+	KRequantFP32ToInt8(fp32Buf, q.DataPtr, q.ScalePtr, q.Rows, q.Cols)
+}
+
 func (c *CUDA) AllocFP16Buffer(nElements int) unsafe.Pointer {
 	return C.tw_gpu_alloc(C.size_t(nElements * 2))
 }

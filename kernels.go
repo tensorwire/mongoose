@@ -43,6 +43,7 @@ typedef void (*fn_helix_needle)(void*, float*, const float*, void*, void*, const
 typedef void (*fn_helix_needle_paired)(void*, void*, float*, float*, const float*, const float*, void*, void*, void*, void*, const void*, float, float, float, float, float, float, float, float, float, float, float, float, float, float, int, int, cudaStream_t);
 typedef void (*fn_dequant_int8_fp16)(const void*, const float*, void*, int, int, cudaStream_t);
 typedef void (*fn_dequant_int8_fp32)(const void*, const float*, float*, int, int, cudaStream_t);
+typedef void (*fn_requant_fp32_int8)(const float*, void*, float*, int, int, cudaStream_t);
 typedef void (*fn_dequant_int8_delta)(const void*, const float*, const float*, float*, int, int, cudaStream_t);
 typedef void (*fn_fp32_to_fp16)(const float*, void*, int, cudaStream_t);
 typedef void (*fn_fp16_to_fp32)(const void*, float*, int, cudaStream_t);
@@ -103,6 +104,7 @@ typedef void (*fn_helix_needle_inline)(void*, float*, float*, void*, void*, cons
 static fn_helix_needle_inline k_helix_needle_inline = NULL;
 static fn_dequant_int8_fp16 k_dequant_int8_fp16 = NULL;
 static fn_dequant_int8_fp32 k_dequant_int8_fp32 = NULL;
+static fn_requant_fp32_int8 k_requant_fp32_int8 = NULL;
 static fn_dequant_int8_delta k_dequant_int8_delta = NULL;
 static fn_fp32_to_fp16     k_fp32_to_fp16 = NULL;
 static fn_fp16_to_fp32     k_fp16_to_fp32 = NULL;
@@ -165,6 +167,7 @@ int tw_load_kernels(const char* path) {
     k_helix_needle_inline = (fn_helix_needle_inline)dlsym(kernel_lib, "mongoose_helix_needle_inline");
     k_dequant_int8_fp16   = (fn_dequant_int8_fp16)dlsym(kernel_lib, "mongoose_dequant_int8_to_fp16");
     k_dequant_int8_fp32   = (fn_dequant_int8_fp32)dlsym(kernel_lib, "mongoose_dequant_int8_to_fp32");
+    k_requant_fp32_int8   = (fn_requant_fp32_int8)dlsym(kernel_lib, "mongoose_requant_fp32_to_int8");
     k_dequant_int8_delta  = (fn_dequant_int8_delta)dlsym(kernel_lib, "mongoose_dequant_int8_delta");
     k_fp32_to_fp16        = (fn_fp32_to_fp16)dlsym(kernel_lib, "mongoose_fp32_to_fp16");
     k_fp16_to_fp32        = (fn_fp16_to_fp32)dlsym(kernel_lib, "mongoose_fp16_to_fp32");
@@ -370,6 +373,9 @@ void tw_k_dequant_int8_delta(const void* data, const float* scales, const float*
 }
 void tw_k_dequant_int8_fp32(const void* data, const float* scales, float* out, int rows, int cols) {
     if (k_dequant_int8_fp32) k_dequant_int8_fp32(data, scales, out, rows, cols, 0);
+}
+void tw_k_requant_fp32_int8(const float* fp32, void* data, float* scales, int rows, int cols) {
+    if (k_requant_fp32_int8) k_requant_fp32_int8(fp32, data, scales, rows, cols, 0);
 }
 void tw_k_fp32_to_fp16(const float* in, void* out, int n) {
     if (k_fp32_to_fp16) k_fp32_to_fp16(in, out, n, 0);
@@ -826,6 +832,14 @@ func KDequantInt8DeltaToFP32(dataPtr, scalesPtr, deltaPtr, outPtr unsafe.Pointer
 
 func KDequantInt8ToFP32(dataPtr, scalesPtr, outPtr unsafe.Pointer, rows, cols int) {
 	C.tw_k_dequant_int8_fp32(dataPtr, (*C.float)(scalesPtr), (*C.float)(outPtr), C.int(rows), C.int(cols))
+}
+
+func KRequantFP32ToInt8(fp32Ptr, dataPtr, scalesPtr unsafe.Pointer, rows, cols int) {
+	C.tw_k_requant_fp32_int8((*C.float)(fp32Ptr), dataPtr, (*C.float)(scalesPtr), C.int(rows), C.int(cols))
+}
+
+func AdamWLoaded() bool {
+	return C.tw_train_kernels_loaded() == 1
 }
 
 // KFP32ToFP16 converts FP32 tensor to FP16 on GPU. For mixed-precision matmul input prep.
