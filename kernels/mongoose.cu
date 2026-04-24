@@ -1894,7 +1894,12 @@ void mongoose_silu_gate_backward_fp16(
         (__half*)dGate, (__half*)dUp, n);
 }
 
-// === Sparse needle: forward-only INT8 update on conductor hot rows ===
+// === Sparse needle: per-weight update on conductor hot positions ===
+// hotIdx[i] = flat position index into data_int8 / fp32_cache / grad.
+// nHot threads — one per individual weight position.
+// mom/delta compacted to [nHot], indexed by thread ID.
+// grad is the full-size gradient buffer — read at hotIdx[tid] for real per-weight gradient.
+// If grad is NULL, falls back to signalScale * momentum (forward-only mode).
 
 __global__ void helix_needle_sparse_kernel(
     int8_t* __restrict__ data_int8,
@@ -1903,59 +1908,56 @@ __global__ void helix_needle_sparse_kernel(
     __half* __restrict__ mom,
     __half* __restrict__ delta_buf,
     const int* __restrict__ hotIdx,
+    const float* __restrict__ grad,
     float signalScale,
     float lr, float beta1,
     float wd, int nHot, int cols
 ) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= nHot * cols) return;
-    int hotPos = tid / cols;
-    int col = tid % cols;
+    if (tid >= nHot) return;
 
-    int row = hotIdx[hotPos];
-    int wi = row * cols + col;
-    int ci = hotPos * cols + col;
+    int wi = hotIdx[tid];
+    int row = wi / cols;
 
     float scale = scales[row] / 127.0f;
-    float mi = __half2float(mom[ci]);
-    float delta = __half2float(delta_buf[ci]);
+    float mi = __half2float(mom[tid]);
+    float delta = __half2float(delta_buf[tid]);
 
-    float sg = mi * signalScale;
-
-    mi = beta1 * mi + (1.0f - beta1) * sg;
-
+    float g = (grad != NULL) ? grad[wi] : mi * signalScale;
+    mi = beta1 * mi + (1.0f - beta1) * g;
     delta -= lr * (mi + wd * delta);
 
-    float bucket = scale;
-    if (delta > 0.5f * bucket || delta < -0.5f * bucket) {
-        float w = (float)data_int8[wi] * scale + delta;
-        float qi = w / scale;
-        qi = fminf(fmaxf(qi, -127.0f), 127.0f);
-        float qi_r = rintf(qi);
-        data_int8[wi] = (int8_t)qi_r;
-        delta = w - qi_r * scale;
-        fp32_cache[wi] = qi_r * scale + delta;
-    } else {
-        fp32_cache[wi] = (float)data_int8[wi] * scale + delta;
+    if (fp32_cache != NULL) {
+        float bucket = scale;
+        if (delta > 0.5f * bucket || delta < -0.5f * bucket) {
+            float w = (float)data_int8[wi] * scale + delta;
+            float qi = w / scale;
+            qi = fminf(fmaxf(qi, -127.0f), 127.0f);
+            float qi_r = rintf(qi);
+            data_int8[wi] = (int8_t)qi_r;
+            delta = w - qi_r * scale;
+            fp32_cache[wi] = qi_r * scale + delta;
+        } else {
+            fp32_cache[wi] = (float)data_int8[wi] * scale + delta;
+        }
     }
 
-    mom[ci] = __float2half(mi);
-    delta_buf[ci] = __float2half(delta);
+    mom[tid] = __float2half(mi);
+    delta_buf[tid] = __float2half(delta);
 }
 
 void mongoose_helix_needle_sparse(
     void* data_int8, float* scales, float* fp32_cache,
-    void* mom, void* delta_buf, const int* hotIdx,
+    void* mom, void* delta_buf, const int* hotIdx, const float* grad,
     float signalScale, float lr, float beta1,
     float wd, int nHot, int cols, cudaStream_t stream
 ) {
     if (nHot <= 0) return;
-    int total = nHot * cols;
     int threads = 256;
-    int blocks = (total + threads - 1) / threads;
+    int blocks = (nHot + threads - 1) / threads;
     helix_needle_sparse_kernel<<<blocks, threads, 0, stream>>>(
         (int8_t*)data_int8, scales, fp32_cache,
-        (__half*)mom, (__half*)delta_buf, hotIdx,
+        (__half*)mom, (__half*)delta_buf, hotIdx, grad,
         signalScale, lr, beta1, wd, nHot, cols);
 }
 

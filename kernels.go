@@ -97,7 +97,7 @@ static fn_softmax_ce        k_softmax_ce = NULL;
 static fn_helix_dna_step    k_helix_dna_step = NULL;
 static fn_helix_needle      k_helix_needle = NULL;
 static fn_helix_needle_paired k_helix_needle_paired = NULL;
-typedef void (*fn_helix_needle_sparse)(void*, float*, float*, void*, void*, const int*, float, float, float, float, int, int, cudaStream_t);
+typedef void (*fn_helix_needle_sparse)(void*, float*, float*, void*, void*, const int*, const float*, float, float, float, float, int, int, cudaStream_t);
 static fn_helix_needle_sparse k_helix_needle_sparse = NULL;
 typedef void (*fn_helix_needle_inline)(void*, float*, float*, void*, void*, const void*, float, float, float, float, int, int, cudaStream_t);
 static fn_helix_needle_inline k_helix_needle_inline = NULL;
@@ -436,9 +436,9 @@ void tw_k_helix_needle_inline(void* data, float* scales, float* cache,
         signalScale, lr, beta1, wd, n, cols, (cudaStream_t)stream);
 }
 void tw_k_helix_needle_sparse(void* data, float* scales, float* cache,
-    void* mom, void* delta, const int* hotIdx,
+    void* mom, void* delta, const int* hotIdx, const float* grad,
     float signalScale, float lr, float beta1, float wd, int nHot, int cols, void* stream) {
-    if (k_helix_needle_sparse) k_helix_needle_sparse(data, scales, cache, mom, delta, hotIdx,
+    if (k_helix_needle_sparse) k_helix_needle_sparse(data, scales, cache, mom, delta, hotIdx, grad,
         signalScale, lr, beta1, wd, nHot, cols, (cudaStream_t)stream);
 }
 */
@@ -903,13 +903,14 @@ func NeedleSparseLoaded() bool {
 	return C.tw_helix_needle_sparse_loaded() == 1
 }
 
-// KNeedleSparse fires the forward-only sparse needle on conductor hot rows.
-// Uses signalScale (from helix ForwardOnlyStep) instead of explicit gradients.
-// Only touches nHot rows — conductor-driven sparsity.
-func KNeedleSparse(dataPtr, scalesPtr, cachePtr, momPtr, deltaPtr, hotIdxPtr unsafe.Pointer,
+// KNeedleSparse fires the sparse needle on conductor hot positions.
+// If gradPtr is non-nil, reads real per-weight gradients from grad[hotIdx[i]].
+// If gradPtr is nil, uses signalScale * momentum as synthetic gradient (forward-only).
+// Only touches nHot positions — conductor-driven sparsity.
+func KNeedleSparse(dataPtr, scalesPtr, cachePtr, momPtr, deltaPtr, hotIdxPtr, gradPtr unsafe.Pointer,
 	signalScale, lr, beta1, wd float32, nHot, cols int) {
 	C.tw_k_helix_needle_sparse(dataPtr, (*C.float)(scalesPtr), (*C.float)(cachePtr),
-		momPtr, deltaPtr, (*C.int)(hotIdxPtr),
+		momPtr, deltaPtr, (*C.int)(hotIdxPtr), (*C.float)(gradPtr),
 		C.float(signalScale), C.float(lr), C.float(beta1),
 		C.float(wd), C.int(nHot), C.int(cols), nil)
 }
