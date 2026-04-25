@@ -1844,6 +1844,38 @@ static NSString* const g_kernel_source = @"\n"
 "    }\n"
 "}\n"
 "\n"
+"// RMSNorm out-of-place: output = rmsnorm(input, w). Input NOT modified.\n"
+"kernel void rmsnorm_out(\n"
+"    device const float* input  [[buffer(0)]],   // [n, dim] read-only\n"
+"    device float* output       [[buffer(1)]],   // [n, dim] written\n"
+"    device const float* w      [[buffer(2)]],   // [dim] weights\n"
+"    device const uint* dim     [[buffer(3)]],\n"
+"    device const float* eps    [[buffer(4)]],\n"
+"    uint pos [[threadgroup_position_in_grid]],\n"
+"    uint tid [[thread_index_in_threadgroup]],\n"
+"    uint tpg [[threads_per_threadgroup]])\n"
+"{\n"
+"    uint off = pos * dim[0];\n"
+"    float localSS = 0.0f;\n"
+"    for (uint i = tid; i < dim[0]; i += tpg) localSS += input[off + i] * input[off + i];\n"
+"    localSS = simd_sum(localSS);\n"
+"    threadgroup float shared_ss[32];\n"
+"    uint lane = tid % 32, warp = tid / 32;\n"
+"    if (lane == 0) shared_ss[warp] = localSS;\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    if (warp == 0) {\n"
+"        localSS = (lane < (tpg + 31) / 32) ? shared_ss[lane] : 0.0f;\n"
+"        localSS = simd_sum(localSS);\n"
+"    }\n"
+"    threadgroup float finalSS;\n"
+"    if (tid == 0) finalSS = localSS;\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    float rms = 1.0f / sqrt(finalSS / float(dim[0]) + eps[0]);\n"
+"    for (uint i = tid; i < dim[0]; i += tpg) {\n"
+"        output[off + i] = input[off + i] * rms * w[i];\n"
+"    }\n"
+"}\n"
+"\n"
 "// RMSNorm backward: dx = rmsScale * w * dOut - dot * xIn\n"
 "// where dot = sum(dOut * w * xIn) * rmsScale^3 / dim.\n"
 "// One threadgroup per position. Cooperative reduction for dot product.\n"
@@ -2153,6 +2185,7 @@ static id<MTLComputePipelineState> g_ps_gemm4f_nn = nil;
 static id<MTLComputePipelineState> g_ps_gemm4f_tn = nil;
 static bool g_use_metal4_gemm = false;
 static id<MTLComputePipelineState> g_ps_rmsnorm_save = nil;
+static id<MTLComputePipelineState> g_ps_rmsnorm_out = nil;
 static id<MTLComputePipelineState> g_ps_fused_attn = nil;
 static id<MTLComputePipelineState> g_ps_fused_attn_bwd = nil;
 static id<MTLComputePipelineState> g_ps_bias_add = nil;
@@ -2255,6 +2288,7 @@ int mtl_init_compute(void) {
     g_ps_gemm_nn = make_ps(@"gemm_nn");
     g_ps_gemm_tn_sparse = make_ps(@"gemm_tn_sparse");
     g_ps_rmsnorm_save = make_ps(@"rmsnorm_save");
+    g_ps_rmsnorm_out = make_ps(@"rmsnorm_out");
     g_ps_fused_attn = make_ps(@"fused_causal_attention");
     g_ps_fused_attn_bwd = make_ps(@"fused_causal_attention_backward");
     g_ps_bias_add = make_ps(@"bias_add");
@@ -5469,11 +5503,13 @@ static NSString* g_infer_kernel_src =
 "using namespace metal;\n"
 "\n"
 "// Q8 matvec: 4 rows per threadgroup, 256 threads (8 simdgroups).\n"
-"// Each simdgroup handles 1 row, 2 simdgroups share activation loads.\n"
-"// Per-row scale, contiguous int8 weights.\n"
+"// Q8 matvec: 4 rows per threadgroup, 2 simdgroups per row.\n"
+"// Each pair of simdgroups processes 2 adjacent rows sharing activation loads.\n"
+"// Q8 matvec: 4 rows per threadgroup, 2 simdgroups per row.\n"
+"// Per-row scale, contiguous int8 weights. Vectorized char4 loads.\n"
 "kernel void q8_matvec(\n"
 "    device const float* act    [[buffer(0)]],  // [K]\n"
-"    device const int8_t* weight [[buffer(1)]],  // [N, K] int8\n"
+"    device const char4* weight [[buffer(1)]],  // [N, K] int8, read as char4\n"
 "    device const float* scales [[buffer(2)]],  // [N]\n"
 "    device float* out          [[buffer(3)]],  // [N]\n"
 "    device const uint* p_K     [[buffer(4)]],\n"
@@ -5483,21 +5519,21 @@ static NSString* g_infer_kernel_src =
 "    ushort sgitg [[simdgroup_index_in_threadgroup]])\n"
 "{\n"
 "    uint K = p_K[0], N = p_N[0];\n"
-"    // 4 rows per threadgroup, 2 simdgroups per row\n"
 "    uint row = tgid * 4 + sgitg / 2;\n"
 "    if (row >= N) return;\n"
-"    ushort half_sg = sgitg % 2;  // which half of the row\n"
-"    uint wOff = row * K;\n"
+"    ushort half_sg = sgitg % 2;\n"
+"    uint K4 = K / 4;\n"
+"    device const char4* wRow = weight + row * K4;\n"
+"    device const float4* act4 = (device const float4*)act;\n"
 "    float sum = 0.0f;\n"
 "    uint tid_in_row = half_sg * 32 + tiisg;\n"
-"    for (uint k = tid_in_row * 4; k + 3 < K; k += 256) {\n"
-"        float4 a = float4(act[k], act[k+1], act[k+2], act[k+3]);\n"
-"        sum += a.x * weight[wOff+k] + a.y * weight[wOff+k+1] + a.z * weight[wOff+k+2] + a.w * weight[wOff+k+3];\n"
+"    for (uint k4 = tid_in_row; k4 < K4; k4 += 64) {\n"
+"        float4 a = act4[k4];\n"
+"        char4 w = wRow[k4];\n"
+"        sum += a.x * w.x + a.y * w.y + a.z * w.z + a.w * w.w;\n"
 "    }\n"
 "    sum *= scales[row];\n"
-"    // Reduce within simdgroup\n"
 "    sum = simd_sum(sum);\n"
-"    // Cross-simdgroup reduce (2 simdgroups per row)\n"
 "    threadgroup float shmem[8];\n"
 "    if (tiisg == 0) shmem[sgitg] = sum;\n"
 "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
@@ -5506,63 +5542,47 @@ static NSString* g_infer_kernel_src =
 "    }\n"
 "}\n"
 "\n"
-"// Q4_0 matvec: ggml block format. NR0=4 rows/simdgroup, NQ=16, 32 threads.\n"
+"// Q4_0 matvec: block_q4_0 format. 4 rows/tg, 2 simdgroups per row.\n"
 "// block_q4_0: { half d; uint8_t qs[16]; } = 18 bytes per 32 elements.\n"
-"// Pre-scaled activation trick from llama.cpp: fold nibble positions into yl.\n"
+"// qs[j] = elem[2j] | (elem[2j+1] << 4). Sequential nibble pairs.\n"
 "struct block_q4_0 { half d; uchar qs[16]; };\n"
-"inline float bq4_dot_y(device const block_q4_0* qb, float sumy, thread float* yl, int il) {\n"
-"    float d = float(qb->d);\n"
-"    float acc0=0, acc1=0, acc2=0, acc3=0;\n"
-"    uint qs_off = il/2;\n"
-"    for (int i = 0; i < 8; i += 2) {\n"
-"        ushort v = ((device const ushort*)(qb->qs))[qs_off + i/2];\n"
-"        acc0 += yl[i+0] * (v & 0x000F);\n"
-"        acc1 += yl[i+1] * (v & 0x0F00);\n"
-"        acc2 += yl[i+8] * (v & 0x00F0);\n"
-"        acc3 += yl[i+9] * (v & 0xF000);\n"
-"    }\n"
-"    return d * (sumy * -8.0f + acc0 + acc1 + acc2 + acc3);\n"
-"}\n"
 "kernel void q4_matvec(\n"
 "    device const float* act     [[buffer(0)]],\n"
-"    device const uchar* weight  [[buffer(1)]],  // block_q4_0 format\n"
+"    device const uchar* weight  [[buffer(1)]],  // block_q4_0 packed\n"
 "    device float* out           [[buffer(2)]],\n"
 "    device const uint* p_K      [[buffer(3)]],\n"
 "    device const uint* p_N      [[buffer(4)]],\n"
-"    uint3 tgpig [[threadgroup_position_in_grid]],\n"
+"    uint tgid [[threadgroup_position_in_grid]],\n"
 "    ushort tiisg [[thread_index_in_simdgroup]],\n"
 "    ushort sgitg [[simdgroup_index_in_threadgroup]])\n"
 "{\n"
 "    uint K = p_K[0], N = p_N[0];\n"
-"    const uint QK = 32;\n"
-"    const short NR0 = 4;\n"
-"    const short NQ = 16;\n"
-"    uint nb = K / QK;\n"
-"    uint r0 = (tgpig.x * 2 + sgitg) * NR0;\n"
-"    if (r0 >= N) return;\n"
-"    float sumf[4] = {0,0,0,0};\n"
-"    short ix = tiisg / 2;\n"
-"    short il = (tiisg % 2) * 8;\n"
-"    uint ib0 = ix;\n"
-"    uint yOff = ib0 * QK + il;\n"
-"    for (uint ib = ib0; ib < nb; ib += NQ) {\n"
-"        float sumy[2] = {0,0};\n"
-"        float yl[16];\n"
-"        for (short i = 0; i < 8; i += 2) {\n"
-"            sumy[0] += act[yOff+i] + act[yOff+i+1];\n"
-"            yl[i]   = act[yOff+i];\n"
-"            yl[i+1] = act[yOff+i+1] / 256.0f;\n"
-"            sumy[1] += act[yOff+i+16] + act[yOff+i+17];\n"
-"            yl[i+8] = act[yOff+i+16] / 16.0f;\n"
-"            yl[i+9] = act[yOff+i+17] / 4096.0f;\n"
+"    uint nb = K / 32;\n"
+"    uint row = tgid * 4 + sgitg / 2;\n"
+"    if (row >= N) return;\n"
+"    ushort half_sg = sgitg % 2;\n"
+"    float sum = 0.0f;\n"
+"    uint tid_in_row = half_sg * 32 + tiisg;  // 0..63\n"
+"    device const block_q4_0* wr = (device const block_q4_0*)(weight + row * nb * 18);\n"
+"    for (uint b = tid_in_row; b < nb; b += 64) {\n"
+"        float d = float(wr[b].d);\n"
+"        float s = 0.0f;\n"
+"        uint aOff = b * 32;\n"
+"        for (ushort j = 0; j < 16; j += 2) {\n"
+"            float4 a = *((device const float4*)(act + aOff + j*2));\n"
+"            uchar q0 = wr[b].qs[j];\n"
+"            uchar q1 = wr[b].qs[j+1];\n"
+"            s += a.x * ((q0 & 0xF) - 8) + a.y * ((q0 >> 4) - 8)\n"
+"               + a.z * ((q1 & 0xF) - 8) + a.w * ((q1 >> 4) - 8);\n"
 "        }\n"
-"        for (short row = 0; row < NR0 && r0+row < N; row++)\n"
-"            sumf[row] += bq4_dot_y((device const block_q4_0*)(weight + (r0+row)*nb*18) + ib, sumy[0]+sumy[1], yl, il);\n"
-"        yOff += QK * NQ;\n"
+"        sum += s * d;\n"
 "    }\n"
-"    for (short row = 0; row < NR0 && r0+row < N; row++) {\n"
-"        float tot = simd_sum(sumf[row]);\n"
-"        if (tiisg == 0) out[r0+row] = tot;\n"
+"    sum = simd_sum(sum);\n"
+"    threadgroup float shmem[8];\n"
+"    if (tiisg == 0) shmem[sgitg] = sum;\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    if (sgitg % 2 == 0 && tiisg == 0) {\n"
+"        out[row] = shmem[sgitg] + shmem[sgitg + 1];\n"
 "    }\n"
 "}\n"
 "\n"
@@ -5690,6 +5710,7 @@ static struct {
     id<MTLBuffer> cb_eps; id<MTLBuffer> cb_theta;
     id<MTLBuffer> cb_M1; id<MTLBuffer> cb_Kdim; id<MTLBuffer> cb_Nkvdim;
     id<MTLBuffer> cb_Nffn; id<MTLBuffer> cb_Nvocab;
+    id<MTLBuffer> cb_pos; id<MTLBuffer> cb_seq; // pre-allocated, written per token
 } g_inf = {0};
 
 static bool g_inf_use_q4 = false;
@@ -5896,6 +5917,7 @@ int mtl_fused_build(int dim, int kvDim, int headDim,
     g_inf.cb_eps=inf_constf(rmsEps); g_inf.cb_theta=inf_constf(ropeTheta);
     g_inf.cb_M1=inf_const(1); g_inf.cb_Kdim=inf_const(dim); g_inf.cb_Nkvdim=inf_const(kvDim);
     g_inf.cb_Nffn=inf_const(ffnDim); g_inf.cb_Nvocab=inf_const(vocabSize);
+    g_inf.cb_pos=inf_const(0); g_inf.cb_seq=inf_const(0);
 
     g_inf.built = true;
     return 0;
@@ -5950,7 +5972,7 @@ int mtl_fused_set_weight(int idx, const float* data, int nFloats) {
         DTG(((w).rows+31)/32, 1, 1, sw*4, 1, 1); \
     } else if ((w).q4) { \
         PS(g_ps_q4mv); BUF(act, 0); BUF((w).data, 1); BUF(out, 2); CB(cb_K, 3); CB(cb_N, 4); \
-        DTG(((w).rows + 7) / 8, 1, 1, 64, 1, 1); \
+        DTG(((w).rows + 3) / 4, 1, 1, 256, 1, 1); \
     } else { \
         PS(g_ps_q8mv); BUF(act, 0); BUF((w).data, 1); BUF((w).scales, 2); BUF(out, 3); CB(cb_K, 4); CB(cb_N, 5); \
         DTG(((w).rows + 3) / 4, 1, 1, 256, 1, 1); \
@@ -5968,12 +5990,12 @@ int mtl_fused_step(const float* hiddenIn, const float* cosData, const float* sin
     // Upload hidden
     memcpy(((__bridge id<MTLBuffer>)g_inf.hidden).contents, hiddenIn, dim * sizeof(float));
 
-    // Per-token constants
-    uint32_t upos = (uint32_t)pos, useq = (uint32_t)seqLen;
-    id<MTLBuffer> cb_pos = [g_device newBufferWithBytes:&upos length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> cb_seq = [g_device newBufferWithBytes:&useq length:4 options:MTLResourceStorageModeShared];
+    // Write per-token constants into pre-allocated buffers (no allocation)
+    ((uint32_t*)g_inf.cb_pos.contents)[0] = (uint32_t)pos;
+    ((uint32_t*)g_inf.cb_seq.contents)[0] = (uint32_t)seqLen;
+    id<MTLBuffer> cb_pos = g_inf.cb_pos;
+    id<MTLBuffer> cb_seq = g_inf.cb_seq;
 
-    // One command buffer, one encoder
     id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
 
@@ -5983,12 +6005,8 @@ int mtl_fused_step(const float* hiddenIn, const float* cosData, const float* sin
     for (int l = 0; l < nLayers; l++) {
         // --- Pre-attention: RMSNorm → QKV → bias → RoPE ---
 
-        // Copy hidden → normed
-        PS(g_ps_copy_mem); BUF(g_inf.hidden, 0); BUF(g_inf.normed, 1);
-        DT(dim,1,1, 256,1,1); BARRIER();
-
-        // RMSNorm normed in-place
-        PS(g_ps_rmsnorm_save); BUF(g_inf.normed, 0); BUF(g_inf.norm1[l], 1); BUF(g_inf.rmsScale, 2);
+        // RMSNorm out-of-place: normed = rmsnorm(hidden, norm1)
+        PS(g_ps_rmsnorm_out); BUF(g_inf.hidden, 0); BUF(g_inf.normed, 1); BUF(g_inf.norm1[l], 2);
         CB(g_inf.cb_dim, 3); CB(g_inf.cb_eps, 4); DTG(1,1,1, tpg_norm,1,1); BARRIER();
 
         // QKV matvecs (Q8 fused dequant)
@@ -6032,10 +6050,8 @@ int mtl_fused_step(const float* hiddenIn, const float* cosData, const float* sin
         PS(g_ps_add_inplace); BUF(g_inf.hidden, 0); BUF(g_inf.proj, 1);
         DT(dim,1,1, 256,1,1); BARRIER();
 
-        // Post-attn norm
-        PS(g_ps_copy_mem); BUF(g_inf.hidden, 0); BUF(g_inf.normed2, 1);
-        DT(dim,1,1, 256,1,1); BARRIER();
-        PS(g_ps_rmsnorm_save); BUF(g_inf.normed2, 0); BUF(g_inf.norm2[l], 1); BUF(g_inf.rmsScale2, 2);
+        // Post-attn norm: normed2 = rmsnorm(hidden, norm2)
+        PS(g_ps_rmsnorm_out); BUF(g_inf.hidden, 0); BUF(g_inf.normed2, 1); BUF(g_inf.norm2[l], 2);
         CB(g_inf.cb_dim, 3); CB(g_inf.cb_eps, 4); DTG(1,1,1, tpg_norm,1,1); BARRIER();
 
         // FFN
@@ -6101,9 +6117,10 @@ int mtl_fused_partial_step_slot(int slot, const float* hiddenIn, int pos,
 
     memcpy(((__bridge id<MTLBuffer>)sl->hidden).contents, hiddenIn, dim * sizeof(float));
 
-    uint32_t upos = (uint32_t)pos, useq = (uint32_t)seqLen;
-    id<MTLBuffer> cb_pos = [g_device newBufferWithBytes:&upos length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> cb_seq = [g_device newBufferWithBytes:&useq length:4 options:MTLResourceStorageModeShared];
+    ((uint32_t*)g_inf.cb_pos.contents)[0] = (uint32_t)pos;
+    ((uint32_t*)g_inf.cb_seq.contents)[0] = (uint32_t)seqLen;
+    id<MTLBuffer> cb_pos = g_inf.cb_pos;
+    id<MTLBuffer> cb_seq = g_inf.cb_seq;
 
     id<MTLCommandBuffer> cmd = [queue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
@@ -6273,9 +6290,10 @@ int mtl_stream_step_layer(int set, int layer, int pos) {
     int nHeads=g_inf.nHeads, nKVHeads=g_inf.nKVHeads, ffnDim=g_inf.ffnDim;
     int seqLen = pos + 1;
 
-    uint32_t upos = (uint32_t)pos, useq = (uint32_t)seqLen;
-    id<MTLBuffer> cb_pos = [g_device newBufferWithBytes:&upos length:4 options:MTLResourceStorageModeShared];
-    id<MTLBuffer> cb_seq = [g_device newBufferWithBytes:&useq length:4 options:MTLResourceStorageModeShared];
+    ((uint32_t*)g_inf.cb_pos.contents)[0] = (uint32_t)pos;
+    ((uint32_t*)g_inf.cb_seq.contents)[0] = (uint32_t)seqLen;
+    id<MTLBuffer> cb_pos = g_inf.cb_pos;
+    id<MTLBuffer> cb_seq = g_inf.cb_seq;
 
     id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];

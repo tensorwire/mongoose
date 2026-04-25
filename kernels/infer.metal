@@ -2,11 +2,11 @@
 using namespace metal;
 
 // Q8 matvec: 4 rows per threadgroup, 256 threads (8 simdgroups).
-// Each simdgroup handles 1 row, 2 simdgroups share activation loads.
-// Per-row scale, contiguous int8 weights.
+// 2 simdgroups per row. Per-row scale, contiguous int8 weights.
+// Vectorized char4 weight loads + float4 activation loads.
 kernel void q8_matvec(
     device const float* act    [[buffer(0)]],
-    device const int8_t* weight [[buffer(1)]],
+    device const char4* weight [[buffer(1)]],
     device const float* scales [[buffer(2)]],
     device float* out          [[buffer(3)]],
     device const uint* p_K     [[buffer(4)]],
@@ -19,12 +19,15 @@ kernel void q8_matvec(
     uint row = tgid * 4 + sgitg / 2;
     if (row >= N) return;
     ushort half_sg = sgitg % 2;
-    uint wOff = row * K;
+    uint K4 = K / 4;
+    device const char4* wRow = weight + row * K4;
+    device const float4* act4 = (device const float4*)act;
     float sum = 0.0f;
     uint tid_in_row = half_sg * 32 + tiisg;
-    for (uint k = tid_in_row * 4; k + 3 < K; k += 256) {
-        float4 a = float4(act[k], act[k+1], act[k+2], act[k+3]);
-        sum += a.x * weight[wOff+k] + a.y * weight[wOff+k+1] + a.z * weight[wOff+k+2] + a.w * weight[wOff+k+3];
+    for (uint k4 = tid_in_row; k4 < K4; k4 += 64) {
+        float4 a = act4[k4];
+        char4 w = wRow[k4];
+        sum += a.x * w.x + a.y * w.y + a.z * w.z + a.w * w.w;
     }
     sum *= scales[row];
     sum = simd_sum(sum);
@@ -36,63 +39,46 @@ kernel void q8_matvec(
     }
 }
 
+// Q4_0 matvec: block_q4_0 format. 4 rows/tg, 2 simdgroups per row.
+// qs[j] = elem[2j] | (elem[2j+1] << 4). Sequential nibble pairs.
 struct block_q4_0 { half d; uchar qs[16]; };
-
-inline float bq4_dot_y(device const block_q4_0* qb, float sumy, thread float* yl, int il) {
-    float d = float(qb->d);
-    float acc0=0, acc1=0, acc2=0, acc3=0;
-    uint qs_off = il/2;
-    for (int i = 0; i < 8; i += 2) {
-        ushort v = ((device const ushort*)(qb->qs))[qs_off + i/2];
-        acc0 += yl[i+0] * (v & 0x000F);
-        acc1 += yl[i+1] * (v & 0x0F00);
-        acc2 += yl[i+8] * (v & 0x00F0);
-        acc3 += yl[i+9] * (v & 0xF000);
-    }
-    return d * (sumy * -8.0f + acc0 + acc1 + acc2 + acc3);
-}
-
 kernel void q4_matvec(
     device const float* act     [[buffer(0)]],
     device const uchar* weight  [[buffer(1)]],
     device float* out           [[buffer(2)]],
     device const uint* p_K      [[buffer(3)]],
     device const uint* p_N      [[buffer(4)]],
-    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint tgid [[threadgroup_position_in_grid]],
     ushort tiisg [[thread_index_in_simdgroup]],
     ushort sgitg [[simdgroup_index_in_threadgroup]])
 {
     uint K = p_K[0], N = p_N[0];
-    const uint QK = 32;
-    const short NR0 = 4;
-    const short NQ = 16;
-    uint nb = K / QK;
-    uint r0 = (tgpig.x * 2 + sgitg) * NR0;
-    if (r0 >= N) return;
-    float sumf[4] = {0,0,0,0};
-    short ix = tiisg / 2;
-    short il = (tiisg % 2) * 8;
-    uint ib0 = ix;
-    uint yOff = ib0 * QK + il;
-    for (uint ib = ib0; ib < nb; ib += NQ) {
-        float sumy[2] = {0,0};
-        float yl[16];
-        for (short i = 0; i < 8; i += 2) {
-            sumy[0] += act[yOff+i] + act[yOff+i+1];
-            yl[i]   = act[yOff+i];
-            yl[i+1] = act[yOff+i+1] / 256.0f;
-            sumy[1] += act[yOff+i+16] + act[yOff+i+17];
-            yl[i+8] = act[yOff+i+16] / 16.0f;
-            yl[i+9] = act[yOff+i+17] / 4096.0f;
+    uint nb = K / 32;
+    uint row = tgid * 4 + sgitg / 2;
+    if (row >= N) return;
+    ushort half_sg = sgitg % 2;
+    float sum = 0.0f;
+    uint tid_in_row = half_sg * 32 + tiisg;
+    device const block_q4_0* wr = (device const block_q4_0*)(weight + row * nb * 18);
+    for (uint b = tid_in_row; b < nb; b += 64) {
+        float d = float(wr[b].d);
+        float s = 0.0f;
+        uint aOff = b * 32;
+        for (ushort j = 0; j < 16; j += 2) {
+            float4 a = *((device const float4*)(act + aOff + j*2));
+            uchar q0 = wr[b].qs[j];
+            uchar q1 = wr[b].qs[j+1];
+            s += a.x * ((q0 & 0xF) - 8) + a.y * ((q0 >> 4) - 8)
+               + a.z * ((q1 & 0xF) - 8) + a.w * ((q1 >> 4) - 8);
         }
-        for (short row = 0; row < NR0 && r0+row < N; row++)
-            sumf[row] += bq4_dot_y((device const block_q4_0*)(weight + (r0+row)*nb*18) + ib, sumy[0]+sumy[1], yl, il);
-        yOff += QK * NQ;
+        sum += s * d;
     }
-    for (short row = 0; row < NR0 && r0+row < N; row++) {
-        float tot = simd_sum(sumf[row]);
-        if (tiisg == 0) out[r0+row] = tot;
-    }
+    sum = simd_sum(sum);
+    threadgroup float shmem[8];
+    if (tiisg == 0) shmem[sgitg] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg % 2 == 0 && tiisg == 0)
+        out[row] = shmem[sgitg] + shmem[sgitg + 1];
 }
 
 kernel void rope_rotate_half(
