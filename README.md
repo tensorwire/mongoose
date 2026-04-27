@@ -1,5 +1,7 @@
 # mongoose
 
+> **This project has moved to [github.com/tensorwire/mongoose](https://github.com/tensorwire/mongoose).** Updates will be published under [github.com/tensorwire](https://github.com/tensorwire). Code remaining in open-ai-org is unmaintained.
+
 GPU compute for Go. Trains transformers without Python. One `Engine` interface, five backends — CUDA, Metal, Accelerate, WebGPU, CPU — selected at build time. Sparse by default.
 
 ## Training throughput
