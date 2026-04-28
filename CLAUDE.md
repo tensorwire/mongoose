@@ -80,7 +80,7 @@ go test -v -run CPU ./...     # CPU backend tests
 
 ## Related Packages
 
-- `github.com/open-ai-org/gguf` — GGUF + SafeTensors + NumPy I/O
-- `github.com/open-ai-org/tokenizer` — BPE tokenizer (GPT-2, SentencePiece)
-- `github.com/open-ai-org/helix` — DNA optimizer (forward-only training)
-- `github.com/open-ai-org/needle` — Fused INT8 dequant + Adam kernels
+- `github.com/tensorwire/gguf` — GGUF + SafeTensors + NumPy I/O
+- `github.com/tensorwire/tokenizer` — BPE tokenizer (GPT-2, SentencePiece)
+- `github.com/tensorwire/helix` — DNA optimizer (forward-only training)
+- `github.com/tensorwire/needle` — Fused INT8 dequant + Adam kernels

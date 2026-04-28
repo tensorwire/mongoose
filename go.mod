@@ -1,4 +1,4 @@
-module github.com/open-ai-org/mongoose
+module github.com/tensorwire/mongoose
 
 go 1.25.0
 
@@ -13,4 +13,4 @@ require (
 	golang.org/x/sys v0.43.0 // indirect
 )
 
-replace github.com/open-ai-org/mongoose => ../mongoose-m4infer
+replace github.com/tensorwire/mongoose => ../mongoose-m4infer

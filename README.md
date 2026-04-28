@@ -1,7 +1,5 @@
 # mongoose
 
-> **This project has moved to [github.com/tensorwire/mongoose](https://github.com/tensorwire/mongoose).** Updates will be published under [github.com/tensorwire](https://github.com/tensorwire). Code remaining in open-ai-org is unmaintained.
-
 GPU compute for Go. Trains transformers without Python. One `Engine` interface, five backends — CUDA, Metal, Accelerate, WebGPU, CPU — selected at build time. Sparse by default.
 
 ## Training throughput
@@ -116,11 +114,11 @@ Four levels: `Engine` (host slices), `TensorEngine` (GPU tensors), `TrainEngine`
 
 | Package | What |
 |---------|------|
-| [ai](https://github.com/open-ai-org/ai) | CLI — train, infer, chat, serve, quantize |
-| [helix](https://github.com/open-ai-org/helix) | DNA optimizer |
-| [needle](https://github.com/open-ai-org/needle) | Fused INT8 optimizer kernels |
-| [gguf](https://github.com/open-ai-org/gguf) | GGUF + SafeTensors I/O |
-| [tokenizer](https://github.com/open-ai-org/tokenizer) | BPE tokenizer |
+| [ai](https://github.com/tensorwire/ai) | CLI — train, infer, chat, serve, quantize |
+| [helix](https://github.com/tensorwire/helix) | DNA optimizer |
+| [needle](https://github.com/tensorwire/needle) | Fused INT8 optimizer kernels |
+| [gguf](https://github.com/tensorwire/gguf) | GGUF + SafeTensors I/O |
+| [tokenizer](https://github.com/tensorwire/tokenizer) | BPE tokenizer |
 
 ## License
 
