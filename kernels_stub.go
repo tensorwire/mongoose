@@ -51,6 +51,26 @@ func KDequantInt8ToFP16(dataPtr, scalesPtr, outPtr unsafe.Pointer, rows, cols in
 func KDequantInt8ToFP32(dataPtr, scalesPtr, outPtr unsafe.Pointer, rows, cols int) {}
 func KRequantFP32ToInt8(fp32Ptr, dataPtr, scalesPtr unsafe.Pointer, rows, cols int) {}
 func AdamWLoaded() bool { return false }
+func KKVCacheWriteTQ3(srcPtr unsafe.Pointer, cachePtr unsafe.Pointer, pos, kvDim, headDim, nKVH, blockBytes int) {}
+func KKVCacheDequantTQ3(cachePtr unsafe.Pointer, outPtr unsafe.Pointer, pos, kvDim, headDim, nKVH, blockBytes int) {}
+func HasTQ3() bool { return false }
+func KQ4_0Matvec(actPtr, weightPtr, outPtr unsafe.Pointer, N, K int) {}
+func KQ4_0MatvecStream(actPtr, weightPtr, outPtr unsafe.Pointer, N, K int, stream unsafe.Pointer) {}
+func HasQ4_0Matvec() bool { return false }
+func KQ4_0MatvecDP4A(actPtr, weightPtr, outPtr, scratchPtr unsafe.Pointer, N, K int) {}
+func HasQ4_0DP4A() bool { return false }
+func KQ8QuantizeAct(actPtr, q8OutPtr unsafe.Pointer, K int) {}
+func KQ4_0MatvecDP4APreq(weightPtr, q8ActPtr, outPtr unsafe.Pointer, N, K int) {}
+func HasQ8Quantize() bool { return false }
+func KQ4_0MatvecDP4ABatch(weightPtr, q8ScratchPtr, outPtr unsafe.Pointer, N, K, B int) {}
+func KQ8QuantizeActBatch(actsPtr, q8OutPtr unsafe.Pointer, K, B int) {}
+func HasDP4ABatch() bool { return false }
+func NeedleQ4Loaded() bool { return false }
+func KNeedleQ4(q4DataPtr, momPtr, deltaPtr, hotIdxPtr unsafe.Pointer, signalScale, lr, beta1, wd float32, nHot, cols int) {}
+func NeedleFP16Loaded() bool { return false }
+func KNeedleFP16(weightsPtr, momPtr, deltaPtr, hotIdxPtr unsafe.Pointer, signalScale, lr, beta1, wd float32, nHot, cols int) {}
+func NeedleQ8Loaded() bool { return false }
+func KNeedleQ8(dataPtr, scalesPtr, momPtr, deltaPtr, hotIdxPtr unsafe.Pointer, signalScale, lr, beta1, wd float32, nHot, cols int) {}
 func KDequantInt8DeltaToFP32(dataPtr, scalesPtr, deltaPtr, outPtr unsafe.Pointer, n, cols int) {}
 func KFP32ToFP16(inPtr, outPtr unsafe.Pointer, n int) {}
 func KFP16ToFP32(inPtr, outPtr unsafe.Pointer, n int) {}
@@ -76,6 +96,6 @@ func KCausalAttentionGQAFP16(qPtr, kPtr, vPtr, outPtr unsafe.Pointer, seqLen, di
 func KSiLUGateMulFP16(gatePtr, upPtr, outPtr unsafe.Pointer, n int) {}
 func KSiLUGateBackwardFP16(dOutPtr, gatePtr, upPtr, dGatePtr, dUpPtr unsafe.Pointer, n int) {}
 func NeedleSparseLoaded() bool                                                                    { return false }
-func KNeedleSparse(dataPtr, scalesPtr, cachePtr, momPtr, deltaPtr, hotIdxPtr, gradPtr unsafe.Pointer, signalScale, lr, beta1, wd float32, nHot, cols int) {}
+func KNeedleSparse(dataPtr, scalesPtr, cachePtr, momPtr, deltaPtr, hotIdxPtr unsafe.Pointer, signalScale, lr, beta1, wd float32, nHot, cols int) {}
 func NeedleInlineLoaded() bool { return false }
 func KNeedleInline(dataPtr, scalesPtr, cachePtr, momPtr, deltaPtr, maskPtr unsafe.Pointer, signalScale, lr, beta1, wd float32, n, cols int) {}

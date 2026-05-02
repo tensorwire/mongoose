@@ -222,9 +222,6 @@ type ProjectionTracker struct {
 	decay     float32
 	threshold float32
 	hotRows   []int32
-	colNorm   []float32 // accumulated abs input per column
-	colCharge []float32 // per-col charge [0, 1]
-	hotCols   []int32
 }
 
 // NewProjectionTracker creates a row activity tracker for a weight projection.
@@ -236,7 +233,7 @@ func NewProjectionTracker(nRows, nCols, window int) *ProjectionTracker {
 		nCols:     nCols,
 		window:    window,
 		decay:     0.5,
-		threshold: 0.1,
+		threshold: 0.01,
 	}
 }
 
@@ -337,123 +334,6 @@ func (p *ProjectionTracker) updateCharge() {
 
 // HotRows returns indices of active weight rows for this projection.
 func (p *ProjectionTracker) HotRows() []int32 { return p.hotRows }
-
-// HotPositions returns up to maxN flat weight indices, ranked by
-// combined row charge × col charge. Highest signal positions first.
-func (p *ProjectionTracker) HotPositions(maxN int) []int32 {
-	if len(p.hotRows) == 0 || len(p.hotCols) == 0 {
-		return nil
-	}
-
-	type candidate struct {
-		pos   int32
-		score float32
-	}
-
-	// Cap rows/cols to sqrt(maxN) each to bound the cross product
-	capPer := int(math.Sqrt(float64(maxN))) + 1
-	rows := p.hotRows
-	cols := p.hotCols
-	if len(rows) > capPer {
-		rows = rows[:capPer]
-	}
-	if len(cols) > capPer {
-		cols = cols[:capPer]
-	}
-
-	candidates := make([]candidate, 0, len(rows)*len(cols))
-	for _, r := range rows {
-		rc := p.charge[r]
-		for _, c := range cols {
-			cc := p.colCharge[c]
-			candidates = append(candidates, candidate{
-				pos:   r*int32(p.nCols) + c,
-				score: rc * cc,
-			})
-		}
-	}
-
-	// Partial sort: pick top maxN by score
-	if len(candidates) > maxN {
-		for i := 0; i < maxN; i++ {
-			best := i
-			for j := i + 1; j < len(candidates); j++ {
-				if candidates[j].score > candidates[best].score {
-					best = j
-				}
-			}
-			candidates[i], candidates[best] = candidates[best], candidates[i]
-		}
-		candidates = candidates[:maxN]
-	}
-
-	out := make([]int32, len(candidates))
-	for i, c := range candidates {
-		out[i] = c.pos
-	}
-	return out
-}
-
-// ObserveInput records which input columns carry the most signal.
-// inputSlice is shape [n, inDim]. Samples one position, keeps top-K columns.
-func (p *ProjectionTracker) ObserveInput(inputSlice []float32, n, inDim int) {
-	if len(inputSlice) == 0 || n == 0 || inDim != p.nCols {
-		return
-	}
-	pos := n / 2
-	off := pos * inDim
-	end := off + inDim
-	if end > len(inputSlice) {
-		end = len(inputSlice)
-	}
-
-	// Accumulate abs input magnitudes per column
-	if len(p.colNorm) != p.nCols {
-		p.colNorm = make([]float32, p.nCols)
-	}
-	for i := off; i < end; i++ {
-		col := i - off
-		v := inputSlice[i]
-		if v < 0 {
-			v = -v
-		}
-		p.colNorm[col] += v
-	}
-
-	// Rebuild hot cols on same schedule as hot rows
-	if p.stepCount == 1 || p.stepCount >= p.window {
-		p.updateHotCols()
-	}
-}
-
-func (p *ProjectionTracker) updateHotCols() {
-	var maxNorm float32
-	for _, n := range p.colNorm {
-		if n > maxNorm {
-			maxNorm = n
-		}
-	}
-	if maxNorm == 0 {
-		return
-	}
-	invMax := 1.0 / maxNorm
-
-	if len(p.colCharge) != p.nCols {
-		p.colCharge = make([]float32, p.nCols)
-	}
-	p.hotCols = p.hotCols[:0]
-	for i := range p.colCharge {
-		p.colCharge[i] *= p.decay
-		p.colCharge[i] += p.colNorm[i] * invMax * (1.0 - p.decay)
-		if p.colCharge[i] > 1.0 {
-			p.colCharge[i] = 1.0
-		}
-		if p.colCharge[i] >= p.threshold {
-			p.hotCols = append(p.hotCols, int32(i))
-		}
-		p.colNorm[i] = 0
-	}
-}
 
 // IsHot returns true if a specific row is active.
 func (p *ProjectionTracker) IsHot(row int) bool {

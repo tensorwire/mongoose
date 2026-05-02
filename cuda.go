@@ -3,9 +3,9 @@
 package mongoose
 
 /*
-// CUDA library paths — override with CGO_LDFLAGS if cuBLAS is not in standard paths.
-// Common locations: /usr/lib, /usr/local/cuda/lib64, pip nvidia-cublas-cu12
-#cgo LDFLAGS: -lcublas -lcudart
+// CUDA 13.1 toolkit paths.
+#cgo CFLAGS: -I/usr/local/cuda/targets/x86_64-linux/include
+#cgo LDFLAGS: -L/usr/local/cuda/targets/x86_64-linux/lib -lcublas -lcudart
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <stdlib.h>

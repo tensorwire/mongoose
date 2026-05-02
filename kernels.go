@@ -6,6 +6,7 @@ package mongoose
 #include <dlfcn.h>
 #include <cuda_runtime.h>
 #include <stdlib.h>
+#include <stdint.h>
 
 // Function pointers loaded from libmongoose_kernels.so
 typedef void (*fn_rmsnorm)(float*, const float*, int, int, cudaStream_t);
@@ -61,6 +62,14 @@ typedef void (*fn_grad_scale)(float*, float, int, cudaStream_t);
 typedef void (*fn_q8_matvec)(const float*, const void*, const float*, float*, int, int, cudaStream_t);
 typedef void (*fn_q4_matvec)(const float*, const void*, const float*, float*, int, int, cudaStream_t);
 typedef void (*fn_kv_cache_write)(float*, const float*, int, int, cudaStream_t);
+typedef void (*fn_q4_0_matvec)(const float*, const void*, float*, int, int, cudaStream_t);
+typedef void (*fn_q4_0_matvec_dp4a)(const float*, const void*, float*, int, int, void*, cudaStream_t);
+typedef void (*fn_q8_quantize_act)(const float*, void*, int, cudaStream_t);
+typedef void (*fn_q4_0_matvec_dp4a_preq)(const void*, const void*, float*, int, int, cudaStream_t);
+typedef void (*fn_q4_0_matvec_dp4a_batch)(const void*, const void*, float*, int, int, int, cudaStream_t);
+typedef void (*fn_q8_quantize_act_batch)(const float*, void*, int, int, cudaStream_t);
+typedef void (*fn_kv_cache_write_tq3)(const float*, unsigned char*, int, int, int, int, int, cudaStream_t);
+typedef void (*fn_kv_cache_dequant_tq3)(const unsigned char*, float*, int, int, int, int, int, cudaStream_t);
 
 static void* kernel_lib = NULL;
 static fn_rmsnorm           k_rmsnorm = NULL;
@@ -98,10 +107,16 @@ static fn_softmax_ce        k_softmax_ce = NULL;
 static fn_helix_dna_step    k_helix_dna_step = NULL;
 static fn_helix_needle      k_helix_needle = NULL;
 static fn_helix_needle_paired k_helix_needle_paired = NULL;
-typedef void (*fn_helix_needle_sparse)(void*, float*, float*, void*, void*, const int*, const float*, float, float, float, float, int, int, cudaStream_t);
+typedef void (*fn_helix_needle_sparse)(void*, float*, float*, void*, void*, const int*, float, float, float, float, int, int, cudaStream_t);
 static fn_helix_needle_sparse k_helix_needle_sparse = NULL;
 typedef void (*fn_helix_needle_inline)(void*, float*, float*, void*, void*, const void*, float, float, float, float, int, int, cudaStream_t);
 static fn_helix_needle_inline k_helix_needle_inline = NULL;
+typedef void (*fn_helix_needle_q4)(void*, void*, void*, const int*, float, float, float, float, int, int, cudaStream_t);
+static fn_helix_needle_q4 k_helix_needle_q4 = NULL;
+typedef void (*fn_helix_needle_q8)(void*, const float*, void*, void*, const int*, float, float, float, float, int, int, cudaStream_t);
+static fn_helix_needle_q8 k_helix_needle_q8 = NULL;
+typedef void (*fn_helix_needle_fp16)(void*, void*, void*, const int*, float, float, float, float, int, int, cudaStream_t);
+static fn_helix_needle_fp16 k_helix_needle_fp16 = NULL;
 static fn_dequant_int8_fp16 k_dequant_int8_fp16 = NULL;
 static fn_dequant_int8_fp32 k_dequant_int8_fp32 = NULL;
 static fn_requant_fp32_int8 k_requant_fp32_int8 = NULL;
@@ -114,6 +129,14 @@ static fn_grad_scale       k_grad_scale = NULL;
 static fn_q8_matvec        k_q8_matvec = NULL;
 static fn_q4_matvec        k_q4_matvec = NULL;
 static fn_kv_cache_write   k_kv_cache_write = NULL;
+static fn_q4_0_matvec      k_q4_0_matvec = NULL;
+static fn_q4_0_matvec_dp4a k_q4_0_dp4a = NULL;
+static fn_q8_quantize_act  k_q8_quantize = NULL;
+static fn_q4_0_matvec_dp4a_preq k_q4_0_dp4a_preq = NULL;
+static fn_q4_0_matvec_dp4a_batch k_q4_0_dp4a_batch = NULL;
+static fn_q8_quantize_act_batch k_q8_quantize_batch = NULL;
+static fn_kv_cache_write_tq3  k_kv_write_tq3 = NULL;
+static fn_kv_cache_dequant_tq3 k_kv_dequant_tq3 = NULL;
 static fn_fp16_add_inplace   k_fp16_add_inplace = NULL;
 static fn_fp32_add_fp16      k_fp32_add_fp16 = NULL;
 static fn_rmsnorm_save_fp16  k_rmsnorm_save_fp16 = NULL;
@@ -165,6 +188,9 @@ int tw_load_kernels(const char* path) {
     k_helix_needle_paired = (fn_helix_needle_paired)dlsym(kernel_lib, "mongoose_helix_needle_paired");
     k_helix_needle_sparse = (fn_helix_needle_sparse)dlsym(kernel_lib, "mongoose_helix_needle_sparse");
     k_helix_needle_inline = (fn_helix_needle_inline)dlsym(kernel_lib, "mongoose_helix_needle_inline");
+    k_helix_needle_q4     = (fn_helix_needle_q4)dlsym(kernel_lib, "mongoose_helix_needle_q4");
+    k_helix_needle_q8     = (fn_helix_needle_q8)dlsym(kernel_lib, "mongoose_helix_needle_q8");
+    k_helix_needle_fp16   = (fn_helix_needle_fp16)dlsym(kernel_lib, "mongoose_helix_needle_fp16");
     k_dequant_int8_fp16   = (fn_dequant_int8_fp16)dlsym(kernel_lib, "mongoose_dequant_int8_to_fp16");
     k_dequant_int8_fp32   = (fn_dequant_int8_fp32)dlsym(kernel_lib, "mongoose_dequant_int8_to_fp32");
     k_requant_fp32_int8   = (fn_requant_fp32_int8)dlsym(kernel_lib, "mongoose_requant_fp32_to_int8");
@@ -177,6 +203,14 @@ int tw_load_kernels(const char* path) {
     k_q8_matvec           = (fn_q8_matvec)dlsym(kernel_lib, "mongoose_q8_matvec");
     k_q4_matvec           = (fn_q4_matvec)dlsym(kernel_lib, "mongoose_q4_matvec");
     k_kv_cache_write      = (fn_kv_cache_write)dlsym(kernel_lib, "mongoose_kv_cache_write");
+    k_q4_0_matvec         = (fn_q4_0_matvec)dlsym(kernel_lib, "mongoose_q4_0_matvec");
+    k_q4_0_dp4a           = (fn_q4_0_matvec_dp4a)dlsym(kernel_lib, "mongoose_q4_0_matvec_dp4a");
+    k_q8_quantize         = (fn_q8_quantize_act)dlsym(kernel_lib, "mongoose_q8_quantize_act");
+    k_q4_0_dp4a_preq      = (fn_q4_0_matvec_dp4a_preq)dlsym(kernel_lib, "mongoose_q4_0_matvec_dp4a_preq");
+    k_q4_0_dp4a_batch     = (fn_q4_0_matvec_dp4a_batch)dlsym(kernel_lib, "mongoose_q4_0_matvec_dp4a_batch");
+    k_q8_quantize_batch   = (fn_q8_quantize_act_batch)dlsym(kernel_lib, "mongoose_q8_quantize_act_batch");
+    k_kv_write_tq3        = (fn_kv_cache_write_tq3)dlsym(kernel_lib, "mongoose_kv_cache_write_tq3");
+    k_kv_dequant_tq3      = (fn_kv_cache_dequant_tq3)dlsym(kernel_lib, "mongoose_kv_cache_dequant_tq3");
     k_fp16_add_inplace    = (fn_fp16_add_inplace)dlsym(kernel_lib, "mongoose_fp16_add_inplace");
     k_fp32_add_fp16       = (fn_fp32_add_fp16)dlsym(kernel_lib, "mongoose_fp32_add_fp16");
     k_rmsnorm_save_fp16   = (fn_rmsnorm_save_fp16)dlsym(kernel_lib, "mongoose_rmsnorm_out_save_fp16");
@@ -442,11 +476,71 @@ void tw_k_helix_needle_inline(void* data, float* scales, float* cache,
         signalScale, lr, beta1, wd, n, cols, (cudaStream_t)stream);
 }
 void tw_k_helix_needle_sparse(void* data, float* scales, float* cache,
-    void* mom, void* delta, const int* hotIdx, const float* grad,
+    void* mom, void* delta, const int* hotIdx,
     float signalScale, float lr, float beta1, float wd, int nHot, int cols, void* stream) {
-    if (k_helix_needle_sparse) k_helix_needle_sparse(data, scales, cache, mom, delta, hotIdx, grad,
+    if (k_helix_needle_sparse) k_helix_needle_sparse(data, scales, cache, mom, delta, hotIdx,
         signalScale, lr, beta1, wd, nHot, cols, (cudaStream_t)stream);
 }
+
+// Q4-aware needle: dequant → update → requant in-place
+int tw_helix_needle_q4_loaded() { return k_helix_needle_q4 != NULL ? 1 : 0; }
+void tw_k_helix_needle_q4(void* q4_data, void* mom, void* delta,
+    const int* hotIdx, float signalScale, float lr, float beta1, float wd,
+    int nHot, int cols, void* stream) {
+    if (k_helix_needle_q4) k_helix_needle_q4(q4_data, mom, delta, hotIdx,
+        signalScale, lr, beta1, wd, nHot, cols, (cudaStream_t)stream);
+}
+
+// FP16 needle: native half-precision, no quantization
+int tw_helix_needle_fp16_loaded() { return k_helix_needle_fp16 != NULL ? 1 : 0; }
+void tw_k_helix_needle_fp16(void* weights, void* mom, void* delta,
+    const int* hotIdx, float signalScale, float lr, float beta1, float wd,
+    int nHot, int cols, void* stream) {
+    if (k_helix_needle_fp16) k_helix_needle_fp16(weights, mom, delta, hotIdx,
+        signalScale, lr, beta1, wd, nHot, cols, (cudaStream_t)stream);
+}
+
+// Q8 needle: INT8 + per-row scales, no FP32 cache needed
+int tw_helix_needle_q8_loaded() { return k_helix_needle_q8 != NULL ? 1 : 0; }
+void tw_k_helix_needle_q8(void* data, const float* scales, void* mom, void* delta,
+    const int* hotIdx, float signalScale, float lr, float beta1, float wd,
+    int nHot, int cols, void* stream) {
+    if (k_helix_needle_q8) k_helix_needle_q8(data, scales, mom, delta, hotIdx,
+        signalScale, lr, beta1, wd, nHot, cols, (cudaStream_t)stream);
+}
+
+void tw_k_kv_write_tq3(const float* src, unsigned char* cache, int pos, int kvDim, int headDim, int nKVH, int blockBytes) {
+    if (k_kv_write_tq3) k_kv_write_tq3(src, cache, pos, kvDim, headDim, nKVH, blockBytes, 0);
+}
+void tw_k_kv_dequant_tq3(const unsigned char* cache, float* out, int pos, int kvDim, int headDim, int nKVH, int blockBytes) {
+    if (k_kv_dequant_tq3) k_kv_dequant_tq3(cache, out, pos, kvDim, headDim, nKVH, blockBytes, 0);
+}
+int tw_k_has_tq3() { return (k_kv_write_tq3 != NULL && k_kv_dequant_tq3 != NULL) ? 1 : 0; }
+void tw_k_q4_0_matvec(const float* act, const void* weight, float* out, int N, int K) {
+    if (k_q4_0_matvec) k_q4_0_matvec(act, weight, out, N, K, 0);
+}
+void tw_k_q4_0_matvec_stream(const float* act, const void* weight, float* out, int N, int K, void* stream) {
+    if (k_q4_0_matvec) k_q4_0_matvec(act, weight, out, N, K, (cudaStream_t)stream);
+}
+void tw_k_q4_0_matvec_dp4a(const float* act, const void* weight, float* out, int N, int K, void* scratch) {
+    if (k_q4_0_dp4a) k_q4_0_dp4a(act, weight, out, N, K, scratch, 0);
+}
+int tw_k_has_q4_0_dp4a() { return k_q4_0_dp4a != NULL ? 1 : 0; }
+void tw_k_q8_quantize_act(const float* act, void* q8_out, int K) {
+    if (k_q8_quantize) k_q8_quantize(act, q8_out, K, 0);
+}
+void tw_k_q4_0_matvec_dp4a_preq(const void* weight, const void* q8, float* out, int N, int K) {
+    if (k_q4_0_dp4a_preq) k_q4_0_dp4a_preq(weight, q8, out, N, K, 0);
+}
+int tw_k_has_q8_quantize() { return k_q8_quantize != NULL ? 1 : 0; }
+void tw_k_q4_0_matvec_dp4a_batch(const void* weight, const void* q8, float* out, int N, int K, int B) {
+    if (k_q4_0_dp4a_batch) k_q4_0_dp4a_batch(weight, q8, out, N, K, B, 0);
+}
+void tw_k_q8_quantize_act_batch(const float* acts, void* q8_out, int K, int B) {
+    if (k_q8_quantize_batch) k_q8_quantize_batch(acts, q8_out, K, B, 0);
+}
+int tw_k_has_dp4a_batch() { return k_q4_0_dp4a_batch != NULL ? 1 : 0; }
+int tw_k_has_q4_0_matvec() { return k_q4_0_matvec != NULL ? 1 : 0; }
 */
 import "C"
 
@@ -834,14 +928,6 @@ func KDequantInt8ToFP32(dataPtr, scalesPtr, outPtr unsafe.Pointer, rows, cols in
 	C.tw_k_dequant_int8_fp32(dataPtr, (*C.float)(scalesPtr), (*C.float)(outPtr), C.int(rows), C.int(cols))
 }
 
-func KRequantFP32ToInt8(fp32Ptr, dataPtr, scalesPtr unsafe.Pointer, rows, cols int) {
-	C.tw_k_requant_fp32_int8((*C.float)(fp32Ptr), dataPtr, (*C.float)(scalesPtr), C.int(rows), C.int(cols))
-}
-
-func AdamWLoaded() bool {
-	return C.tw_train_kernels_loaded() == 1
-}
-
 // KFP32ToFP16 converts FP32 tensor to FP16 on GPU. For mixed-precision matmul input prep.
 func KFP32ToFP16(inPtr, outPtr unsafe.Pointer, n int) {
 	C.tw_k_fp32_to_fp16((*C.float)(inPtr), outPtr, C.int(n))
@@ -867,11 +953,76 @@ func KKVCacheWrite(cachePtr, srcPtr unsafe.Pointer, pos, kvDim int) {
 	C.tw_k_kv_cache_write((*C.float)(cachePtr), (*C.float)(srcPtr), C.int(pos), C.int(kvDim))
 }
 
+func KKVCacheWriteTQ3(srcPtr unsafe.Pointer, cachePtr unsafe.Pointer, pos, kvDim, headDim, nKVH, blockBytes int) {
+	C.tw_k_kv_write_tq3((*C.float)(srcPtr), (*C.uchar)(cachePtr), C.int(pos), C.int(kvDim), C.int(headDim), C.int(nKVH), C.int(blockBytes))
+}
+
+func KKVCacheDequantTQ3(cachePtr unsafe.Pointer, outPtr unsafe.Pointer, pos, kvDim, headDim, nKVH, blockBytes int) {
+	C.tw_k_kv_dequant_tq3((*C.uchar)(cachePtr), (*C.float)(outPtr), C.int(pos), C.int(kvDim), C.int(headDim), C.int(nKVH), C.int(blockBytes))
+}
+
+func HasTQ3() bool { return C.tw_k_has_tq3() != 0 }
+
 // HasQ8Matvec returns true if the fused Q8 matvec kernel is loaded.
 func HasQ8Matvec() bool { return C.tw_k_has_q8_matvec() != 0 }
 
 // HasQ4Matvec returns true if the fused Q4 matvec kernel is loaded.
 func HasQ4Matvec() bool { return C.tw_k_has_q4_matvec() != 0 }
+
+// KQ4_0Matvec: fused GGUF block_q4_0 dequant + matvec.
+func KQ4_0Matvec(actPtr, weightPtr, outPtr unsafe.Pointer, N, K int) {
+	C.tw_k_q4_0_matvec((*C.float)(actPtr), weightPtr, (*C.float)(outPtr), C.int(N), C.int(K))
+}
+
+// KQ4_0MatvecStream: same as KQ4_0Matvec but on a specified CUDA stream.
+func KQ4_0MatvecStream(actPtr, weightPtr, outPtr unsafe.Pointer, N, K int, stream unsafe.Pointer) {
+	C.tw_k_q4_0_matvec_stream((*C.float)(actPtr), weightPtr, (*C.float)(outPtr), C.int(N), C.int(K), stream)
+}
+
+// HasQ4_0Matvec returns true if the GGUF block_q4_0 matvec kernel is loaded.
+func HasQ4_0Matvec() bool { return C.tw_k_has_q4_0_matvec() != 0 }
+
+// KQ4_0MatvecDP4A: dp4a-accelerated Q4_0 matvec.
+func KQ4_0MatvecDP4A(actPtr, weightPtr, outPtr, scratchPtr unsafe.Pointer, N, K int) {
+	C.tw_k_q4_0_matvec_dp4a((*C.float)(actPtr), weightPtr, (*C.float)(outPtr), C.int(N), C.int(K), scratchPtr)
+}
+
+// HasQ4_0DP4A returns true if the dp4a-accelerated Q4_0 kernel is loaded.
+func HasQ4_0DP4A() bool { return C.tw_k_has_q4_0_dp4a() != 0 }
+
+// KQ8QuantizeAct quantizes fp32 activation to Q8_1 blocks.
+func KQ8QuantizeAct(actPtr, q8OutPtr unsafe.Pointer, K int) {
+	C.tw_k_q8_quantize_act((*C.float)(actPtr), q8OutPtr, C.int(K))
+}
+
+// KQ4_0MatvecDP4APreq runs dp4a matvec with pre-quantized Q8 activation.
+func KQ4_0MatvecDP4APreq(weightPtr, q8ActPtr, outPtr unsafe.Pointer, N, K int) {
+	C.tw_k_q4_0_matvec_dp4a_preq(weightPtr, q8ActPtr, (*C.float)(outPtr), C.int(N), C.int(K))
+}
+
+// HasQ8Quantize returns true if the standalone Q8 quantize kernel is loaded.
+func HasQ8Quantize() bool { return C.tw_k_has_q8_quantize() != 0 }
+
+// KQ4_0MatvecDP4ABatch runs batched dp4a matvec.
+func KQ4_0MatvecDP4ABatch(weightPtr, q8ScratchPtr, outPtr unsafe.Pointer, N, K, B int) {
+	C.tw_k_q4_0_matvec_dp4a_batch(weightPtr, q8ScratchPtr, (*C.float)(outPtr), C.int(N), C.int(K), C.int(B))
+}
+
+// KQ8QuantizeActBatch quantizes B contiguous fp32 activation vectors to Q8.
+func KQ8QuantizeActBatch(actsPtr, q8OutPtr unsafe.Pointer, K, B int) {
+	C.tw_k_q8_quantize_act_batch((*C.float)(actsPtr), q8OutPtr, C.int(K), C.int(B))
+}
+
+// HasDP4ABatch returns true if the batched dp4a kernel is loaded.
+func HasDP4ABatch() bool { return C.tw_k_has_dp4a_batch() != 0 }
+
+func KRequantFP32ToInt8(fp32Ptr, dataPtr, scalesPtr unsafe.Pointer, rows, cols int) {
+	C.tw_k_requant_fp32_int8((*C.float)(fp32Ptr), dataPtr, (*C.float)(scalesPtr), C.int(rows), C.int(cols))
+}
+
+func AdamWLoaded() bool {
+	return C.tw_train_kernels_loaded() == 1
+}
 
 // FP16TrainKernelsLoaded returns true if all native FP16 training kernels are available.
 func FP16TrainKernelsLoaded() bool { return C.tw_fp16_train_kernels_loaded() == 1 }
@@ -917,14 +1068,52 @@ func NeedleSparseLoaded() bool {
 	return C.tw_helix_needle_sparse_loaded() == 1
 }
 
-// KNeedleSparse fires the sparse needle on conductor hot positions.
-// If gradPtr is non-nil, reads real per-weight gradients from grad[hotIdx[i]].
-// If gradPtr is nil, uses signalScale * momentum as synthetic gradient (forward-only).
-// Only touches nHot positions — conductor-driven sparsity.
-func KNeedleSparse(dataPtr, scalesPtr, cachePtr, momPtr, deltaPtr, hotIdxPtr, gradPtr unsafe.Pointer,
+// KNeedleSparse fires the forward-only sparse needle on conductor hot rows.
+// Uses signalScale (from helix ForwardOnlyStep) instead of explicit gradients.
+// Only touches nHot rows — conductor-driven sparsity.
+func KNeedleSparse(dataPtr, scalesPtr, cachePtr, momPtr, deltaPtr, hotIdxPtr unsafe.Pointer,
 	signalScale, lr, beta1, wd float32, nHot, cols int) {
 	C.tw_k_helix_needle_sparse(dataPtr, (*C.float)(scalesPtr), (*C.float)(cachePtr),
-		momPtr, deltaPtr, (*C.int)(hotIdxPtr), (*C.float)(gradPtr),
+		momPtr, deltaPtr, (*C.int)(hotIdxPtr),
+		C.float(signalScale), C.float(lr), C.float(beta1),
+		C.float(wd), C.int(nHot), C.int(cols), nil)
+}
+
+// NeedleQ4Loaded returns true if the Q4-aware needle kernel is available.
+func NeedleQ4Loaded() bool {
+	return C.tw_helix_needle_q4_loaded() == 1
+}
+
+// KNeedleQ4 fires the Q4-aware sparse needle on hot rows.
+func KNeedleQ4(q4DataPtr, momPtr, deltaPtr, hotIdxPtr unsafe.Pointer,
+	signalScale, lr, beta1, wd float32, nHot, cols int) {
+	C.tw_k_helix_needle_q4(q4DataPtr, momPtr, deltaPtr, (*C.int)(hotIdxPtr),
+		C.float(signalScale), C.float(lr), C.float(beta1),
+		C.float(wd), C.int(nHot), C.int(cols), nil)
+}
+
+// NeedleFP16Loaded returns true if the FP16 needle kernel is available.
+func NeedleFP16Loaded() bool {
+	return C.tw_helix_needle_fp16_loaded() == 1
+}
+
+// KNeedleFP16 fires the FP16 needle on hot rows — native half-precision.
+func KNeedleFP16(weightsPtr, momPtr, deltaPtr, hotIdxPtr unsafe.Pointer,
+	signalScale, lr, beta1, wd float32, nHot, cols int) {
+	C.tw_k_helix_needle_fp16(weightsPtr, momPtr, deltaPtr, (*C.int)(hotIdxPtr),
+		C.float(signalScale), C.float(lr), C.float(beta1),
+		C.float(wd), C.int(nHot), C.int(cols), nil)
+}
+
+// NeedleQ8Loaded returns true if the Q8 no-cache needle kernel is available.
+func NeedleQ8Loaded() bool {
+	return C.tw_helix_needle_q8_loaded() == 1
+}
+
+// KNeedleQ8 fires the Q8 needle on hot rows — INT8 data + per-row FP32 scales.
+func KNeedleQ8(dataPtr, scalesPtr, momPtr, deltaPtr, hotIdxPtr unsafe.Pointer,
+	signalScale, lr, beta1, wd float32, nHot, cols int) {
+	C.tw_k_helix_needle_q8(dataPtr, (*C.float)(scalesPtr), momPtr, deltaPtr, (*C.int)(hotIdxPtr),
 		C.float(signalScale), C.float(lr), C.float(beta1),
 		C.float(wd), C.int(nHot), C.int(cols), nil)
 }

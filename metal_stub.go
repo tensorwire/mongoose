@@ -81,6 +81,7 @@ func (m *Metal) GraphNumDiffable() int                         { return 0 }
 func (m *Metal) GraphReadVariable(varIdx int, dst []float32) int { return -1 }
 func (m *Metal) GraphApplyWeights(varIdx int, data []float32) int { return -1 }
 func (m *Metal) UploadInto(dst *Tensor, data []float32) {}
+func (m *Metal) SharedPtr(t *Tensor) unsafe.Pointer      { return nil }
 
 func (m *Metal) FusedBegin()             {}
 func (m *Metal) FusedEnd()               {}

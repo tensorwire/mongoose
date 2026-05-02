@@ -225,3 +225,10 @@ func MtlBufPtr(t *Tensor) unsafe.Pointer {
 func (m *Metal) UploadInto(dst *Tensor, data []float32) {
 	C.mtl_upload(dst.device.(*mtlPtr).buf, unsafe.Pointer(&data[0]), C.size_t(len(data)*4))
 }
+
+// SharedPtr returns the raw CPU-accessible pointer for a StorageModeShared GPU buffer.
+// On Apple Silicon unified memory this is the same physical pages the GPU reads —
+// writes here are visible to the GPU with no explicit copy or flush.
+func (m *Metal) SharedPtr(t *Tensor) unsafe.Pointer {
+	return C.mtl_shared_ptr(t.device.(*mtlPtr).buf)
+}

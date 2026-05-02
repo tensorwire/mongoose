@@ -17,8 +17,13 @@ extern cublasHandle_t tw_cublas_handle;
 
 // GPU memory management
 void* tw_gpu_alloc(size_t bytes) {
-    void* ptr;
-    cudaMalloc(&ptr, bytes);
+    void* ptr = NULL;
+    cudaError_t err = cudaMalloc(&ptr, bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[CUDA OOM] cudaMalloc(%zu bytes / %.1f MB) failed: %s\n",
+                bytes, (double)bytes / (1024*1024), cudaGetErrorString(err));
+        return NULL;
+    }
     return ptr;
 }
 
@@ -128,6 +133,27 @@ int tw_gpu_hgemm(const void* dA, const void* dB, float* dC, int m, int k, int n)
         dA, CUDA_R_16F, k,
         &beta,
         dC, CUDA_R_32F, n,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    return (int)s;
+}
+
+// C[m,n] = A[m,k] @ B[n,k]^T: FP16 inputs, FP32 output.
+// B is row-major [n,k] — standard weight layout for inference matvec.
+int tw_gpu_hgemm_ex_transB(const void* dA, const void* dB, float* dC, int m, int k, int n) {
+    float alpha = 1.0f, beta = 0.0f;
+    // cuBLAS col-major: C[n,m] = op(B) @ op(A)
+    // op(B) = B^T: stored [n,k] row-major = [k,n] col-major, transposed to [n,k], ldb=k
+    // op(A) = A:   stored [m,k] row-major = [k,m] col-major, lda=k
+    // C: [n,m] col-major = [m,n] row-major, ldc=n
+    cublasStatus_t s = cublasGemmEx(tw_cublas_handle,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        n, m, k,
+        &alpha,
+        dB, CUDA_R_16F, k,     // B stored as [k,n] col-major, ldb=k
+        dA, CUDA_R_16F, k,     // A stored as [k,m] col-major, lda=k
+        &beta,
+        dC, CUDA_R_32F, n,     // C stored as [n,m] col-major, ldc=n
         CUBLAS_COMPUTE_32F,
         CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     return (int)s;
@@ -365,6 +391,14 @@ void* tw_gpu_upload_fp16(const float* hostData, int n) {
     return dOut;
 }
 
+// Upload raw FP16 bytes directly to GPU — no conversion
+void* tw_gpu_upload_raw_fp16(const void* hostData, int nElems) {
+    void* dOut;
+    cudaMalloc(&dOut, nElems * 2);
+    cudaMemcpy(dOut, hostData, nElems * 2, cudaMemcpyHostToDevice);
+    return dOut;
+}
+
 // C = A^T @ B: A[m,k]->A^T[k,m], B[m,n], C[k,n] row-major
 int tw_gpu_sgemm_transA(const float* dA, const float* dB, float* dC, int m, int k, int n) {
     float alpha = 1.0f, beta = 0.0f;
@@ -592,10 +626,6 @@ func (c *CUDA) ToHost(t *Tensor) []float32 {
 	return data
 }
 
-func (c *CUDA) DownloadRawBytes(src unsafe.Pointer, dst []byte) {
-	C.tw_gpu_download(unsafe.Pointer(&dst[0]), src, C.size_t(len(dst)))
-}
-
 func (c *CUDA) Release(t *Tensor) {
 	if t.device != nil {
 		cu := t.device.(*cuPtr)
@@ -634,6 +664,18 @@ func (c *CUDA) FromHostFP16(data []float32, shape []int) *Tensor {
 	return &Tensor{
 		Shape:  shape,
 		Size:   size,
+		device: &cuPtr{ptr: ptr},
+		eng:    c,
+	}
+}
+
+// FromHostRawFP16 uploads raw FP16 bytes directly to GPU — no conversion.
+// data must be len(data) == nElems * 2 bytes of IEEE 754 half-precision.
+func (c *CUDA) FromHostRawFP16(data []byte, nElems int) *Tensor {
+	ptr := C.tw_gpu_upload_raw_fp16(unsafe.Pointer(&data[0]), C.int(nElems))
+	return &Tensor{
+		Shape:  []int{nElems},
+		Size:   nElems,
 		device: &cuPtr{ptr: ptr},
 		eng:    c,
 	}
@@ -685,6 +727,20 @@ func (c *CUDA) MatMulFP16TInto(a, b, out *Tensor, m, k, n int) {
 		(*C.float)(out.device.(*cuPtr).ptr),
 		C.int(m), C.int(k), C.int(n),
 	)
+}
+
+// HGemmRaw calls cuBLAS hgemm with raw device pointers.
+// C[M,N] = A[M,K] @ B[K,N], A/B are FP16, C is FP32.
+// B must be column-major [K,N]. For row-major weights, use HGemmTransBRaw.
+func (c *CUDA) HGemmRaw(aPtr, bPtr, cPtr unsafe.Pointer, m, k, n int) {
+	C.tw_gpu_hgemm(aPtr, bPtr, (*C.float)(cPtr), C.int(m), C.int(k), C.int(n))
+}
+
+// HGemmTransBRaw calls cuBLAS hgemm with B transposed, raw device pointers.
+// C[M,N] = A[M,K] @ B[N,K]^T, A/B are FP16, C is FP32.
+// B is row-major [N,K] — standard weight layout.
+func (c *CUDA) HGemmTransBRaw(aPtr, bPtr, cPtr unsafe.Pointer, m, k, n int) {
+	C.tw_gpu_hgemm_ex_transB(aPtr, bPtr, (*C.float)(cPtr), C.int(m), C.int(k), C.int(n))
 }
 
 // MatMulFP16 computes C = A @ B where A,B,C are all FP16.

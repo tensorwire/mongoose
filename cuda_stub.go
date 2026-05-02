@@ -62,7 +62,6 @@ func (c *CUDA) CopyInto(dst, src *Tensor)                       {}
 func (c *CUDA) UploadInto(dst *Tensor, data []float32)           {}
 func (c *CUDA) UploadSlice(dst *Tensor, offsetFloats int, data []float32) {}
 func (c *CUDA) DownloadSlice(src *Tensor, offsetFloats int, dst []float32) {}
-func (c *CUDA) DownloadRawBytes(src unsafe.Pointer, dst []byte)            {}
 func (c *CUDA) ZerosBF16(shape []int) *Tensor                   { return nil }
 
 // INT8 stubs
@@ -103,5 +102,8 @@ func (c *CUDA) MatMulFP16TransposeBTInto(out, a, b *Tensor, m, k, n int) {}
 func (c *CUDA) AllocFP16Tensor(nElements int, shape []int) *Tensor { return nil }
 func (c *CUDA) FreeFP16Tensor(t *Tensor)                        {}
 func (c *CUDA) FromHostFP16(data []float32, shape []int) *Tensor { return nil }
+func (c *CUDA) FromHostRawFP16(data []byte, nElems int) *Tensor { return nil }
+func (c *CUDA) HGemmRaw(aPtr, bPtr, cPtr unsafe.Pointer, m, k, n int) {}
+func (c *CUDA) HGemmTransBRaw(aPtr, bPtr, cPtr unsafe.Pointer, m, k, n int) {}
 
 func PoolStats() (int64, int64, int64, int64) { return 0, 0, 0, 0 }

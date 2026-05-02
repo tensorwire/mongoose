@@ -62,15 +62,17 @@ func ProvisionKernels() string {
 		return ""
 	}
 
-	arch := fmt.Sprintf("compute_%s", strings.Replace(cc, ".", "", 1))
-	log.Printf("[kernels] compiling for %s (compute capability %s)...", arch, cc)
+	archNum := strings.Replace(cc, ".", "", 1)
+	computeArch := fmt.Sprintf("compute_%s", archNum)
+	smCode := fmt.Sprintf("sm_%s", archNum)
+	log.Printf("[kernels] compiling for %s (compute capability %s)...", smCode, cc)
 
 	cmd := exec.Command(nvcc,
 		"-shared",
 		"-o", soPath,
 		cuPath,
 		"-Xcompiler", "-fPIC",
-		"-gencode", fmt.Sprintf("arch=%s,code=%s", arch, arch),
+		"-gencode", fmt.Sprintf("arch=%s,code=%s", computeArch, smCode),
 	)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
