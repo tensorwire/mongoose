@@ -20,10 +20,10 @@ dim       params     mongoose    dense (DDP)    ratio
 
 ```
 dim       params     steps/s
-128       624K       773
-512       9.6M       455
-1024      38M        191
-2048      152M        74
+128       624K       569
+512       4.9M       433
+1024      16M        294
+2048      57M         83
 ```
 
 ### Apple M4 Max — Metal + Needle INT8
@@ -56,7 +56,7 @@ Helix LoRA: frozen INT8 base + rank-8 FP32 adapters, DNA-paired optimizer (gate+
 ## Inference — Qwen2.5-0.5B (200 tokens, warm serve)
 
 ```
-RTX 5090     182.2 tok/s    CUDA Q8 fused matvec
+RTX 5090     234.0 tok/s    CUDA Q8 fused matvec
 M1 Pro       121.7 tok/s    Metal fused Q8 inference
 ```
 
