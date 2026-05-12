@@ -190,10 +190,9 @@ kernel void sq4_matvec(
     for (uint i = tid_in_row; i < K4; i += 64) {
         uchar2 chunk = row2[i];
         float4 a = act4[i];
-        sum += table16[chunk.x & 0x0F] * a.x;
-        sum += table16[(chunk.x >> 4) & 0x0F] * a.y;
-        sum += table16[chunk.y & 0x0F] * a.z;
-        sum += table16[(chunk.y >> 4) & 0x0F] * a.w;
+        float4 w = float4(table16[chunk.x & 0x0F], table16[(chunk.x >> 4) & 0x0F],
+                          table16[chunk.y & 0x0F], table16[(chunk.y >> 4) & 0x0F]);
+        sum += dot(w, a);
     }
 
     uint handled = K4 * 4;
