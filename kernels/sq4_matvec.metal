@@ -36,10 +36,10 @@ kernel void sq4_matvec(
 
     device const uchar2* row2 = (device const uchar2*)(packed + row * half_K);
     device const float4* act4 = (device const float4*)act;
-    uint n2 = half_K / 2;
+    uint K4 = K / 4;
 
     float sum = 0.0f;
-    for (uint i = tid_in_row; i < n2; i += 64) {
+    for (uint i = tid_in_row; i < K4; i += 64) {
         uchar2 chunk = row2[i];
         float4 a = act4[i];
         sum += table16[chunk.x & 0x0F] * a.x;
@@ -48,7 +48,7 @@ kernel void sq4_matvec(
         sum += table16[(chunk.y >> 4) & 0x0F] * a.w;
     }
 
-    uint handled = n2 * 4;
+    uint handled = K4 * 4;
     for (uint k = handled + tid_in_row; k < K; k += 64) {
         uint byte_idx = k >> 1;
         uint shift = (k & 1) * 4;
