@@ -150,3 +150,95 @@ kernel void decode_attn(
         acc += scores[t] * invSum * vCache[t * kvDim + kvH * headDim + tid];
     out[h * headDim + tid] = acc;
 }
+
+// SQ4 matvec: 4 rows per threadgroup, 2 simdgroups per row.
+// Vectorized uchar4 reads (8 nibbles per load), float4 activation reads.
+// 16-entry signed band table in threadgroup memory.
+kernel void sq4_matvec(
+    device const float* act      [[buffer(0)]],
+    device const uchar* packed   [[buffer(1)]],
+    device const float* bands    [[buffer(2)]],
+    device float* out            [[buffer(3)]],
+    device const uint* p_K       [[buffer(4)]],
+    device const uint* p_N       [[buffer(5)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]])
+{
+    uint K = p_K[0], N = p_N[0];
+    threadgroup float table16[16];
+    if (sgitg == 0 && tiisg < 8) {
+        table16[tiisg] = bands[tiisg];
+        table16[tiisg + 8] = -bands[tiisg];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint row = tgid * 4 + sgitg / 2;
+    if (row >= N) return;
+
+    ushort half_sg = sgitg % 2;
+    uint tid_in_row = half_sg * 32 + tiisg;
+    uint half_K = K / 2;
+
+    device const uchar4* row4 = (device const uchar4*)(packed + row * half_K);
+    device const float4* act4 = (device const float4*)act;
+    uint n4 = half_K / 4;
+
+    float sum = 0.0f;
+    for (uint i = tid_in_row; i < n4; i += 64) {
+        uchar4 chunk = row4[i];
+        uint col_base = i * 2;
+        float4 a0 = act4[col_base];
+        float4 a1 = act4[col_base + 1];
+        sum += table16[chunk.x & 0x0F] * a0.x;
+        sum += table16[(chunk.x >> 4) & 0x0F] * a0.y;
+        sum += table16[chunk.y & 0x0F] * a0.z;
+        sum += table16[(chunk.y >> 4) & 0x0F] * a0.w;
+        sum += table16[chunk.z & 0x0F] * a1.x;
+        sum += table16[(chunk.z >> 4) & 0x0F] * a1.y;
+        sum += table16[chunk.w & 0x0F] * a1.z;
+        sum += table16[(chunk.w >> 4) & 0x0F] * a1.w;
+    }
+
+    uint handled = n4 * 8;
+    for (uint k = handled + tid_in_row; k < K; k += 64) {
+        uint byte_idx = k >> 1;
+        uint shift = (k & 1) * 4;
+        uchar nibble = (packed[row * half_K + byte_idx] >> shift) & 0x0F;
+        sum += table16[nibble] * act[k];
+    }
+
+    sum = simd_sum(sum);
+    threadgroup float shmem[8];
+    if (tiisg == 0) shmem[sgitg] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg % 2 == 0 && tiisg == 0)
+        out[row] = shmem[sgitg] + shmem[sgitg + 1];
+}
+
+// SQ4 outlier correction
+kernel void sq4_outlier_correct(
+    device const uint* outlier_idx   [[buffer(0)]],
+    device const float* outlier_val  [[buffer(1)]],
+    device const uchar* packed       [[buffer(2)]],
+    device const float* bands        [[buffer(3)]],
+    device const float* act          [[buffer(4)]],
+    device atomic_float* out         [[buffer(5)]],
+    device const uint* p_cols        [[buffer(6)]],
+    device const uint* p_count       [[buffer(7)]],
+    uint tid [[thread_position_in_grid]])
+{
+    uint cols = p_cols[0], count = p_count[0];
+    if (tid >= count) return;
+    uint flat = outlier_idx[tid];
+    uint row = flat / cols;
+    uint col = flat % cols;
+    uint half_cols = cols >> 1;
+    uint byte_idx = row * half_cols + (col >> 1);
+    uint shift = (col & 1) * 4;
+    uchar nibble = (packed[byte_idx] >> shift) & 0x0F;
+    float band_approx = bands[nibble & 0x07];
+    if (nibble & 0x08) band_approx = -band_approx;
+    float correction = (outlier_val[tid] - band_approx) * act[col];
+    atomic_fetch_add_explicit(out + row, correction, memory_order_relaxed);
+}

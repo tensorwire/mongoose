@@ -2269,6 +2269,18 @@ static id<MTLComputePipelineState> g_ps_bias_add = nil;
 static id<MTLComputePipelineState> g_ps_rope_fwd = nil;
 static id<MTLComputePipelineState> g_ps_rope_bwd = nil;
 
+// Public pipeline state factory — used by standalone kernel files (sq4_infer, mlp_train, etc.)
+id<MTLComputePipelineState> mtl_make_pipeline(NSString* name) {
+    NSError* err = nil;
+    id<MTLFunction> fn = [g_compute_lib newFunctionWithName:name];
+    if (!fn) return nil;
+    MTLComputePipelineDescriptor* desc = [[MTLComputePipelineDescriptor alloc] init];
+    desc.computeFunction = fn;
+    desc.supportIndirectCommandBuffers = YES;
+    id<MTLComputePipelineState> ps = [g_device newComputePipelineStateWithDescriptor:desc options:0 reflection:nil error:&err];
+    return ps;
+}
+
 static id<MTLComputePipelineState> make_ps(NSString* name) {
     NSError* err = nil;
     id<MTLFunction> fn = [g_compute_lib newFunctionWithName:name];

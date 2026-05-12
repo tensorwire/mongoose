@@ -9,7 +9,7 @@
 
 // out[row] = sum_k(dequant(packed[row,k]) * act[k])
 // packed: [rows, cols/2] bytes (2 weights per byte)
-// bands: [rows, 8] floats (8 band values per row)
+// bands: [8] floats (per-tensor band means)
 // act: [cols] floats (activation vector)
 // out: [rows] floats
 __global__ void sq4_matvec_kernel(
@@ -19,8 +19,11 @@ __global__ void sq4_matvec_kernel(
     float* __restrict__ out,
     int cols
 ) {
+    __shared__ float s_bands[8];
+    if (threadIdx.x < 8) s_bands[threadIdx.x] = bands[threadIdx.x];
+    __syncthreads();
+
     int row = blockIdx.x;
-    const float* row_bands = bands + row * 8;
     int half_cols = cols / 2;
     const uint8_t* row_packed = packed + row * half_cols;
 
@@ -30,7 +33,7 @@ __global__ void sq4_matvec_kernel(
         int shift = (k & 1) * 4;
         int nibble = (row_packed[byte_idx] >> shift) & 0x0F;
         int band = nibble & 0x07;
-        float w = row_bands[band];
+        float w = s_bands[band];
         if (nibble & 0x08) w = -w;
         sum += w * act[k];
     }
@@ -85,12 +88,11 @@ __global__ void sq4_outlier_correct_kernel(
     int row = flat / cols;
     int col = flat % cols;
 
-    // Dequant the band approximation
     int half_cols = cols / 2;
     int byte_idx = row * half_cols + (col >> 1);
     int shift = (col & 1) * 4;
     int nibble = (packed[byte_idx] >> shift) & 0x0F;
-    float band_approx = bands[row * 8 + (nibble & 0x07)];
+    float band_approx = bands[nibble & 0x07];
     if (nibble & 0x08) band_approx = -band_approx;
 
     float correction = (outlier_val[i] - band_approx) * act[col];
