@@ -34,32 +34,21 @@ kernel void sq4_matvec(
     uint tid_in_row = half_sg * 32 + tiisg;
     uint half_K = K / 2;
 
-    device const uchar4* row4 = (device const uchar4*)(packed + row * half_K);
-    uint n4 = half_K / 4;
-
+    device const uchar2* row2 = (device const uchar2*)(packed + row * half_K);
     device const float4* act4 = (device const float4*)act;
+    uint n2 = half_K / 2;
 
     float sum = 0.0f;
-    for (uint i = tid_in_row; i < n4; i += 64) {
-        uchar4 chunk = row4[i];
-        uint col_base = i * 2;
-
-        float4 a0 = act4[col_base];
-        float4 a1 = act4[col_base + 1];
-
-        #define SQ4_DEQUANT(nib) table16[(nib)]
-        sum += SQ4_DEQUANT(chunk.x & 0x0F) * a0.x;
-        sum += SQ4_DEQUANT((chunk.x >> 4) & 0x0F) * a0.y;
-        sum += SQ4_DEQUANT(chunk.y & 0x0F) * a0.z;
-        sum += SQ4_DEQUANT((chunk.y >> 4) & 0x0F) * a0.w;
-        sum += SQ4_DEQUANT(chunk.z & 0x0F) * a1.x;
-        sum += SQ4_DEQUANT((chunk.z >> 4) & 0x0F) * a1.y;
-        sum += SQ4_DEQUANT(chunk.w & 0x0F) * a1.z;
-        sum += SQ4_DEQUANT((chunk.w >> 4) & 0x0F) * a1.w;
-        #undef SQ4_DEQUANT
+    for (uint i = tid_in_row; i < n2; i += 64) {
+        uchar2 chunk = row2[i];
+        float4 a = act4[i];
+        sum += table16[chunk.x & 0x0F] * a.x;
+        sum += table16[(chunk.x >> 4) & 0x0F] * a.y;
+        sum += table16[chunk.y & 0x0F] * a.z;
+        sum += table16[(chunk.y >> 4) & 0x0F] * a.w;
     }
 
-    uint handled = n4 * 8;
+    uint handled = n2 * 4;
     for (uint k = handled + tid_in_row; k < K; k += 64) {
         uint byte_idx = k >> 1;
         uint shift = (k & 1) * 4;
