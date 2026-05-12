@@ -1,11 +1,12 @@
 NVCC ?= nvcc
-CUDA_ARCH ?= -gencode arch=compute_90,code=compute_90
+CUDA_ARCH ?= -gencode arch=compute_80,code=compute_80 -gencode arch=compute_90,code=compute_90 -gencode arch=compute_120,code=compute_120
 
 # Atomic kernel files — mongoose.cu includes them all via #include
 KERNEL_DEPS := mongoose_rmsnorm.cu mongoose_rope.cu mongoose_attention.cu \
 	mongoose_silu.cu mongoose_elementwise.cu mongoose_adamw.cu mongoose_loss.cu \
 	mongoose_q8_matvec.cu mongoose_quant.cu mongoose_kv.cu mongoose_helix.cu \
-	mongoose_sparse.cu mongoose_mlp_fused.cu
+	mongoose_sparse.cu mongoose_mlp_fused.cu \
+	mongoose_sq4_matvec.cu mongoose_sq4_infer.cu
 
 libmongoose_kernels.so: mongoose.cu $(KERNEL_DEPS)
 	$(NVCC) -shared -o $@ mongoose.cu -Xcompiler -fPIC -rdc=true $(CUDA_ARCH)

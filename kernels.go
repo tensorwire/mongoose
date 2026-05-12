@@ -72,11 +72,39 @@ typedef void (*fn_kv_cache_write_tq3)(const float*, unsigned char*, int, int, in
 typedef void (*fn_kv_cache_dequant_tq3)(const unsigned char*, float*, int, int, int, int, int, cudaStream_t);
 
 typedef void (*fn_sq4_matvec)(const void*, const float*, const float*, float*, int, int, cudaStream_t);
+typedef void (*fn_sq4_matvec_fused)(const void*, const float*, const float*, float*, int, int, const unsigned int*, const float*, int, cudaStream_t);
+typedef void (*fn_sq4_matvec_swizzled)(const void*, const float*, const float*, float*, int, int, const float*, const float*, const unsigned int*, int, cudaStream_t);
+typedef void (*fn_sq4_swizzle)(const unsigned char*, unsigned char*, int, int);
+typedef void (*fn_argmax)(const float*, unsigned int*, int, cudaStream_t);
+
+// Fused SQ4 inference
+typedef int (*fn_sq4i_build)(int,int,int,int,int,int,int,int,int);
+typedef void (*fn_sq4i_set_layer)(int, void*,void*,void*,void*,int,int,int, void*,void*,void*,void*,int,int,int, void*,void*,void*,void*,int,int,int, void*,void*,void*,void*,int,int,int, void*,void*,void*,void*,int,int,int, void*,void*,void*,void*,int,int,int, void*,void*,void*,void*,int,int,int, void*,void*,void*,void*,void*, void*,void*);
+typedef void (*fn_sq4i_set_final)(void*, void*,void*,void*,void*,int,int,int, void*,void*,void*);
+typedef int (*fn_sq4i_step)(int,int);
+typedef int (*fn_sq4i_step_logits)(int,int,float*);
+typedef void (*fn_sq4i_reset_kv)(void);
+typedef void (*fn_embed_gather_single)(const float*, float*, int, int, cudaStream_t);
 typedef int (*fn_has_sq4_matvec)();
 typedef void (*fn_sq4_outlier_correct)(const unsigned int*, const float*, const void*, const float*, const float*, float*, int, int, cudaStream_t);
+typedef void (*fn_sq4i_set_swizzled)(int);
+typedef void (*fn_sq4i_set_outlier_approx)(int, int, const float*, int);
 
 static fn_sq4_matvec          k_sq4_matvec = NULL;
+static fn_sq4_matvec_fused    k_sq4_matvec_fused = NULL;
+static fn_sq4_matvec_swizzled k_sq4_matvec_swiz = NULL;
+static fn_sq4_swizzle         k_sq4_swizzle = NULL;
 static fn_sq4_outlier_correct k_sq4_outlier = NULL;
+static fn_argmax              k_argmax = NULL;
+static fn_sq4i_build          k_sq4i_build = NULL;
+static fn_sq4i_set_layer      k_sq4i_set_layer = NULL;
+static fn_sq4i_set_final      k_sq4i_set_final = NULL;
+static fn_sq4i_step           k_sq4i_step = NULL;
+static fn_sq4i_step_logits    k_sq4i_step_logits = NULL;
+static fn_sq4i_reset_kv       k_sq4i_reset_kv = NULL;
+static fn_embed_gather_single k_embed_gather_single = NULL;
+static fn_sq4i_set_swizzled   k_sq4i_set_swizzled = NULL;
+static fn_sq4i_set_outlier_approx k_sq4i_set_oa = NULL;
 
 // MLP training kernels
 typedef void (*fn_bias_add)(float*, const float*, int, int, cudaStream_t);
@@ -239,7 +267,20 @@ int tw_load_kernels(const char* path) {
     k_kv_dequant_tq3      = (fn_kv_cache_dequant_tq3)dlsym(kernel_lib, "mongoose_kv_cache_dequant_tq3");
     k_fp16_add_inplace    = (fn_fp16_add_inplace)dlsym(kernel_lib, "mongoose_fp16_add_inplace");
     k_sq4_matvec          = (fn_sq4_matvec)dlsym(kernel_lib, "mongoose_sq4_matvec");
+    k_sq4_matvec_fused    = (fn_sq4_matvec_fused)dlsym(kernel_lib, "mongoose_sq4_matvec_fused");
+    k_sq4_matvec_swiz     = (fn_sq4_matvec_swizzled)dlsym(kernel_lib, "mongoose_sq4_matvec_swizzled");
+    k_sq4_swizzle         = (fn_sq4_swizzle)dlsym(kernel_lib, "sq4_swizzle_for_tiles");
     k_sq4_outlier         = (fn_sq4_outlier_correct)dlsym(kernel_lib, "mongoose_sq4_outlier_correct");
+    k_argmax              = (fn_argmax)dlsym(kernel_lib, "mongoose_argmax");
+    k_sq4i_build          = (fn_sq4i_build)dlsym(kernel_lib, "sq4_infer_build");
+    k_sq4i_set_layer      = (fn_sq4i_set_layer)dlsym(kernel_lib, "sq4_infer_set_layer");
+    k_sq4i_set_final      = (fn_sq4i_set_final)dlsym(kernel_lib, "sq4_infer_set_final");
+    k_sq4i_step           = (fn_sq4i_step)dlsym(kernel_lib, "sq4_infer_step");
+    k_sq4i_step_logits    = (fn_sq4i_step_logits)dlsym(kernel_lib, "sq4_infer_step_logits");
+    k_sq4i_reset_kv       = (fn_sq4i_reset_kv)dlsym(kernel_lib, "sq4_infer_reset_kv");
+    k_embed_gather_single = (fn_embed_gather_single)dlsym(kernel_lib, "mongoose_embed_gather_single");
+    k_sq4i_set_swizzled   = (fn_sq4i_set_swizzled)dlsym(kernel_lib, "sq4_infer_set_swizzled");
+    k_sq4i_set_oa         = (fn_sq4i_set_outlier_approx)dlsym(kernel_lib, "sq4_infer_set_outlier_approx");
     k_bias_add            = (fn_bias_add)dlsym(kernel_lib, "mongoose_bias_add");
     k_reduce_mean_rows    = (fn_reduce_mean_rows)dlsym(kernel_lib, "mongoose_reduce_mean_rows");
     k_batchnorm_fwd       = (fn_batchnorm_fwd)dlsym(kernel_lib, "mongoose_batchnorm_fwd");
@@ -374,6 +415,64 @@ void tw_k_dropout_bwd(float* dx, const float* mask, int n) {
 void tw_k_sq4_matvec(const void* packed, const float* bands, const float* act,
                       float* out, int rows, int cols) {
     if (k_sq4_matvec) k_sq4_matvec(packed, bands, act, out, rows, cols, 0);
+}
+void tw_k_sq4_matvec_fused(const void* packed, const float* bands, const float* act,
+                            float* out, int rows, int cols,
+                            const unsigned int* oidx, const float* oval, int ocount) {
+    if (k_sq4_matvec_fused) k_sq4_matvec_fused(packed, bands, act, out, rows, cols, oidx, oval, ocount, 0);
+}
+void tw_k_sq4_matvec_swizzled(const void* packed, const float* bands, const float* act,
+                               float* out, int rows, int cols,
+                               const float* o_approx, const float* oval,
+                               const unsigned int* oidx, int ocount) {
+    if (k_sq4_matvec_swiz) k_sq4_matvec_swiz(packed, bands, act, out, rows, cols, o_approx, oval, oidx, ocount, 0);
+    else if (k_sq4_matvec_fused) k_sq4_matvec_fused(packed, bands, act, out, rows, cols, oidx, oval, ocount, 0);
+}
+void tw_k_sq4_swizzle(const unsigned char* src, unsigned char* dst, int rows, int cols) {
+    if (k_sq4_swizzle) k_sq4_swizzle(src, dst, rows, cols);
+}
+int tw_k_has_sq4_tf32() { return k_sq4_matvec_swiz != NULL ? 1 : 0; }
+void tw_sq4i_set_swizzled(int flag) {
+    if (k_sq4i_set_swizzled) k_sq4i_set_swizzled(flag);
+}
+void tw_sq4i_set_outlier_approx(int layer, int slot, const float* approx, int count) {
+    if (k_sq4i_set_oa) k_sq4i_set_oa(layer, slot, approx, count);
+}
+void tw_k_argmax(const float* data, unsigned int* result, int n) {
+    if (k_argmax) k_argmax(data, result, n, 0);
+}
+int tw_sq4i_build(int dim, int kv, int hd, int nh, int nkv, int ffn, int vocab, int nl, int maxseq) {
+    if (k_sq4i_build) return k_sq4i_build(dim, kv, hd, nh, nkv, ffn, vocab, nl, maxseq);
+    return -1;
+}
+void tw_sq4i_set_layer(int l,
+    void* a1,void* a2,void* a3,void* a4,int a5,int a6,int a7,
+    void* b1,void* b2,void* b3,void* b4,int b5,int b6,int b7,
+    void* c1,void* c2,void* c3,void* c4,int c5,int c6,int c7,
+    void* d1,void* d2,void* d3,void* d4,int d5,int d6,int d7,
+    void* e1,void* e2,void* e3,void* e4,int e5,int e6,int e7,
+    void* f1,void* f2,void* f3,void* f4,int f5,int f6,int f7,
+    void* g1,void* g2,void* g3,void* g4,int g5,int g6,int g7,
+    void* n1,void* n2,void* bq,void* bk,void* bv,
+    void* kc,void* vc) {
+    if (k_sq4i_set_layer) k_sq4i_set_layer(l, a1,a2,a3,a4,a5,a6,a7, b1,b2,b3,b4,b5,b6,b7, c1,c2,c3,c4,c5,c6,c7, d1,d2,d3,d4,d5,d6,d7, e1,e2,e3,e4,e5,e6,e7, f1,f2,f3,f4,f5,f6,f7, g1,g2,g3,g4,g5,g6,g7, n1,n2,bq,bk,bv,kc,vc);
+}
+void tw_sq4i_set_final(void* fn, void* lp,void* lb,void* lo,void* lv,int oc,int r,int c, void* em,void* cos,void* sin) {
+    if (k_sq4i_set_final) k_sq4i_set_final(fn, lp,lb,lo,lv,oc,r,c, em,cos,sin);
+}
+int tw_sq4i_step(int tok, int pos) {
+    if (k_sq4i_step) return k_sq4i_step(tok, pos);
+    return -1;
+}
+int tw_sq4i_step_logits(int tok, int pos, float* out) {
+    if (k_sq4i_step_logits) return k_sq4i_step_logits(tok, pos, out);
+    return -1;
+}
+void tw_sq4i_reset_kv() {
+    if (k_sq4i_reset_kv) k_sq4i_reset_kv();
+}
+void tw_k_embed_gather_single(const float* embed, float* out, int tokenID, int dim) {
+    if (k_embed_gather_single) k_embed_gather_single(embed, out, tokenID, dim, 0);
 }
 void tw_k_sq4_outlier_correct(const unsigned int* idx, const float* val,
                                const void* packed, const float* bands,
@@ -1065,6 +1164,46 @@ func KSQ4Matvec(packedPtr, bandsPtr, actPtr, outPtr unsafe.Pointer, rows, cols i
 		(*C.float)(outPtr), C.int(rows), C.int(cols))
 }
 
+// HasSQ4TF32 returns true if the TF32 tensor core SQ4 matvec is available (SM 80+).
+func HasSQ4TF32() bool { return C.tw_k_has_sq4_tf32() != 0 }
+
+// KSQ4MatvecSwizzled dispatches TF32 tensor core matvec on tile-swizzled data.
+// Falls back to scalar fused path if TF32 kernel not available.
+func KSQ4MatvecSwizzled(packedPtr, bandsPtr, actPtr, outPtr unsafe.Pointer, rows, cols int,
+	outlierApproxPtr, outlierValPtr, outlierIdxPtr unsafe.Pointer, outlierCount int) {
+	C.tw_k_sq4_matvec_swizzled(packedPtr, (*C.float)(bandsPtr), (*C.float)(actPtr),
+		(*C.float)(outPtr), C.int(rows), C.int(cols),
+		(*C.float)(outlierApproxPtr), (*C.float)(outlierValPtr),
+		(*C.uint)(outlierIdxPtr), C.int(outlierCount))
+}
+
+// SQ4SwizzleForTiles performs CPU-side tile swizzle on packed nibble data.
+// src and dst must be []byte of length rows*cols/2.
+func SQ4SwizzleForTiles(src, dst []byte, rows, cols int) {
+	C.tw_k_sq4_swizzle((*C.uchar)(unsafe.Pointer(&src[0])),
+		(*C.uchar)(unsafe.Pointer(&dst[0])), C.int(rows), C.int(cols))
+}
+
+// SQ4InferSetSwizzled tells the fused infer pipeline to use TF32 tensor core dispatch.
+func SQ4InferSetSwizzled(flag bool) {
+	v := 0
+	if flag {
+		v = 1
+	}
+	C.tw_sq4i_set_swizzled(C.int(v))
+}
+
+// SQ4InferSetOutlierApprox uploads pre-computed band approximations for a weight's outliers.
+// layer=-1 for lm_head. slot: 0=wq 1=wk 2=wv 3=wo 4=gate 5=up 6=down.
+func SQ4InferSetOutlierApprox(layer, slot int, approx []float32) {
+	if len(approx) == 0 {
+		C.tw_sq4i_set_outlier_approx(C.int(layer), C.int(slot), nil, 0)
+		return
+	}
+	C.tw_sq4i_set_outlier_approx(C.int(layer), C.int(slot),
+		(*C.float)(unsafe.Pointer(&approx[0])), C.int(len(approx)))
+}
+
 // HasMLPKernels returns true if all MLP training kernels are loaded.
 func HasMLPKernels() bool { return C.tw_k_has_mlp_kernels() != 0 }
 
@@ -1116,6 +1255,60 @@ func KDropoutFwd(xPtr, maskPtr unsafe.Pointer, seed, counter uint64, p float32, 
 func KDropoutBwd(dxPtr, maskPtr unsafe.Pointer, n int) {
 	C.tw_k_dropout_bwd((*C.float)(dxPtr), (*C.float)(maskPtr), C.int(n))
 }
+
+// KArgmax finds the index of the maximum element. result must point to a single uint32 on device.
+func KArgmax(dataPtr unsafe.Pointer, resultPtr unsafe.Pointer, n int) {
+	C.tw_k_argmax((*C.float)(dataPtr), (*C.uint)(resultPtr), C.int(n))
+}
+
+// KEmbedGather copies embed[tokenID*dim..(tokenID+1)*dim] to out on device.
+func KEmbedGather(embedPtr, outPtr unsafe.Pointer, tokenID, dim int) {
+	C.tw_k_embed_gather_single((*C.float)(embedPtr), (*C.float)(outPtr), C.int(tokenID), C.int(dim))
+}
+
+// KSQ4MatvecFused: SQ4 matvec + outlier correction in one kernel launch.
+func KSQ4MatvecFused(packedPtr, bandsPtr, actPtr, outPtr unsafe.Pointer, rows, cols int,
+	outlierIdxPtr, outlierValPtr unsafe.Pointer, outlierCount int) {
+	C.tw_k_sq4_matvec_fused(packedPtr, (*C.float)(bandsPtr), (*C.float)(actPtr),
+		(*C.float)(outPtr), C.int(rows), C.int(cols),
+		(*C.uint)(outlierIdxPtr), (*C.float)(outlierValPtr), C.int(outlierCount))
+}
+
+// SQ4 fused inference pipeline — one CGo call per token
+func SQ4InferBuild(dim, kvDim, headDim, nHeads, nKVHeads, ffnDim, vocabSize, nLayers, maxSeq int) int {
+	return int(C.tw_sq4i_build(C.int(dim), C.int(kvDim), C.int(headDim), C.int(nHeads), C.int(nKVHeads), C.int(ffnDim), C.int(vocabSize), C.int(nLayers), C.int(maxSeq)))
+}
+
+func SQ4InferSetLayer(l int, wq, wk, wv, wo, gate, up, down *SQ4WeightPtrs,
+	norm1, norm2, bq, bk, bv, kCache, vCache unsafe.Pointer) {
+	C.tw_sq4i_set_layer(C.int(l),
+		wq.Packed, wq.Bands, wq.OIdx, wq.OVal, C.int(wq.OC), C.int(wq.Rows), C.int(wq.Cols),
+		wk.Packed, wk.Bands, wk.OIdx, wk.OVal, C.int(wk.OC), C.int(wk.Rows), C.int(wk.Cols),
+		wv.Packed, wv.Bands, wv.OIdx, wv.OVal, C.int(wv.OC), C.int(wv.Rows), C.int(wv.Cols),
+		wo.Packed, wo.Bands, wo.OIdx, wo.OVal, C.int(wo.OC), C.int(wo.Rows), C.int(wo.Cols),
+		gate.Packed, gate.Bands, gate.OIdx, gate.OVal, C.int(gate.OC), C.int(gate.Rows), C.int(gate.Cols),
+		up.Packed, up.Bands, up.OIdx, up.OVal, C.int(up.OC), C.int(up.Rows), C.int(up.Cols),
+		down.Packed, down.Bands, down.OIdx, down.OVal, C.int(down.OC), C.int(down.Rows), C.int(down.Cols),
+		norm1, norm2, bq, bk, bv, kCache, vCache)
+}
+
+func SQ4InferSetFinal(finalNorm unsafe.Pointer, lm *SQ4WeightPtrs, embed, cosCache, sinCache unsafe.Pointer) {
+	C.tw_sq4i_set_final(finalNorm, lm.Packed, lm.Bands, lm.OIdx, lm.OVal, C.int(lm.OC), C.int(lm.Rows), C.int(lm.Cols), embed, cosCache, sinCache)
+}
+
+func SQ4InferStep(tokenID, pos int) int {
+	return int(C.tw_sq4i_step(C.int(tokenID), C.int(pos)))
+}
+
+func SQ4InferStepLogits(tokenID, pos int, logitsOut []float32) int {
+	return int(C.tw_sq4i_step_logits(C.int(tokenID), C.int(pos), (*C.float)(unsafe.Pointer(&logitsOut[0]))))
+}
+
+func SQ4InferResetKV() {
+	C.tw_sq4i_reset_kv()
+}
+
+func HasSQ4FusedInfer() bool { return C.tw_sq4i_step != nil }
 
 // KSQ4OutlierCorrect applies outlier corrections after SQ4 matvec.
 func KSQ4OutlierCorrect(idxPtr, valPtr, packedPtr, bandsPtr, actPtr, outPtr unsafe.Pointer, count, cols int) {

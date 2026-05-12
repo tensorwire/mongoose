@@ -118,5 +118,21 @@ func KReduceMean(inPtr, outPtr unsafe.Pointer, n int) {}
 func KDropoutFwd(xPtr, maskPtr unsafe.Pointer, seed, counter uint64, p float32, n int) {}
 func KDropoutBwd(dxPtr, maskPtr unsafe.Pointer, n int) {}
 func HasSQ4Matvec() bool { return false }
+func KArgmax(dataPtr unsafe.Pointer, resultPtr unsafe.Pointer, n int) {}
+
+func SQ4InferBuild(dim, kvDim, headDim, nHeads, nKVHeads, ffnDim, vocabSize, nLayers, maxSeq int) int { return -1 }
+func SQ4InferSetLayer(l int, wq, wk, wv, wo, gate, up, down *SQ4WeightPtrs, norm1, norm2, bq, bk, bv, kCache, vCache unsafe.Pointer) {}
+func SQ4InferSetFinal(finalNorm unsafe.Pointer, lm *SQ4WeightPtrs, embed, cosCache, sinCache unsafe.Pointer) {}
+func SQ4InferStep(tokenID, pos int) int { return -1 }
+func SQ4InferStepLogits(tokenID, pos int, logitsOut []float32) int { return -1 }
+func SQ4InferResetKV() {}
+func HasSQ4FusedInfer() bool { return false }
+func KEmbedGather(embedPtr, outPtr unsafe.Pointer, tokenID, dim int) {}
 func KSQ4Matvec(packedPtr, bandsPtr, actPtr, outPtr unsafe.Pointer, rows, cols int) {}
+func KSQ4MatvecFused(packedPtr, bandsPtr, actPtr, outPtr unsafe.Pointer, rows, cols int, outlierIdxPtr, outlierValPtr unsafe.Pointer, outlierCount int) {}
 func KSQ4OutlierCorrect(idxPtr, valPtr, packedPtr, bandsPtr, actPtr, outPtr unsafe.Pointer, count, cols int) {}
+func HasSQ4TF32() bool { return false }
+func KSQ4MatvecSwizzled(packedPtr, bandsPtr, actPtr, outPtr unsafe.Pointer, rows, cols int, outlierApproxPtr, outlierValPtr, outlierIdxPtr unsafe.Pointer, outlierCount int) {}
+func SQ4SwizzleForTiles(src, dst []byte, rows, cols int) {}
+func SQ4InferSetSwizzled(flag bool) {}
+func SQ4InferSetOutlierApprox(layer, slot int, approx []float32) {}

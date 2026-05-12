@@ -1,5 +1,6 @@
 // sq4_metal_darwin.m — Self-contained SQ4 matvec dispatch.
 // Loads sq4_matvec.metallib. Does NOT reference any globals from metal_impl_darwin.m.
+// GPU-side: packed nibbles [sign:1|band:3], 2 per byte. 16-entry LUT.
 
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
@@ -10,6 +11,9 @@ extern id<MTLCommandQueue> g_queue;
 static id<MTLLibrary> g_sq4_lib = nil;
 id<MTLComputePipelineState> g_ps_sq4_matvec = nil;
 id<MTLComputePipelineState> g_ps_sq4_outlier = nil;
+
+static id<MTLBuffer> g_sq4_zero_buf = nil;
+static id<MTLBuffer> g_sq4_cb_oc = nil;
 
 static id<MTLBuffer> sq4_const_u(uint32_t v) {
     return [g_device newBufferWithBytes:&v length:4 options:MTLResourceStorageModeShared];
@@ -37,6 +41,11 @@ int mtl_sq4_init(const char* path) {
         NSLog(@"[SQ4] pipeline creation failed");
         return 0;
     }
+
+    uint32_t zero = 0;
+    g_sq4_zero_buf = [g_device newBufferWithBytes:&zero length:4 options:MTLResourceStorageModeShared];
+    g_sq4_cb_oc = [g_device newBufferWithBytes:&zero length:4 options:MTLResourceStorageModeShared];
+
     NSLog(@"[SQ4] loaded %@", p);
     return 1;
 }
@@ -58,6 +67,38 @@ void mtl_sq4_matvec(void* actRef, void* packedRef, void* bandsRef, void* outRef,
     [enc setBuffer:(__bridge id<MTLBuffer>)outRef    offset:0 atIndex:3];
     [enc setBuffer:sq4_const_u(cols) offset:0 atIndex:4];
     [enc setBuffer:sq4_const_u(rows) offset:0 atIndex:5];
+    [enc setBuffer:g_sq4_zero_buf offset:0 atIndex:6];
+    [enc setBuffer:g_sq4_zero_buf offset:0 atIndex:7];
+    [enc setBuffer:g_sq4_zero_buf offset:0 atIndex:8];
+    [enc dispatchThreadgroups:MTLSizeMake((rows + 3) / 4, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [enc endEncoding];
+    [cmd commit]; [cmd waitUntilCompleted];
+    }
+}
+
+void mtl_sq4_matvec_fused(void* actRef, void* packedRef, void* bandsRef, void* outRef,
+    int rows, int cols,
+    void* outlierIdxRef, void* outlierValRef, int outlierCount) {
+    if (!g_ps_sq4_matvec) return;
+    @autoreleasepool {
+    id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    [enc setComputePipelineState:g_ps_sq4_matvec];
+    [enc setBuffer:(__bridge id<MTLBuffer>)actRef    offset:0 atIndex:0];
+    [enc setBuffer:(__bridge id<MTLBuffer>)packedRef offset:0 atIndex:1];
+    [enc setBuffer:(__bridge id<MTLBuffer>)bandsRef  offset:0 atIndex:2];
+    [enc setBuffer:(__bridge id<MTLBuffer>)outRef    offset:0 atIndex:3];
+    [enc setBuffer:sq4_const_u(cols) offset:0 atIndex:4];
+    [enc setBuffer:sq4_const_u(rows) offset:0 atIndex:5];
+    if (outlierCount > 0 && outlierIdxRef && outlierValRef) {
+        [enc setBuffer:(__bridge id<MTLBuffer>)outlierIdxRef offset:0 atIndex:6];
+        [enc setBuffer:(__bridge id<MTLBuffer>)outlierValRef offset:0 atIndex:7];
+    } else {
+        [enc setBuffer:g_sq4_zero_buf offset:0 atIndex:6];
+        [enc setBuffer:g_sq4_zero_buf offset:0 atIndex:7];
+    }
+    ((uint32_t*)g_sq4_cb_oc.contents)[0] = (uint32_t)outlierCount;
+    [enc setBuffer:g_sq4_cb_oc offset:0 atIndex:8];
     [enc dispatchThreadgroups:MTLSizeMake((rows + 3) / 4, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     [enc endEncoding];
     [cmd commit]; [cmd waitUntilCompleted];

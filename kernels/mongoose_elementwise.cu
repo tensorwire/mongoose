@@ -210,3 +210,43 @@ void mongoose_fp32_add_fp16(float* a, const void* b, int n, cudaStream_t stream)
     fp32_add_fp16_kernel<<<(n+255)/256, 256, 0, stream>>>(a, (const __half*)b, n);
 }
 
+
+// === Argmax: find index of max element ===
+__global__ void argmax_kernel(const float* data, unsigned int* result, int n) {
+    __shared__ float smax[256];
+    __shared__ unsigned int sidx[256];
+
+    float best = -1e30f;
+    unsigned int bestIdx = 0;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        float v = data[i];
+        if (v > best) { best = v; bestIdx = i; }
+    }
+    smax[threadIdx.x] = best;
+    sidx[threadIdx.x] = bestIdx;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s && smax[threadIdx.x + s] > smax[threadIdx.x]) {
+            smax[threadIdx.x] = smax[threadIdx.x + s];
+            sidx[threadIdx.x] = sidx[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) result[0] = sidx[0];
+}
+
+void mongoose_argmax(const float* data, unsigned int* result, int n, cudaStream_t stream) {
+    argmax_kernel<<<1, 256, 0, stream>>>(data, result, n);
+}
+
+// === Embed gather single token: out[0..dim-1] = embed[tokenID*dim .. (tokenID+1)*dim-1] ===
+__global__ void embed_gather_single_kernel(const float* embed, float* out, int tokenID, int dim) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < dim) out[i] = embed[tokenID * dim + i];
+}
+
+void mongoose_embed_gather_single(const float* embed, float* out, int tokenID, int dim, cudaStream_t stream) {
+    embed_gather_single_kernel<<<(dim+255)/256, 256, 0, stream>>>(embed, out, tokenID, dim);
+}

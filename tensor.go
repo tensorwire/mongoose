@@ -2,6 +2,12 @@ package mongoose
 
 import "unsafe"
 
+// SQ4WeightPtrs holds device pointers for an SQ4 weight tensor.
+type SQ4WeightPtrs struct {
+	Packed, Bands, OIdx, OVal unsafe.Pointer
+	OC, Rows, Cols            int
+}
+
 // Tensor represents a multi-dimensional array that lives on a compute device.
 // Data stays on-device (GPU) until explicitly moved to host.
 // This is the key abstraction that eliminates PCIe round-trips between ops.

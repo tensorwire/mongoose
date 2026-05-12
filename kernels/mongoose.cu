@@ -22,6 +22,7 @@ extern "C" {
 #include "mongoose_silu.cu"
 #include "mongoose_sparse.cu"
 #include "mongoose_sq4_matvec.cu"
+#include "mongoose_sq4_infer.cu"
 #include "mongoose_mlp_train.cu"
 
 } // extern "C"

@@ -9,6 +9,7 @@ package mongoose
 extern int mtl_sq4_init(const char* path);
 extern int mtl_sq4_ready(void);
 extern void mtl_sq4_matvec(void* act, void* packed, void* bands, void* out, int rows, int cols);
+extern void mtl_sq4_matvec_fused(void* act, void* packed, void* bands, void* out, int rows, int cols, void* outlierIdx, void* outlierVal, int outlierCount);
 extern void mtl_sq4_outlier_correct(void* outlierIdx, void* outlierVal, void* packed, void* bands, void* act, void* out, int outlierCount, int cols);
 
 extern void* mtl_alloc(unsigned long bytes);
@@ -80,6 +81,12 @@ func NewSQ4Metal(eng *Metal) *SQ4Metal {
 func (s *SQ4Metal) Matvec(act, packed, bands, out *Tensor, rows, cols int) {
 	C.mtl_sq4_matvec(MtlBufPtr(act), MtlBufPtr(packed), MtlBufPtr(bands), MtlBufPtr(out),
 		C.int(rows), C.int(cols))
+}
+
+func (s *SQ4Metal) MatvecFused(act, packed, bands, out *Tensor, rows, cols int, outlierIdx, outlierVal *Tensor, outlierCount int) {
+	C.mtl_sq4_matvec_fused(MtlBufPtr(act), MtlBufPtr(packed), MtlBufPtr(bands), MtlBufPtr(out),
+		C.int(rows), C.int(cols),
+		MtlBufPtr(outlierIdx), MtlBufPtr(outlierVal), C.int(outlierCount))
 }
 
 func (s *SQ4Metal) OutlierCorrect(outlierIdx, outlierVal, packed, bands, act, out *Tensor, outlierCount, cols int) {
