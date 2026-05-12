@@ -10,13 +10,13 @@ extern id<MTLCommandQueue> g_queue;
 extern id<MTLComputePipelineState> mtl_make_pipeline(NSString* name);
 
 typedef struct {
-    int packed_offset;
+    long long packed_offset;
     int bands_offset;   // float index into bands slab
     int outlier_offset; // element index into outlier slabs
     int outlier_count;
     int rows, cols;
     int lut_offset;     // element offset into LUT texture (16 entries per tensor)
-    int lin_packed_offset; // byte offset in MLX-padded packed slab
+    long long lin_packed_offset; // byte offset in MLX-padded packed slab
     int lin_padded_cols;   // cols rounded up to MLX block_size (512)
 } sq4_wt;
 
@@ -79,7 +79,7 @@ static struct {
     float* shared_bands_copy;
     uint32_t* shared_outlier_idx_copy;
     float* shared_outlier_val_copy;
-    int shared_packed_bytes;
+    long long shared_packed_bytes;
     int shared_bands_floats;
     int shared_outlier_count;
 
@@ -112,9 +112,9 @@ static void* mkconstf(float v) {
     return BR([g_device newBufferWithBytes:&v length:4 options:MTLResourceStorageModeShared]);
 }
 
-static void* upload_private(const void* data, int nBytes) {
-    id<MTLBuffer> staging = [g_device newBufferWithBytes:data length:nBytes options:MTLResourceStorageModeShared];
-    id<MTLBuffer> priv = [g_device newBufferWithLength:nBytes options:MTLResourceStorageModePrivate];
+static void* upload_private(const void* data, long long nBytes) {
+    id<MTLBuffer> staging = [g_device newBufferWithBytes:data length:(NSUInteger)nBytes options:MTLResourceStorageModeShared];
+    id<MTLBuffer> priv = [g_device newBufferWithLength:(NSUInteger)nBytes options:MTLResourceStorageModePrivate];
     id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
     id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
     [blit copyFromBuffer:staging sourceOffset:0 toBuffer:priv destinationOffset:0 size:nBytes];
@@ -128,8 +128,8 @@ static void* upload_private(const void* data, int nBytes) {
 // API: Build
 // ============================================================================
 
-void mtl_sq4_infer_alloc_slabs(int totalPackedBytes, int totalBandsFloats, int totalOutliers) {
-    S.packed_slab = BR([g_device newBufferWithLength:totalPackedBytes options:MTLResourceStorageModeShared]);
+void mtl_sq4_infer_alloc_slabs(long long totalPackedBytes, int totalBandsFloats, int totalOutliers) {
+    S.packed_slab = BR([g_device newBufferWithLength:(NSUInteger)totalPackedBytes options:MTLResourceStorageModeShared]);
     S.bands_slab = BR([g_device newBufferWithLength:totalBandsFloats * 4 options:MTLResourceStorageModeShared]);
     if (totalOutliers > 0) {
         S.outlier_idx_slab = BR([g_device newBufferWithLength:totalOutliers * 4 options:MTLResourceStorageModeShared]);
@@ -137,7 +137,7 @@ void mtl_sq4_infer_alloc_slabs(int totalPackedBytes, int totalBandsFloats, int t
     }
 }
 
-void mtl_sq4_infer_upload_packed(int packedOffset, const uint8_t* mag, int magBytes,
+void mtl_sq4_infer_upload_packed(long long packedOffset, const uint8_t* mag, int magBytes,
     const uint8_t* sign_data, int signBytes, int nWeights) {
     uint8_t* dst = (uint8_t*)B(S.packed_slab).contents + packedOffset;
     for (int i = 0; i < nWeights; i++) {
@@ -177,7 +177,7 @@ void mtl_sq4_infer_finalize_slabs(void) {
     id<MTLBuffer> sb = B(S.bands_slab);
 
     // Save copies of shared slab data BEFORE promoting to private
-    S.shared_packed_bytes = (int)sp.length;
+    S.shared_packed_bytes = (long long)sp.length;
     S.shared_bands_floats = (int)(sb.length / sizeof(float));
     S.shared_packed_copy = (uint8_t*)malloc(sp.length);
     S.shared_bands_copy = (float*)malloc(sb.length);
@@ -224,7 +224,7 @@ void mtl_sq4_infer_finalize_slabs(void) {
     // Build linear INT4 re-encoding from SQ4 band means
     // For each tensor's packed nibbles: dequant → find per-group scale+bias → re-encode as linear int4
     {
-        int totalPacked = (int)sp.length;  // bytes in packed slab
+        long long totalPacked = (long long)sp.length;
         int totalWeights = totalPacked * 2; // 2 nibbles per byte
         int totalGroups = totalWeights / LIN_GROUP_SIZE;
 
@@ -605,7 +605,7 @@ void mtl_sq4_infer_set_fp32(int idx, const float* data, int nFloats) {
     }
 }
 
-void mtl_sq4_infer_set_sq4_desc(int idx, int packedOffset,
+void mtl_sq4_infer_set_sq4_desc(int idx, long long packedOffset,
     int bandsOffset, int outlierOffset, int outlierCount, int rows, int cols) {
     if (!S.built) return;
     int nL = S.nLayers;
@@ -821,16 +821,21 @@ static void build_linear_encoding(void) {
     // Calculate total size needed
     if (!S.shared_packed_copy || !S.shared_bands_copy) return;
 
-    int totalPacked = S.shared_packed_bytes;
-    int totalWeights = totalPacked * 2;
-    int totalGroups = totalWeights / LIN_GROUP_SIZE;
+    long long totalPacked = S.shared_packed_bytes;
+    long long totalWeights = totalPacked * 2;
+    int totalGroups = (int)(totalWeights / LIN_GROUP_SIZE);
 
     // Also compute per-ROW scale+bias for the fast kernel
     // We'll compute these alongside the per-group encoding
 
+    fprintf(stderr, "[SQ4] alloc re-encoding: %lld bytes packed, %d groups\n", totalPacked, totalGroups);
     uint8_t* newPacked = (uint8_t*)calloc(1, totalPacked);
     float* newScales = (float*)calloc(totalGroups, sizeof(float));
     float* newBiases = (float*)calloc(totalGroups, sizeof(float));
+    if (!newPacked || !newScales || !newBiases) {
+        fprintf(stderr, "[SQ4] FATAL: calloc failed for re-encoding buffers\n");
+        return;
+    }
     uint8_t* srcPacked = S.shared_packed_copy;
     float* srcBands = S.shared_bands_copy;
 
@@ -853,8 +858,8 @@ static void build_linear_encoding(void) {
 
             int nWeights = w->rows * w->cols;
             int nGroups = nWeights / LIN_GROUP_SIZE;
-            int poff = w->packed_offset;  // byte offset in packed slab
-            int goff = poff * 2 / LIN_GROUP_SIZE; // group offset
+            long long poff = w->packed_offset;
+            int goff = (int)(poff * 2 / LIN_GROUP_SIZE);
 
             for (int g = 0; g < nGroups; g++) {
                 int wstart = g * LIN_GROUP_SIZE;
@@ -863,7 +868,7 @@ static void build_linear_encoding(void) {
                 float vals[LIN_GROUP_SIZE];
                 for (int j = 0; j < LIN_GROUP_SIZE; j++) {
                     int wi = wstart + j;
-                    int byteIdx = poff + wi / 2;
+                    long long byteIdx = poff + wi / 2;
                     int shift = (wi & 1) * 4;
                     int nib = (srcPacked[byteIdx] >> shift) & 0x0F;
                     vals[j] = table16[nib];
@@ -894,7 +899,7 @@ static void build_linear_encoding(void) {
                     if (code < 0) code = 0;
                     if (code > 15) code = 15;
                     int wi = wstart + j;
-                    int byteIdx = poff + wi / 2;
+                    long long byteIdx = poff + wi / 2;
                     int shift = (wi & 1) * 4;
                     if (shift == 0)
                         newPacked[byteIdx] = (newPacked[byteIdx] & 0xF0) | (code & 0x0F);
@@ -917,15 +922,15 @@ static void build_linear_encoding(void) {
             }
             int nWeights = w->rows * w->cols;
             int nGroups = nWeights / LIN_GROUP_SIZE;
-            int poff = w->packed_offset;
-            int goff = poff * 2 / LIN_GROUP_SIZE;
+            long long poff = w->packed_offset;
+            int goff = (int)(poff * 2 / LIN_GROUP_SIZE);
             for (int g = 0; g < nGroups; g++) {
                 int wstart = g * LIN_GROUP_SIZE;
                 float gmin = 1e30f, gmax = -1e30f;
                 float vals[LIN_GROUP_SIZE];
                 for (int j = 0; j < LIN_GROUP_SIZE; j++) {
                     int wi = wstart + j;
-                    int byteIdx = poff + wi / 2;
+                    long long byteIdx = poff + wi / 2;
                     int shift = (wi & 1) * 4;
                     int nib = (srcPacked[byteIdx] >> shift) & 0x0F;
                     vals[j] = table16[nib];
@@ -948,7 +953,7 @@ static void build_linear_encoding(void) {
                     if (code < 0) code = 0;
                     if (code > 15) code = 15;
                     int wi = wstart + j;
-                    int byteIdx = poff + wi / 2;
+                    long long byteIdx = poff + wi / 2;
                     int shift = (wi & 1) * 4;
                     if (shift == 0)
                         newPacked[byteIdx] = (newPacked[byteIdx] & 0xF0) | (code & 0x0F);
@@ -978,7 +983,7 @@ static void build_linear_encoding(void) {
     // Build MLX-padded slab: rows padded to next multiple of 512 (MLX block_size)
     if (S.ps_mlx_qmv) {
         #define MLX_BLOCK 512
-        int mlxTotalPacked = 0, mlxTotalGroups = 0;
+        long long mlxTotalPacked = 0; int mlxTotalGroups = 0;
         for (int t = 0; t < n_wt_types; t++)
             for (int l = 0; l < nL; l++) {
                 sq4_wt* w = &all_wts[t][l];
@@ -996,14 +1001,14 @@ static void build_linear_encoding(void) {
         uint8_t* mp = (uint8_t*)calloc(1, mlxTotalPacked);
         float* ms = (float*)calloc(mlxTotalGroups, sizeof(float));
         float* mb = (float*)calloc(mlxTotalGroups, sizeof(float));
-        int mpo = 0, mgo = 0;
+        long long mpo = 0; int mgo = 0;
 
         for (int t = 0; t < n_wt_types; t++)
             for (int l = 0; l < nL; l++) {
                 sq4_wt* w = &all_wts[t][l];
                 if (w->rows == 0 || w->cols == 0) continue;
                 int K = w->cols, padK = (K + MLX_BLOCK - 1) / MLX_BLOCK * MLX_BLOCK;
-                int sg = (w->packed_offset * 2) / LIN_GROUP_SIZE;
+                int sg = (int)(w->packed_offset * 2 / LIN_GROUP_SIZE);
                 w->lin_packed_offset = mpo;
                 w->lin_padded_cols = padK;
                 for (int r = 0; r < w->rows; r++) {
@@ -1017,7 +1022,7 @@ static void build_linear_encoding(void) {
             }
         { sq4_wt* w = &S.lmHead; if (w->rows > 0 && w->cols > 0) {
             int K = w->cols, padK = (K + MLX_BLOCK - 1) / MLX_BLOCK * MLX_BLOCK;
-            int sg = (w->packed_offset * 2) / LIN_GROUP_SIZE;
+            int sg = (int)(w->packed_offset * 2 / LIN_GROUP_SIZE);
             w->lin_packed_offset = mpo;
             w->lin_padded_cols = padK;
             for (int r = 0; r < w->rows; r++) {
@@ -1035,8 +1040,8 @@ static void build_linear_encoding(void) {
             sq4_wt* w0 = &all_wts[0][0]; // wq layer 0
             int K = w0->cols;
             int padK = w0->lin_padded_cols;
-            int linOff = w0->packed_offset;
-            int mlxOff = w0->lin_packed_offset;
+            long long linOff = w0->packed_offset;
+            long long mlxOff = w0->lin_packed_offset;
             int linGrp = (linOff * 2) / LIN_GROUP_SIZE;
             int mlxGrp = (mlxOff * 2) / LIN_GROUP_SIZE;
             fprintf(stderr, "[MLX-DIAG] wq0: K=%d padK=%d linOff=%d mlxOff=%d\n", K, padK, linOff, mlxOff);
@@ -1099,7 +1104,7 @@ static void build_linear_encoding(void) {
         S.mlx_scales_slab = upload_private(ms, mlxTotalGroups * sizeof(float));
         S.mlx_biases_slab = upload_private(mb, mlxTotalGroups * sizeof(float));
         free(mp); free(ms); free(mb);
-        NSLog(@"[SQ4] MLX padded slab: %d bytes packed, %d groups", mlxTotalPacked, mlxTotalGroups);
+        NSLog(@"[SQ4] MLX padded slab: %lld bytes packed, %d groups", mlxTotalPacked, mlxTotalGroups);
         #undef MLX_BLOCK
     }
 
@@ -1154,10 +1159,10 @@ static void build_linear_encoding(void) {
                 }
 
                 // Re-encode packed nibbles
-                int poff = w->packed_offset;
+                long long poff = w->packed_offset;
                 int nWeights = w->rows * w->cols;
                 for (int i = 0; i < nWeights; i++) {
-                    int byteIdx = poff + i / 2;
+                    long long byteIdx = poff + i / 2;
                     int shift = (i & 1) * 4;
                     uint8_t oldNib = (srcPacked[byteIdx] >> shift) & 0x0F;
                     uint8_t newNib = remap[oldNib];
@@ -1201,10 +1206,10 @@ static void build_linear_encoding(void) {
                     if (code < 0) code = 0; if (code > 15) code = 15;
                     remap[i] = (uint8_t)code;
                 }
-                int poff = w->packed_offset;
+                long long poff = w->packed_offset;
                 int nWeights = w->rows * w->cols;
                 for (int i = 0; i < nWeights; i++) {
-                    int byteIdx = poff + i / 2;
+                    long long byteIdx = poff + i / 2;
                     int shift = (i & 1) * 4;
                     uint8_t oldNib = (srcPacked[byteIdx] >> shift) & 0x0F;
                     uint8_t newNib = remap[oldNib];
@@ -1310,7 +1315,11 @@ static void build_linear_encoding(void) {
 
 int mtl_sq4_infer_step(int tokenID, int pos, float* logitsOut) {
     if (!S.built) return -1;
-    if (S.ps_sq4mv_lin && !S.lin_packed_slab) build_linear_encoding();
+    if (S.ps_sq4mv_lin && !S.lin_packed_slab) {
+        fprintf(stderr, "[SQ4] building linear encoding...\n");
+        build_linear_encoding();
+        fprintf(stderr, "[SQ4] linear encoding done\n");
+    }
     int dim=S.dim, kvDim=S.kvDim, headDim=S.headDim;
     int nHeads=S.nHeads, nKVHeads=S.nKVHeads, ffnDim=S.ffnDim;
     int nLayers=S.nLayers, vocabSize=S.vocabSize;
@@ -1397,8 +1406,8 @@ int mtl_sq4_infer_step(int tokenID, int pos, float* logitsOut) {
         BUF(S.hidden, 0); BUF(S.normed2, 1); BUF(S.norm2[l], 2);
         CB(S.cb_dim, 3); CB(S.cb_eps, 4); DTG(1, tpg); BAR();
 
-        // FFN: fused gate+up+SiLU (disabled — use sq4mv for all tensors)
-        if (0 && S.ps_fused_gus_lin && S.lin_packed_slab) {
+        // FFN: fused gate+up+SiLU
+        if (S.ps_fused_gus_lin && S.lin_packed_slab) {
             // Fused linear: no LUT, 1 dispatch
             sq4_wt* wg = &S.wgate[l];
             sq4_wt* wu = &S.wup[l];
@@ -1426,7 +1435,7 @@ int mtl_sq4_infer_step(int tokenID, int pos, float* logitsOut) {
             CB(S.cb_oc[l*7+5], 15);
             DTG((ffnDim + 3) / 4, 256);
             BAR();
-        } else if (0 && S.ps_fused_gus) {
+        } else if (S.ps_fused_gus) {
             sq4_wt* wg = &S.wgate[l];
             sq4_wt* wu = &S.wup[l];
             ENC(S.ps_fused_gus);
@@ -1594,7 +1603,7 @@ int mtl_sq4_infer_step_sample(int tokenID, int pos) {
             } else { BUF(S.lin_packed_slab, 13); BUF(S.lin_packed_slab, 14); }
             CB(S.cb_oc[l*7+5], 15);
             DTG((ffnDim + 3) / 4, 256); BAR();
-        } else if (0 && S.ps_fused_gus) {
+        } else if (S.ps_fused_gus) {
             sq4_wt* wg = &S.wgate[l];
             sq4_wt* wu = &S.wup[l];
             ENC(S.ps_fused_gus);

@@ -12,16 +12,16 @@ extern int mtl_sq4_infer_build(int dim, int kvDim, int headDim,
     int vocabSize, int nLayers, int maxSeq,
     float ropeTheta, float rmsEps);
 extern int mtl_sq4_infer_ready(void);
-extern void mtl_sq4_infer_alloc_slabs(int totalPackedBytes,
+extern void mtl_sq4_infer_alloc_slabs(long long totalPackedBytes,
     int totalBandsFloats, int totalOutliers);
-extern void mtl_sq4_infer_upload_packed(int packedOffset, const uint8_t* mag, int magBytes,
+extern void mtl_sq4_infer_upload_packed(long long packedOffset, const uint8_t* mag, int magBytes,
     const uint8_t* sign_data, int signBytes, int nWeights);
 extern void mtl_sq4_infer_finalize_slabs(void);
 extern void mtl_sq4_infer_upload_embed(const float* data, int nFloats);
 extern void mtl_sq4_infer_upload_bands(int floatOffset, const float* data, int nFloats);
 extern void mtl_sq4_infer_upload_outliers(int offset, const uint32_t* idx, const float* val, int count);
 extern void mtl_sq4_infer_set_fp32(int idx, const float* data, int nFloats);
-extern void mtl_sq4_infer_set_sq4_desc(int idx, int packedOffset,
+extern void mtl_sq4_infer_set_sq4_desc(int idx, long long packedOffset,
     int bandsOffset, int outlierOffset, int outlierCount, int rows, int cols);
 extern int mtl_sq4_infer_step(int tokenID, int pos, float* logitsOut);
 extern int mtl_sq4_infer_step_sample(int tokenID, int pos);
@@ -52,7 +52,7 @@ func SQ4InferReady() bool {
 }
 
 func (s *SQ4InferMetal) AllocSlabs(totalPackedBytes, totalBandsFloats, totalOutliers int) {
-	C.mtl_sq4_infer_alloc_slabs(C.int(totalPackedBytes), C.int(totalBandsFloats), C.int(totalOutliers))
+	C.mtl_sq4_infer_alloc_slabs(C.longlong(totalPackedBytes), C.int(totalBandsFloats), C.int(totalOutliers))
 }
 
 func (s *SQ4InferMetal) FinalizeSlabs() {
@@ -65,7 +65,7 @@ func (s *SQ4InferMetal) UploadEmbed(data []float32) {
 
 // UploadPacked takes spec-format mag+sign and packs into nibbles on CPU, uploads to GPU slab.
 func (s *SQ4InferMetal) UploadPacked(packedOffset int, mag []byte, sign []byte, nWeights int) {
-	C.mtl_sq4_infer_upload_packed(C.int(packedOffset),
+	C.mtl_sq4_infer_upload_packed(C.longlong(packedOffset),
 		(*C.uint8_t)(unsafe.Pointer(&mag[0])), C.int(len(mag)),
 		(*C.uint8_t)(unsafe.Pointer(&sign[0])), C.int(len(sign)),
 		C.int(nWeights))
@@ -90,7 +90,7 @@ func (s *SQ4InferMetal) SetFP32(idx int, data []float32) {
 }
 
 func (s *SQ4InferMetal) SetSQ4Desc(idx, packedOffset, bandsOffset, outlierOffset, outlierCount, rows, cols int) {
-	C.mtl_sq4_infer_set_sq4_desc(C.int(idx), C.int(packedOffset),
+	C.mtl_sq4_infer_set_sq4_desc(C.int(idx), C.longlong(packedOffset),
 		C.int(bandsOffset), C.int(outlierOffset), C.int(outlierCount), C.int(rows), C.int(cols))
 }
 
