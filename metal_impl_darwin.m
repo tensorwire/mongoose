@@ -932,6 +932,76 @@ static NSString* const g_kernel_source = @"\n"
 "    }\n"
 "}\n"
 "\n"
+"// Softmax CE with gradient output: computes loss AND softmax gradient.\n"
+"// grad[v] = softmax(v) * invN; grad[target] -= invN.\n"
+"// Matches CUDA KSoftmaxCE semantics exactly.\n"
+"kernel void softmax_ce_grad(\n"
+"    device float* logits        [[buffer(0)]],  // [n, vocabSize] — modified in-place to exp values\n"
+"    device const int* targets   [[buffer(1)]],   // [n]\n"
+"    device float* losses        [[buffer(2)]],   // [n]\n"
+"    device float* grad          [[buffer(3)]],   // [n, vocabSize] output gradient\n"
+"    device const uint* vocabSize [[buffer(4)]],\n"
+"    device const float* invN    [[buffer(5)]],\n"
+"    uint pos [[threadgroup_position_in_grid]],\n"
+"    uint tid [[thread_index_in_threadgroup]],\n"
+"    uint tpg [[threads_per_threadgroup]])\n"
+"{\n"
+"    uint vSize = vocabSize[0];\n"
+"    uint off = pos * vSize;\n"
+"    int target = targets[pos];\n"
+"\n"
+"    // Pass 1a: find max\n"
+"    float localMax = -1e30f;\n"
+"    for (uint i = tid; i < vSize; i += tpg) {\n"
+"        localMax = max(localMax, logits[off + i]);\n"
+"    }\n"
+"    localMax = simd_max(localMax);\n"
+"    threadgroup float smx[32];\n"
+"    uint lane = tid % 32, warp = tid / 32;\n"
+"    if (lane == 0) smx[warp] = localMax;\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    if (warp == 0) {\n"
+"        localMax = (lane < (tpg+31)/32) ? smx[lane] : -1e30f;\n"
+"        localMax = simd_max(localMax);\n"
+"    }\n"
+"    threadgroup float mx;\n"
+"    if (tid == 0) mx = localMax;\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"\n"
+"    // Pass 1b: exp + sum\n"
+"    float localSum = 0.0f;\n"
+"    for (uint i = tid; i < vSize; i += tpg) {\n"
+"        float e = exp(logits[off + i] - mx);\n"
+"        logits[off + i] = e;\n"
+"        localSum += e;\n"
+"    }\n"
+"    localSum = simd_sum(localSum);\n"
+"    threadgroup float sms[32];\n"
+"    if (lane == 0) sms[warp] = localSum;\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    if (warp == 0) {\n"
+"        localSum = (lane < (tpg+31)/32) ? sms[lane] : 0.0f;\n"
+"        localSum = simd_sum(localSum);\n"
+"    }\n"
+"    threadgroup float se;\n"
+"    if (tid == 0) {\n"
+"        se = localSum;\n"
+"        float prob = logits[off + target] / se;\n"
+"        if (prob < 1e-10f) prob = 1e-10f;\n"
+"        losses[pos] = -log(prob);\n"
+"    }\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"\n"
+"    // Pass 2: gradient\n"
+"    float invSe = 1.0f / se;\n"
+"    float invNv = invN[0];\n"
+"    for (uint i = tid; i < vSize; i += tpg) {\n"
+"        float sv = logits[off + i] * invSe * invNv;\n"
+"        if ((int)i == target) sv -= invNv;\n"
+"        grad[off + i] = sv;\n"
+"    }\n"
+"}\n"
+"\n"
 "// Pass 1: compute max logit and sum of exp for each position.\n"
 "// One threadgroup per position. Threads cooperatively scan all vocab rows.\n"
 "kernel void lm_head_pass1(\n"
@@ -1024,6 +1094,7 @@ static NSString* const g_kernel_source = @"\n"
 "    uint hOff = pos * dim[0];\n"
 "    float mx = maxLogit[pos];\n"
 "    float se = sumExp[pos];\n"
+"    if (se < 1e-30f) se = 1e-30f;\n"
 "    float invSe = 1.0f / se;\n"
 "    int target = targets[pos];\n"
 "\n"
@@ -1039,7 +1110,9 @@ static NSString* const g_kernel_source = @"\n"
 "        for (uint d = 0; d < dim[0]; d++) {\n"
 "            targetDot += hidden[hOff + d] * embed[target * dim[0] + d];\n"
 "        }\n"
-"        float posLoss = -(targetDot - mx) + log(se);\n"
+"        float prob = exp(targetDot - mx) * invSe;\n"
+"        if (prob < 1e-10f) prob = 1e-10f;\n"
+"        float posLoss = -log(prob);\n"
 "        atomic_fetch_add_explicit(loss, posLoss * invN[0], memory_order_relaxed);\n"
 "    }\n"
 "\n"
@@ -1163,6 +1236,7 @@ static NSString* const g_kernel_source = @"\n"
 "    uint hOff = pos * dim[0];\n"
 "    float mx = maxLogit[pos];\n"
 "    float se = sumExp[pos];\n"
+"    if (se < 1e-30f) se = 1e-30f;\n"
 "    float invSe = 1.0f / se;\n"
 "    int target = targets[pos];\n"
 "\n"
@@ -1176,7 +1250,9 @@ static NSString* const g_kernel_source = @"\n"
 "        for (uint d = 0; d < dim[0]; d++) {\n"
 "            targetDot += hidden[hOff + d] * embed[target * dim[0] + d];\n"
 "        }\n"
-"        float posLoss = -(targetDot - mx) + log(se);\n"
+"        float prob = exp(targetDot - mx) * invSe;\n"
+"        if (prob < 1e-10f) prob = 1e-10f;\n"
+"        float posLoss = -log(prob);\n"
 "        atomic_fetch_add_explicit(loss, posLoss * invN[0], memory_order_relaxed);\n"
 "    }\n"
 "\n"
@@ -2166,6 +2242,7 @@ static id<MTLComputePipelineState> g_ps_dequant_delta = nil;
 static id<MTLComputePipelineState> g_ps_dequant_delta_sparse = nil;
 static id<MTLComputePipelineState> g_ps_needle_inline = nil;
 static id<MTLComputePipelineState> g_ps_ce_loss = nil;
+static id<MTLComputePipelineState> g_ps_softmax_ce_grad = nil;
 static id<MTLComputePipelineState> g_ps_rmsnorm_bwd = nil;
 static id<MTLComputePipelineState> g_ps_dequant_fp16 = nil;
 static id<MTLComputePipelineState> g_ps_fp32_to_fp16 = nil;
@@ -2278,6 +2355,7 @@ int mtl_init_compute(void) {
     g_ps_dequant_delta_sparse = make_ps(@"dequant_int8_delta_sparse");
     g_ps_needle_inline = make_ps(@"helix_needle_inline");
     g_ps_ce_loss = make_ps(@"ce_loss");
+    g_ps_softmax_ce_grad = make_ps(@"softmax_ce_grad");
     g_ps_rmsnorm_bwd = make_ps(@"rmsnorm_backward");
     g_ps_dequant_fp16 = make_ps(@"dequant_int8_fp16");
     g_ps_fp32_to_fp16 = make_ps(@"fp32_to_fp16");
@@ -3468,9 +3546,36 @@ void mtl_ce_loss(void* logitsRef, void* targetsRef, void* lossesRef, int seqLen,
     } // @autoreleasepool
 }
 
+// Softmax CE with gradient: outputs both per-position loss and softmax gradient.
+// logits is modified in-place (replaced with exp values). grad[n, vocabSize] written.
+void mtl_softmax_ce_grad(void* logitsRef, void* targetsRef, void* lossesRef,
+    void* gradRef, int seqLen, int vocabSize, float invN) {
+    @autoreleasepool {
+    uint32_t uv = (uint32_t)vocabSize;
+    id<MTLBuffer> vBuf = const_buf(&uv, 4);
+    id<MTLBuffer> invNBuf = const_buf(&invN, 4);
+    id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    [enc setComputePipelineState:g_ps_softmax_ce_grad];
+    [enc setBuffer:(__bridge id<MTLBuffer>)logitsRef  offset:0 atIndex:0];
+    [enc setBuffer:(__bridge id<MTLBuffer>)targetsRef offset:0 atIndex:1];
+    [enc setBuffer:(__bridge id<MTLBuffer>)lossesRef  offset:0 atIndex:2];
+    [enc setBuffer:(__bridge id<MTLBuffer>)gradRef    offset:0 atIndex:3];
+    [enc setBuffer:vBuf offset:0 atIndex:4];
+    [enc setBuffer:invNBuf offset:0 atIndex:5];
+    NSUInteger tpg = g_ps_softmax_ce_grad.maxTotalThreadsPerThreadgroup;
+    if (tpg > 1024) tpg = 1024;
+    tpg = (tpg / 32) * 32;
+    if (tpg == 0) tpg = 32;
+    [enc dispatchThreadgroups:MTLSizeMake(seqLen, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+    [enc endEncoding];
+    [cmd commit]; [cmd waitUntilCompleted];
+    } // @autoreleasepool
+}
+
 // Fused FP32 GEMM: C = A @ B^T (FP32 in, FP32 out, Metal 4 cooperative path).
 void mtl_fused_gemm_f32_bt(void* aRef, void* bRef, void* cRef, int M, int K, int N) {
-    if (!g_ps_gemm4f_bt) { mtl_fused_gemm_bt(aRef, bRef, cRef, M, K, N); return; }
+    if (!g_ps_gemm4f_bt || N < 32 || M < 32) { mtl_fused_gemm_bt(aRef, bRef, cRef, M, K, N); return; }
     uint32_t um = M, uk = K, un = N;
     id<MTLBuffer> mBuf = const_buf(&um, 4);
     id<MTLBuffer> kBuf = const_buf(&uk, 4);
@@ -3487,7 +3592,7 @@ void mtl_fused_gemm_f32_bt(void* aRef, void* bRef, void* cRef, int M, int K, int
                 threadsPerThreadgroup:MTLSizeMake(simdWidth * 4, 1, 1)];
 }
 void mtl_fused_gemm_f32_nn(void* aRef, void* bRef, void* cRef, int M, int K, int N) {
-    if (!g_ps_gemm4f_nn) { mtl_fused_gemm_nn(aRef, bRef, cRef, M, K, N); return; }
+    if (!g_ps_gemm4f_nn || N < 32 || M < 32) { mtl_fused_gemm_nn(aRef, bRef, cRef, M, K, N); return; }
     uint32_t um = M, uk = K, un = N;
     id<MTLBuffer> mBuf = const_buf(&um, 4);
     id<MTLBuffer> kBuf = const_buf(&uk, 4);
@@ -3504,7 +3609,7 @@ void mtl_fused_gemm_f32_nn(void* aRef, void* bRef, void* cRef, int M, int K, int
                 threadsPerThreadgroup:MTLSizeMake(simdWidth * 4, 1, 1)];
 }
 void mtl_fused_gemm_f32_tn(void* aRef, void* bRef, void* cRef, int M, int K, int N) {
-    if (!g_ps_gemm4f_tn) { mtl_fused_gemm_tn(aRef, bRef, cRef, M, K, N); return; }
+    if (!g_ps_gemm4f_tn || N < 32 || K < 32) { mtl_fused_gemm_tn(aRef, bRef, cRef, M, K, N); return; }
     uint32_t um = M, uk = K, un = N;
     id<MTLBuffer> mBuf = const_buf(&um, 4);
     id<MTLBuffer> kBuf = const_buf(&uk, 4);

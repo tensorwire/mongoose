@@ -47,3 +47,4 @@ func (f *CUDAFusedInference) QueueHiddenToL3OnStream1() {}
 func (f *CUDAFusedInference) ComputeStream1Ptr() unsafe.Pointer { return nil }
 func (f *CUDAFusedInference) PartialStepQ4ContinueOnStream1(pos, layerStart, layerEnd int, hiddenOut, logitsOut []float32) int { return -1 }
 func (f *CUDAFusedInference) ExportHidden() []float32 { return nil }
+func (f *CUDAFusedInference) ExportLogits() *Tensor { return nil }

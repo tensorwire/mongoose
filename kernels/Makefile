@@ -1,11 +1,22 @@
 NVCC ?= nvcc
-# Generate PTX for sm_90 — driver JIT compiles for newer GPUs (Blackwell sm_120)
 CUDA_ARCH ?= -gencode arch=compute_90,code=compute_90
 
-libmongoose_kernels.so: mongoose.cu
-	$(NVCC) -shared -o $@ $< -Xcompiler -fPIC $(CUDA_ARCH)
+# Atomic kernel files — mongoose.cu includes them all via #include
+KERNEL_DEPS := mongoose_rmsnorm.cu mongoose_rope.cu mongoose_attention.cu \
+	mongoose_silu.cu mongoose_elementwise.cu mongoose_adamw.cu mongoose_loss.cu \
+	mongoose_q8_matvec.cu mongoose_quant.cu mongoose_kv.cu mongoose_helix.cu \
+	mongoose_sparse.cu mongoose_mlp_fused.cu
+
+libmongoose_kernels.so: mongoose.cu $(KERNEL_DEPS)
+	$(NVCC) -shared -o $@ mongoose.cu -Xcompiler -fPIC -rdc=true $(CUDA_ARCH)
+
+# Metal MLP training kernels (macOS only)
+mlp_train.metallib: mlp_train.metal
+	xcrun metal -std=metal3.1 -O2 -c mlp_train.metal -o mlp_train.air
+	xcrun metallib -o mlp_train.metallib mlp_train.air
+	rm -f mlp_train.air
 
 clean:
-	rm -f libmongoose_kernels.so
+	rm -f libmongoose_kernels.so mlp_train.metallib mlp_train.air
 
 .PHONY: clean

@@ -25,3 +25,9 @@ func (b *L3Bridge) DevicePtr(byteOffset int) unsafe.Pointer {
 	}
 	return unsafe.Pointer(uintptr(b.Ptr) + uintptr(byteOffset))
 }
+
+// HostPtr returns a CPU-accessible pointer at a byte offset.
+// On L3 bridges this is the same physical page as DevicePtr.
+func (b *L3Bridge) HostPtr(byteOffset int) unsafe.Pointer {
+	return b.DevicePtr(byteOffset)
+}

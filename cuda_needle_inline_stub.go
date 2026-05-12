@@ -2,7 +2,11 @@
 
 package mongoose
 
-type NeedleInlineState struct{}
+type NeedleInlineState struct{
+	JitterAmp    float32
+	DropoutP     float32
+	BlipInterval int
+}
 type inlineLayerState struct{}
 
 func NewNeedleInlineState(ci *CUDAFusedInference, nLayers, nActive int, lr, beta1, wd float32) *NeedleInlineState {

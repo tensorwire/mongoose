@@ -19,6 +19,7 @@ static size_t tw_cublas_workspace_size = 32 * 1024 * 1024; // 32 MiB
 
 static int tw_cuda_device_idx = 0;
 
+int tw_cuda_init_device(int deviceIdx);
 int tw_cuda_init() { return tw_cuda_init_device(0); }
 
 int tw_cuda_device_count() {

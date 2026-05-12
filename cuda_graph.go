@@ -45,7 +45,7 @@ static int tw_graph_test_api() {
     if (!stream) return -1;
 
     float* tmp;
-    cudaMalloc(&tmp, 256);
+    cudaMalloc((void**)&tmp, 256);
     cudaDeviceSynchronize();
 
     cudaGetLastError();
@@ -188,7 +188,7 @@ struct tw_graph_params {
 
 static struct tw_graph_params* tw_graph_alloc_params() {
     struct tw_graph_params* p;
-    cudaMalloc(&p, sizeof(struct tw_graph_params));
+    cudaMalloc((void**)&p, sizeof(struct tw_graph_params));
     struct tw_graph_params init = {0, 1, {0}};
     cudaMemcpy(p, &init, sizeof(init), cudaMemcpyHostToDevice);
     return p;

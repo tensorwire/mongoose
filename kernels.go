@@ -71,6 +71,32 @@ typedef void (*fn_q8_quantize_act_batch)(const float*, void*, int, int, cudaStre
 typedef void (*fn_kv_cache_write_tq3)(const float*, unsigned char*, int, int, int, int, int, cudaStream_t);
 typedef void (*fn_kv_cache_dequant_tq3)(const unsigned char*, float*, int, int, int, int, int, cudaStream_t);
 
+typedef void (*fn_sq4_matvec)(const void*, const float*, const float*, float*, int, int, cudaStream_t);
+typedef int (*fn_has_sq4_matvec)();
+typedef void (*fn_sq4_outlier_correct)(const unsigned int*, const float*, const void*, const float*, const float*, float*, int, int, cudaStream_t);
+
+static fn_sq4_matvec          k_sq4_matvec = NULL;
+static fn_sq4_outlier_correct k_sq4_outlier = NULL;
+
+// MLP training kernels
+typedef void (*fn_bias_add)(float*, const float*, int, int, cudaStream_t);
+typedef void (*fn_reduce_mean_rows)(const float*, float*, int, int, cudaStream_t);
+typedef void (*fn_batchnorm_fwd)(const float*, float*, const float*, const float*, float*, float*, float*, float*, int, int, float, float, cudaStream_t);
+typedef void (*fn_batchnorm_bwd)(const float*, const float*, const float*, const float*, const float*, float*, float*, float*, int, int, cudaStream_t);
+typedef void (*fn_bce_with_logits)(const float*, const float*, float*, float*, int, cudaStream_t);
+typedef void (*fn_reduce_mean)(const float*, float*, int, cudaStream_t);
+typedef void (*fn_dropout_fwd)(float*, float*, unsigned long long, unsigned long long, float, int, cudaStream_t);
+typedef void (*fn_dropout_bwd)(float*, const float*, int, cudaStream_t);
+
+static fn_bias_add          k_bias_add = NULL;
+static fn_reduce_mean_rows  k_reduce_mean_rows = NULL;
+static fn_batchnorm_fwd     k_batchnorm_fwd = NULL;
+static fn_batchnorm_bwd     k_batchnorm_bwd = NULL;
+static fn_bce_with_logits   k_bce_with_logits = NULL;
+static fn_reduce_mean       k_reduce_mean = NULL;
+static fn_dropout_fwd       k_dropout_fwd = NULL;
+static fn_dropout_bwd       k_dropout_bwd = NULL;
+
 static void* kernel_lib = NULL;
 static fn_rmsnorm           k_rmsnorm = NULL;
 static fn_rmsnorm_out       k_rmsnorm_out = NULL;
@@ -212,6 +238,16 @@ int tw_load_kernels(const char* path) {
     k_kv_write_tq3        = (fn_kv_cache_write_tq3)dlsym(kernel_lib, "mongoose_kv_cache_write_tq3");
     k_kv_dequant_tq3      = (fn_kv_cache_dequant_tq3)dlsym(kernel_lib, "mongoose_kv_cache_dequant_tq3");
     k_fp16_add_inplace    = (fn_fp16_add_inplace)dlsym(kernel_lib, "mongoose_fp16_add_inplace");
+    k_sq4_matvec          = (fn_sq4_matvec)dlsym(kernel_lib, "mongoose_sq4_matvec");
+    k_sq4_outlier         = (fn_sq4_outlier_correct)dlsym(kernel_lib, "mongoose_sq4_outlier_correct");
+    k_bias_add            = (fn_bias_add)dlsym(kernel_lib, "mongoose_bias_add");
+    k_reduce_mean_rows    = (fn_reduce_mean_rows)dlsym(kernel_lib, "mongoose_reduce_mean_rows");
+    k_batchnorm_fwd       = (fn_batchnorm_fwd)dlsym(kernel_lib, "mongoose_batchnorm_fwd");
+    k_batchnorm_bwd       = (fn_batchnorm_bwd)dlsym(kernel_lib, "mongoose_batchnorm_bwd");
+    k_bce_with_logits     = (fn_bce_with_logits)dlsym(kernel_lib, "mongoose_bce_with_logits");
+    k_reduce_mean         = (fn_reduce_mean)dlsym(kernel_lib, "mongoose_reduce_mean");
+    k_dropout_fwd         = (fn_dropout_fwd)dlsym(kernel_lib, "mongoose_dropout_fwd");
+    k_dropout_bwd         = (fn_dropout_bwd)dlsym(kernel_lib, "mongoose_dropout_bwd");
     k_fp32_add_fp16       = (fn_fp32_add_fp16)dlsym(kernel_lib, "mongoose_fp32_add_fp16");
     k_rmsnorm_save_fp16   = (fn_rmsnorm_save_fp16)dlsym(kernel_lib, "mongoose_rmsnorm_out_save_fp16");
     k_rmsnorm_bwd_fp16    = (fn_rmsnorm_bwd_fp16)dlsym(kernel_lib, "mongoose_rmsnorm_backward_fp16");
@@ -226,6 +262,7 @@ int tw_load_kernels(const char* path) {
 }
 
 int tw_kernels_loaded() { return kernel_lib != NULL ? 1 : 0; }
+void* tw_get_kernel_lib() { return kernel_lib; }
 
 // Wrappers that call through function pointers
 void tw_k_rmsnorm(float* x, const float* w, int seqLen, int dim) {
@@ -295,6 +332,55 @@ void tw_k_kv_cache_write(float* cache, const float* src, int pos, int kvDim) {
 }
 int tw_k_has_q8_matvec() { return k_q8_matvec != NULL ? 1 : 0; }
 int tw_k_has_q4_matvec() { return k_q4_matvec != NULL ? 1 : 0; }
+int tw_k_has_sq4_matvec() { return k_sq4_matvec != NULL ? 1 : 0; }
+int tw_k_has_mlp_kernels() {
+    return (k_bias_add && k_batchnorm_fwd && k_batchnorm_bwd &&
+            k_bce_with_logits && k_reduce_mean && k_dropout_fwd) ? 1 : 0;
+}
+void tw_k_bias_add(float* out, const float* bias, int B, int D) {
+    if (k_bias_add) k_bias_add(out, bias, B, D, 0);
+}
+void tw_k_reduce_mean_rows(const float* in, float* out, int B, int D) {
+    if (k_reduce_mean_rows) k_reduce_mean_rows(in, out, B, D, 0);
+}
+void tw_k_batchnorm_fwd(const float* x, float* out,
+    const float* gamma, const float* beta,
+    float* running_mean, float* running_var,
+    float* save_mean, float* save_invstd,
+    int B, int D, float momentum, float eps) {
+    if (k_batchnorm_fwd) k_batchnorm_fwd(x, out, gamma, beta,
+        running_mean, running_var, save_mean, save_invstd, B, D, momentum, eps, 0);
+}
+void tw_k_batchnorm_bwd(const float* dOut, const float* x,
+    const float* save_mean, const float* save_invstd, const float* gamma,
+    float* dx, float* dGamma, float* dBeta, int B, int D) {
+    if (k_batchnorm_bwd) k_batchnorm_bwd(dOut, x, save_mean, save_invstd,
+        gamma, dx, dGamma, dBeta, B, D, 0);
+}
+void tw_k_bce_with_logits(const float* logits, const float* targets,
+    float* grad, float* loss_buf, int B) {
+    if (k_bce_with_logits) k_bce_with_logits(logits, targets, grad, loss_buf, B, 0);
+}
+void tw_k_reduce_mean(const float* in, float* out, int n) {
+    if (k_reduce_mean) k_reduce_mean(in, out, n, 0);
+}
+void tw_k_dropout_fwd(float* x, float* mask, unsigned long long seed,
+    unsigned long long counter, float p, int n) {
+    if (k_dropout_fwd) k_dropout_fwd(x, mask, seed, counter, p, n, 0);
+}
+void tw_k_dropout_bwd(float* dx, const float* mask, int n) {
+    if (k_dropout_bwd) k_dropout_bwd(dx, mask, n, 0);
+}
+void tw_k_sq4_matvec(const void* packed, const float* bands, const float* act,
+                      float* out, int rows, int cols) {
+    if (k_sq4_matvec) k_sq4_matvec(packed, bands, act, out, rows, cols, 0);
+}
+void tw_k_sq4_outlier_correct(const unsigned int* idx, const float* val,
+                               const void* packed, const float* bands,
+                               const float* act, float* out,
+                               int count, int cols) {
+    if (k_sq4_outlier) k_sq4_outlier(idx, val, packed, bands, act, out, count, cols, 0);
+}
 int tw_helix_dna_loaded() { return k_helix_dna_step != NULL ? 1 : 0; }
 int tw_helix_needle_loaded() { return (k_helix_needle != NULL && k_helix_needle_paired != NULL) ? 1 : 0; }
 void tw_k_helix_needle(void* data, float* scales, const float* grad,
@@ -968,6 +1054,75 @@ func HasQ8Matvec() bool { return C.tw_k_has_q8_matvec() != 0 }
 
 // HasQ4Matvec returns true if the fused Q4 matvec kernel is loaded.
 func HasQ4Matvec() bool { return C.tw_k_has_q4_matvec() != 0 }
+
+// HasSQ4Matvec returns true if the SQ4 matvec kernel is loaded.
+func HasSQ4Matvec() bool { return C.tw_k_has_sq4_matvec() != 0 }
+
+// KSQ4Matvec: SQ4 band-table dequant + matvec.
+// packed: [rows, cols/2] bytes, bands: [rows, 8] float32, act: [cols] float32, out: [rows] float32.
+func KSQ4Matvec(packedPtr, bandsPtr, actPtr, outPtr unsafe.Pointer, rows, cols int) {
+	C.tw_k_sq4_matvec(packedPtr, (*C.float)(bandsPtr), (*C.float)(actPtr),
+		(*C.float)(outPtr), C.int(rows), C.int(cols))
+}
+
+// HasMLPKernels returns true if all MLP training kernels are loaded.
+func HasMLPKernels() bool { return C.tw_k_has_mlp_kernels() != 0 }
+
+// KBiasAdd adds bias[D] to out[B*D], broadcast over batch.
+func KBiasAdd(outPtr, biasPtr unsafe.Pointer, B, D int) {
+	C.tw_k_bias_add((*C.float)(outPtr), (*C.float)(biasPtr), C.int(B), C.int(D))
+}
+
+// KReduceMeanRows computes out[D] = mean(in[B,D], axis=0).
+func KReduceMeanRows(inPtr, outPtr unsafe.Pointer, B, D int) {
+	C.tw_k_reduce_mean_rows((*C.float)(inPtr), (*C.float)(outPtr), C.int(B), C.int(D))
+}
+
+// KBatchNormFwd runs BatchNorm forward with running stat updates.
+func KBatchNormFwd(xPtr, outPtr, gammaPtr, betaPtr, runMeanPtr, runVarPtr, saveMeanPtr, saveInvStdPtr unsafe.Pointer, B, D int, momentum, eps float32) {
+	C.tw_k_batchnorm_fwd((*C.float)(xPtr), (*C.float)(outPtr),
+		(*C.float)(gammaPtr), (*C.float)(betaPtr),
+		(*C.float)(runMeanPtr), (*C.float)(runVarPtr),
+		(*C.float)(saveMeanPtr), (*C.float)(saveInvStdPtr),
+		C.int(B), C.int(D), C.float(momentum), C.float(eps))
+}
+
+// KBatchNormBwd runs BatchNorm backward.
+func KBatchNormBwd(dOutPtr, xPtr, saveMeanPtr, saveInvStdPtr, gammaPtr, dxPtr, dGammaPtr, dBetaPtr unsafe.Pointer, B, D int) {
+	C.tw_k_batchnorm_bwd((*C.float)(dOutPtr), (*C.float)(xPtr),
+		(*C.float)(saveMeanPtr), (*C.float)(saveInvStdPtr), (*C.float)(gammaPtr),
+		(*C.float)(dxPtr), (*C.float)(dGammaPtr), (*C.float)(dBetaPtr),
+		C.int(B), C.int(D))
+}
+
+// KBCEWithLogitsLoss computes numerically stable BCE loss and gradient on GPU.
+func KBCEWithLogitsLoss(logitsPtr, targetsPtr, gradPtr, lossBufPtr unsafe.Pointer, B int) {
+	C.tw_k_bce_with_logits((*C.float)(logitsPtr), (*C.float)(targetsPtr),
+		(*C.float)(gradPtr), (*C.float)(lossBufPtr), C.int(B))
+}
+
+// KReduceMean computes out[0] = mean(in[0..n-1]).
+func KReduceMean(inPtr, outPtr unsafe.Pointer, n int) {
+	C.tw_k_reduce_mean((*C.float)(inPtr), (*C.float)(outPtr), C.int(n))
+}
+
+// KDropoutFwd applies Philox counter-based inverted dropout (graph-safe).
+func KDropoutFwd(xPtr, maskPtr unsafe.Pointer, seed, counter uint64, p float32, n int) {
+	C.tw_k_dropout_fwd((*C.float)(xPtr), (*C.float)(maskPtr),
+		C.ulonglong(seed), C.ulonglong(counter), C.float(p), C.int(n))
+}
+
+// KDropoutBwd applies saved dropout mask to gradient.
+func KDropoutBwd(dxPtr, maskPtr unsafe.Pointer, n int) {
+	C.tw_k_dropout_bwd((*C.float)(dxPtr), (*C.float)(maskPtr), C.int(n))
+}
+
+// KSQ4OutlierCorrect applies outlier corrections after SQ4 matvec.
+func KSQ4OutlierCorrect(idxPtr, valPtr, packedPtr, bandsPtr, actPtr, outPtr unsafe.Pointer, count, cols int) {
+	C.tw_k_sq4_outlier_correct((*C.uint)(idxPtr), (*C.float)(valPtr),
+		packedPtr, (*C.float)(bandsPtr), (*C.float)(actPtr),
+		(*C.float)(outPtr), C.int(count), C.int(cols))
+}
 
 // KQ4_0Matvec: fused GGUF block_q4_0 dequant + matvec.
 func KQ4_0Matvec(actPtr, weightPtr, outPtr unsafe.Pointer, N, K int) {

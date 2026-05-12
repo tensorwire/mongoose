@@ -5,21 +5,30 @@ import (
 	"math/rand"
 )
 
-// MLP is a generic multi-layer perceptron with configurable layer sizes,
-// BatchNorm, ReLU activation, and Dropout between hidden layers.
-// The final layer has no activation (raw logits) or optional sigmoid.
+// MLP is a multi-layer perceptron with BatchNorm, activation, and Dropout.
+// Supports both CPU and GPU (via TensorEngine) execution.
 //
-// Example: binary classification
-//   mlp := NewMLP([]int{inputDim, 512, 256, 128, 1}, MLPConfig{
-//       Activation: "relu",
-//       Dropout:    0.2,
-//       BatchNorm:  true,
-//       Sigmoid:    true,
-//   })
+// Training (numerically stable):
+//
+//	mlp := NewMLP([]int{nFeatures, 512, 256, 128, 1}, MLPConfig{
+//	    Activation: "relu", Dropout: 0.2, BatchNorm: true, Sigmoid: true,
+//	})
+//	mlp.ToGPU(engine)  // optional: accelerate with GPU
+//	opt := NewMLPOptimizer(0.0003, 0.0005, 350)
+//	for epoch := range 350 {
+//	    logits := mlp.ForwardLogits(batch, batchSize, true)
+//	    loss, grad := mlp.BCEWithLogitsLoss(logits, targets, posWeight)
+//	    mlp.BackwardFromLogits(grad, batchSize)
+//	    params, grads := mlp.Params()
+//	    opt.Step(params, grads, epoch)
+//	    if mlp.eng != nil { mlp.SyncWeightsToGPU() }
+//	}
 type MLP struct {
-	Layers []MLPLayer
-	Config MLPConfig
-	rng    *rand.Rand
+	Layers          []MLPLayer
+	Config          MLPConfig
+	rng             *rand.Rand
+	eng             TensorEngine // nil = CPU mode
+	gpuDropoutCounter uint64
 }
 
 // MLPLayer holds weights, biases, and optional BatchNorm params for one layer.
@@ -47,6 +56,14 @@ type MLPLayer struct {
 	postAct []float32 // after activation [batchSize, outDim]
 	mask    []float32 // dropout mask [batchSize, outDim]
 	input   []float32 // input to this layer [batchSize, inDim]
+
+	// GPU tensors (populated by ToGPU)
+	gW, gB                     *Tensor
+	gDW, gDB                   *Tensor
+	gBNGamma, gBNBeta          *Tensor
+	gSaveMean, gSaveInvStd     *Tensor
+	gRunMean, gRunVar          *Tensor
+	gMask                      *Tensor
 }
 
 // MLPConfig controls the MLP architecture.
@@ -110,10 +127,20 @@ func NewMLP(dims []int, cfg MLPConfig) *MLP {
 	return &MLP{Layers: layers, Config: cfg, rng: rng}
 }
 
+// ForwardLogits runs the MLP and returns raw logits (no sigmoid).
+// Use with BCEWithLogitsLoss for numerically stable training.
+func (m *MLP) ForwardLogits(input []float32, batchSize int, training bool) []float32 {
+	return m.forward(input, batchSize, training, false)
+}
+
 // Forward runs the MLP on a batch of inputs.
 // input shape: [batchSize, inputDim], returns [batchSize, outputDim].
 // training=true enables dropout and uses batch stats for BatchNorm.
 func (m *MLP) Forward(input []float32, batchSize int, training bool) []float32 {
+	return m.forward(input, batchSize, training, true)
+}
+
+func (m *MLP) forward(input []float32, batchSize int, training, applySigmoid bool) []float32 {
 	x := input
 	inDim := m.Layers[0].InDim
 
@@ -173,8 +200,8 @@ func (m *MLP) Forward(input []float32, batchSize int, training bool) []float32 {
 			l.mask = nil
 		}
 
-		// Sigmoid on final layer if configured
-		if isLast && m.Config.Sigmoid {
+		// Sigmoid on final layer if configured and requested
+		if isLast && m.Config.Sigmoid && applySigmoid {
 			for j := range out {
 				out[j] = 1.0 / (1.0 + float32(math.Exp(-float64(out[j]))))
 			}
@@ -187,9 +214,20 @@ func (m *MLP) Forward(input []float32, batchSize int, training bool) []float32 {
 	return x
 }
 
+// BackwardFromLogits computes gradients when loss was computed on raw logits.
+// dOut is the gradient from BCEWithLogitsLoss (sigmoid(logit) - target).
+// Skips sigmoid derivative since the loss already accounts for it.
+func (m *MLP) BackwardFromLogits(dOut []float32, batchSize int) {
+	m.backward(dOut, batchSize, true)
+}
+
 // Backward computes gradients given the loss gradient w.r.t. the output.
 // dOut shape: [batchSize, outputDim]. Populates DW, DB, BNDGamma, BNDBeta.
 func (m *MLP) Backward(dOut []float32, batchSize int) {
+	m.backward(dOut, batchSize, false)
+}
+
+func (m *MLP) backward(dOut []float32, batchSize int, fromLogits bool) {
 	dx := dOut
 
 	for i := len(m.Layers) - 1; i >= 0; i-- {
@@ -198,8 +236,8 @@ func (m *MLP) Backward(dOut []float32, batchSize int) {
 		inDim := l.InDim
 		isLast := i == len(m.Layers)-1
 
-		// Sigmoid backward
-		if isLast && m.Config.Sigmoid {
+		// Sigmoid backward (skip when using BCEWithLogitsLoss — gradient already accounts for sigmoid)
+		if isLast && m.Config.Sigmoid && !fromLogits {
 			for j := range dx {
 				s := l.postAct[j]
 				dx[j] *= s * (1.0 - s)
@@ -258,6 +296,7 @@ func (m *MLP) Backward(dOut []float32, batchSize int) {
 
 // BCELoss computes binary cross-entropy loss with optional label smoothing.
 // predictions and targets shape: [batchSize, 1]. Returns scalar loss and gradient.
+// DEPRECATED: Use BCEWithLogitsLoss for numerically stable training on raw logits.
 func (m *MLP) BCELoss(predictions, targets []float32) (float32, []float32) {
 	n := len(predictions)
 	smooth := m.Config.LabelSmooth
@@ -268,17 +307,57 @@ func (m *MLP) BCELoss(predictions, targets []float32) (float32, []float32) {
 		p := predictions[i]
 		t := targets[i]
 
-		// Label smoothing
 		if smooth > 0 {
 			t = t*(1.0-smooth) + 0.5*smooth
 		}
 
-		// Clamp for numerical stability
 		if p < 1e-7 { p = 1e-7 }
 		if p > 1.0-1e-7 { p = 1.0 - 1e-7 }
 
 		loss += -t*float32(math.Log(float64(p))) - (1.0-t)*float32(math.Log(float64(1.0-p)))
 		grad[i] = (p - t) / float32(n)
+	}
+
+	return loss / float32(n), grad
+}
+
+// BCEWithLogitsLoss computes numerically stable binary cross-entropy on raw logits.
+// logits shape: [batchSize, 1] (raw output before sigmoid).
+// Uses: loss = max(x,0) - x*t + log(1 + exp(-|x|)) which avoids log(0).
+// Gradient: sigmoid(x) - t, averaged over batch.
+// posWeight > 0 scales the positive class (for imbalanced datasets).
+func (m *MLP) BCEWithLogitsLoss(logits, targets []float32, posWeight float32) (float32, []float32) {
+	n := len(logits)
+	grad := make([]float32, n)
+	loss := float32(0)
+	smooth := m.Config.LabelSmooth
+
+	for i := range logits {
+		x := float64(logits[i])
+		t := float64(targets[i])
+
+		if smooth > 0 {
+			t = t*(1.0-float64(smooth)) + 0.5*float64(smooth)
+		}
+
+		// Numerically stable: max(x,0) - x*t + log(1 + exp(-|x|))
+		absX := x
+		if absX < 0 { absX = -absX }
+		l := math.Max(x, 0) - x*t + math.Log(1.0+math.Exp(-absX))
+
+		pw := float64(posWeight)
+		if pw > 0 {
+			l = t*pw*(math.Log(1.0+math.Exp(-absX))+math.Max(-x, 0)) + (1-t)*(math.Log(1.0+math.Exp(-absX))+math.Max(x, 0))
+		}
+
+		loss += float32(l)
+
+		sig := 1.0 / (1.0 + math.Exp(-x))
+		if pw > 0 {
+			grad[i] = float32((sig*(pw*t+(1-t)) - t*pw) / float64(n))
+		} else {
+			grad[i] = float32((sig - t) / float64(n))
+		}
 	}
 
 	return loss / float32(n), grad
@@ -308,6 +387,308 @@ func (m *MLP) ParamCount() int {
 		}
 	}
 	return n
+}
+
+// ToGPU uploads MLP weights to GPU tensors for accelerated forward/backward.
+func (m *MLP) ToGPU(eng TensorEngine) {
+	m.eng = eng
+	for i := range m.Layers {
+		l := &m.Layers[i]
+		l.gW = eng.FromHost(l.W, []int{l.OutDim, l.InDim})
+		l.gB = eng.FromHost(l.B, []int{1, l.OutDim})
+		l.gDW = eng.Zeros([]int{l.OutDim, l.InDim})
+		l.gDB = eng.Zeros([]int{1, l.OutDim})
+		if l.BNGamma != nil {
+			l.gBNGamma = eng.FromHost(l.BNGamma, []int{1, l.OutDim})
+			l.gBNBeta = eng.FromHost(l.BNBeta, []int{1, l.OutDim})
+			l.gRunMean = eng.FromHost(l.BNMean, []int{1, l.OutDim})
+			l.gRunVar = eng.FromHost(l.BNVar, []int{1, l.OutDim})
+			l.gSaveMean = eng.Zeros([]int{1, l.OutDim})
+			l.gSaveInvStd = eng.Zeros([]int{1, l.OutDim})
+		}
+	}
+}
+
+// ToCPU downloads GPU weights back to CPU slices (for export/serialization).
+func (m *MLP) ToCPU() {
+	if m.eng == nil { return }
+	for i := range m.Layers {
+		l := &m.Layers[i]
+		if l.gW != nil { copy(l.W, m.eng.ToHost(l.gW)) }
+		if l.gB != nil { copy(l.B, m.eng.ToHost(l.gB)) }
+		if l.gBNGamma != nil { copy(l.BNGamma, m.eng.ToHost(l.gBNGamma)) }
+		if l.gBNBeta != nil { copy(l.BNBeta, m.eng.ToHost(l.gBNBeta)) }
+	}
+}
+
+// ForwardGPU runs the MLP forward pass entirely on GPU.
+// input: [batchSize, inputDim] as *Tensor. Caller must Release the returned tensor.
+// Uses GPU kernels for bias, BatchNorm, ReLU, and dropout — zero CPU round-trips.
+// Falls back to CPU-transfer path if MLP kernels aren't loaded.
+func (m *MLP) ForwardGPU(input *Tensor, batchSize int, training bool) *Tensor {
+	eng := m.eng
+
+	if !HasMLPKernels() {
+		return m.forwardGPUFallback(input, batchSize, training)
+	}
+
+	// Save input for backward (download once)
+	l0 := &m.Layers[0]
+	l0.input = eng.ToHost(input)
+
+	var prevOut *Tensor
+	curInput := input
+	m.gpuDropoutCounter++
+
+	for i := range m.Layers {
+		l := &m.Layers[i]
+		isLast := i == len(m.Layers)-1
+		n := batchSize * l.OutDim
+
+		if i > 0 {
+			l.input = eng.ToHost(curInput)
+		}
+
+		// Linear: out = x @ W^T (cuBLAS)
+		out := eng.MatMulTransposeBT(curInput, l.gW, batchSize, l.InDim, l.OutDim)
+		if prevOut != nil {
+			eng.Release(prevOut)
+		}
+
+		// Bias add (GPU)
+		KBiasAdd(out.DevicePtr(), l.gB.DevicePtr(), batchSize, l.OutDim)
+
+		// Save pre-activation for backward
+		l.preAct = eng.ToHost(out)
+
+		// BatchNorm (GPU)
+		if l.BNGamma != nil && l.gBNGamma != nil {
+			if l.gSaveMean == nil {
+				l.gSaveMean = eng.Zeros([]int{1, l.OutDim})
+				l.gSaveInvStd = eng.Zeros([]int{1, l.OutDim})
+				l.gRunMean = eng.FromHost(l.BNMean, []int{1, l.OutDim})
+				l.gRunVar = eng.FromHost(l.BNVar, []int{1, l.OutDim})
+			}
+			bnOut := eng.Zeros([]int{batchSize, l.OutDim})
+			KBatchNormFwd(out.DevicePtr(), bnOut.DevicePtr(),
+				l.gBNGamma.DevicePtr(), l.gBNBeta.DevicePtr(),
+				l.gRunMean.DevicePtr(), l.gRunVar.DevicePtr(),
+				l.gSaveMean.DevicePtr(), l.gSaveInvStd.DevicePtr(),
+				batchSize, l.OutDim, m.Config.BNMomentum, 1e-5)
+			eng.Release(out)
+			out = bnOut
+		}
+		l.postBN = eng.ToHost(out)
+
+		// Activation (GPU, hidden layers only)
+		if !isLast {
+			KReLU(out.DevicePtr(), n)
+		}
+		l.postAct = eng.ToHost(out)
+
+		// Dropout (GPU, hidden layers, training only)
+		if !isLast && training && m.Config.Dropout > 0 {
+			if l.gMask == nil {
+				l.gMask = eng.Zeros([]int{batchSize, l.OutDim})
+			}
+			KDropoutFwd(out.DevicePtr(), l.gMask.DevicePtr(), 42, m.gpuDropoutCounter, m.Config.Dropout, n)
+			l.mask = eng.ToHost(l.gMask)
+		} else {
+			l.mask = nil
+		}
+
+		prevOut = out
+		curInput = out
+	}
+
+	return prevOut
+}
+
+// forwardGPUFallback is the CPU-transfer path used when MLP kernels aren't loaded.
+func (m *MLP) forwardGPUFallback(input *Tensor, batchSize int, training bool) *Tensor {
+	eng := m.eng
+	inputHost := eng.ToHost(input)
+	l0 := &m.Layers[0]
+	l0.input = inputHost
+
+	var prevOut *Tensor
+	curInput := input
+
+	for i := range m.Layers {
+		l := &m.Layers[i]
+		isLast := i == len(m.Layers)-1
+
+		if i > 0 { l.input = eng.ToHost(curInput) }
+
+		out := eng.MatMulTransposeBT(curInput, l.gW, batchSize, l.InDim, l.OutDim)
+		if prevOut != nil { eng.Release(prevOut) }
+
+		outHost := eng.ToHost(out)
+		eng.Release(out)
+		for b := 0; b < batchSize; b++ {
+			for j := 0; j < l.OutDim; j++ { outHost[b*l.OutDim+j] += l.B[j] }
+		}
+		l.preAct = make([]float32, len(outHost))
+		copy(l.preAct, outHost)
+		if l.BNGamma != nil { outHost = m.batchNorm(l, outHost, batchSize, l.OutDim, training) }
+		l.postBN = make([]float32, len(outHost))
+		copy(l.postBN, outHost)
+		if !isLast { for j := range outHost { outHost[j] = m.activate(outHost[j]) } }
+		l.postAct = make([]float32, len(outHost))
+		copy(l.postAct, outHost)
+		if !isLast && training && m.Config.Dropout > 0 {
+			l.mask = make([]float32, len(outHost))
+			scale := 1.0 / (1.0 - m.Config.Dropout)
+			for j := range outHost {
+				if m.rng.Float32() < m.Config.Dropout { outHost[j] = 0; l.mask[j] = 0 } else { outHost[j] *= float32(scale); l.mask[j] = float32(scale) }
+			}
+		} else { l.mask = nil }
+		curOut := eng.FromHost(outHost, []int{batchSize, l.OutDim})
+		prevOut = curOut
+		curInput = curOut
+	}
+	return prevOut
+}
+
+// BackwardGPU computes gradients on GPU. dOut is gradient w.r.t. output logits.
+// fromLogits=true skips sigmoid derivative (use with BCEWithLogitsLoss).
+func (m *MLP) BackwardGPU(dOut []float32, batchSize int, fromLogits bool) {
+	eng := m.eng
+	dx := dOut
+
+	for i := len(m.Layers) - 1; i >= 0; i-- {
+		l := &m.Layers[i]
+		outDim := l.OutDim
+		inDim := l.InDim
+		isLast := i == len(m.Layers)-1
+
+		// Sigmoid backward
+		if isLast && m.Config.Sigmoid && !fromLogits {
+			for j := range dx {
+				s := l.postAct[j]
+				dx[j] *= s * (1.0 - s)
+			}
+		}
+
+		// Dropout backward
+		if l.mask != nil {
+			for j := range dx { dx[j] *= l.mask[j] }
+		}
+
+		// Activation backward
+		if !isLast {
+			for j := range dx { dx[j] *= m.activateGrad(l.postBN[j]) }
+		}
+
+		// BatchNorm backward (CPU)
+		if l.BNGamma != nil {
+			dx = m.batchNormBackward(l, dx, batchSize, outDim)
+		}
+
+		// Weight gradient: dW = dOut^T @ input, dB = sum(dOut) — on GPU
+		dxT := eng.FromHost(dx, []int{batchSize, outDim})
+		inputT := eng.FromHost(l.input, []int{batchSize, inDim})
+		dWGPU := eng.MatMulTransposeAT(dxT, inputT, batchSize, outDim, inDim)
+
+		invBatch := 1.0 / float32(batchSize)
+		dwHost := eng.ToHost(dWGPU)
+		for j := range dwHost { dwHost[j] *= invBatch }
+		copy(l.DW, dwHost)
+		eng.Release(dWGPU)
+
+		// dB = mean of dOut over batch
+		for j := range l.DB { l.DB[j] = 0 }
+		for b := 0; b < batchSize; b++ {
+			for o := 0; o < outDim; o++ {
+				l.DB[o] += dx[b*outDim+o] * invBatch
+			}
+		}
+
+		// Input gradient: dInput = dOut @ W — on GPU
+		dInputGPU := eng.MatMulT(dxT, l.gW, batchSize, outDim, inDim)
+		dInput := eng.ToHost(dInputGPU)
+		eng.Release(dInputGPU)
+		eng.Release(dxT)
+		eng.Release(inputT)
+
+		// Weight decay
+		if m.Config.WeightDecay > 0 {
+			wd := m.Config.WeightDecay
+			for j := range l.DW { l.DW[j] += wd * l.W[j] }
+		}
+
+		dx = dInput
+	}
+}
+
+// SyncWeightsToGPU uploads current CPU weights to GPU after optimizer step.
+func (m *MLP) SyncWeightsToGPU() {
+	if m.eng == nil { return }
+	for i := range m.Layers {
+		l := &m.Layers[i]
+		if l.gW != nil {
+			m.eng.Release(l.gW)
+			l.gW = m.eng.FromHost(l.W, []int{l.OutDim, l.InDim})
+		}
+		if l.gB != nil {
+			m.eng.Release(l.gB)
+			l.gB = m.eng.FromHost(l.B, []int{1, l.OutDim})
+		}
+	}
+}
+
+// MLPOptimizer is an AdamW optimizer with cosine annealing for MLP training.
+type MLPOptimizer struct {
+	LR         float32
+	Beta1      float32
+	Beta2      float32
+	Eps        float32
+	WeightDecay float32
+	MaxEpochs  int
+	m          [][]float32 // first moment
+	v          [][]float32 // second moment
+	step       int
+}
+
+// NewMLPOptimizer creates an AdamW optimizer matching PyTorch defaults.
+func NewMLPOptimizer(lr, weightDecay float32, maxEpochs int) *MLPOptimizer {
+	return &MLPOptimizer{
+		LR: lr, Beta1: 0.9, Beta2: 0.999, Eps: 1e-8,
+		WeightDecay: weightDecay, MaxEpochs: maxEpochs,
+	}
+}
+
+// Step performs one AdamW update with cosine annealing LR.
+func (opt *MLPOptimizer) Step(params, grads [][]float32, epoch int) {
+	if opt.m == nil {
+		opt.m = make([][]float32, len(params))
+		opt.v = make([][]float32, len(params))
+		for i, p := range params {
+			opt.m[i] = make([]float32, len(p))
+			opt.v[i] = make([]float32, len(p))
+		}
+	}
+	opt.step++
+
+	// Cosine annealing
+	lr := opt.LR
+	if opt.MaxEpochs > 0 {
+		lr = opt.LR * 0.5 * (1.0 + float32(math.Cos(math.Pi*float64(epoch)/float64(opt.MaxEpochs))))
+	}
+
+	bc1 := 1.0 - float32(math.Pow(float64(opt.Beta1), float64(opt.step)))
+	bc2 := 1.0 - float32(math.Pow(float64(opt.Beta2), float64(opt.step)))
+
+	for i := range params {
+		for j := range params[i] {
+			g := grads[i][j]
+			opt.m[i][j] = opt.Beta1*opt.m[i][j] + (1-opt.Beta1)*g
+			opt.v[i][j] = opt.Beta2*opt.v[i][j] + (1-opt.Beta2)*g*g
+			mHat := opt.m[i][j] / bc1
+			vHat := opt.v[i][j] / bc2
+			params[i][j] -= lr * (mHat/(float32(math.Sqrt(float64(vHat)))+opt.Eps) + opt.WeightDecay*params[i][j])
+		}
+	}
 }
 
 // --- internals ---

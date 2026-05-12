@@ -99,3 +99,24 @@ func NeedleSparseLoaded() bool                                                  
 func KNeedleSparse(dataPtr, scalesPtr, cachePtr, momPtr, deltaPtr, hotIdxPtr unsafe.Pointer, signalScale, lr, beta1, wd float32, nHot, cols int) {}
 func NeedleInlineLoaded() bool { return false }
 func KNeedleInline(dataPtr, scalesPtr, cachePtr, momPtr, deltaPtr, maskPtr unsafe.Pointer, signalScale, lr, beta1, wd float32, n, cols int) {}
+func NeedleInlineFP16Loaded() bool { return false }
+func KNeedleInlineFP16(weightsPtr, momPtr, deltaPtr, maskPtr unsafe.Pointer, signalScale, lr, beta1, wd float32, n, cols int) {}
+func KNeedleInlineJitter(dataPtr, scalesPtr, cachePtr, momPtr, deltaPtr, maskPtr unsafe.Pointer, signalScale, lr, beta1, wd float32, n, cols int, jitterAmp, dropoutP float32, seed uint64) {}
+func KNeedleInlineFP16Jitter(weightsPtr, momPtr, deltaPtr, maskPtr unsafe.Pointer, signalScale, lr, beta1, wd float32, n, cols int, jitterAmp, dropoutP float32, seed uint64) {}
+func NeedleForwardStepLoaded() bool { return false }
+func KNeedleForwardStep(cfg *NeedleForwardConfig) {}
+func NeedleBatchStepLoaded() bool { return false }
+func KNeedleBatchStep(cfg *NeedleBatchConfig) {}
+
+func HasMLPKernels() bool { return false }
+func KBiasAdd(outPtr, biasPtr unsafe.Pointer, B, D int) {}
+func KReduceMeanRows(inPtr, outPtr unsafe.Pointer, B, D int) {}
+func KBatchNormFwd(xPtr, outPtr, gammaPtr, betaPtr, runMeanPtr, runVarPtr, saveMeanPtr, saveInvStdPtr unsafe.Pointer, B, D int, momentum, eps float32) {}
+func KBatchNormBwd(dOutPtr, xPtr, saveMeanPtr, saveInvStdPtr, gammaPtr, dxPtr, dGammaPtr, dBetaPtr unsafe.Pointer, B, D int) {}
+func KBCEWithLogitsLoss(logitsPtr, targetsPtr, gradPtr, lossBufPtr unsafe.Pointer, B int) {}
+func KReduceMean(inPtr, outPtr unsafe.Pointer, n int) {}
+func KDropoutFwd(xPtr, maskPtr unsafe.Pointer, seed, counter uint64, p float32, n int) {}
+func KDropoutBwd(dxPtr, maskPtr unsafe.Pointer, n int) {}
+func HasSQ4Matvec() bool { return false }
+func KSQ4Matvec(packedPtr, bandsPtr, actPtr, outPtr unsafe.Pointer, rows, cols int) {}
+func KSQ4OutlierCorrect(idxPtr, valPtr, packedPtr, bandsPtr, actPtr, outPtr unsafe.Pointer, count, cols int) {}

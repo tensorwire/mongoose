@@ -175,6 +175,8 @@ void mtl_fused_post_attn(void* hidden, void* attnOut, void* wo, void* normW2, vo
 int mtl_fused_train_available(void);
 void mtl_fused_lm_head_pass1(void* hidden, void* embed, void* maxBuf, void* sumExp, int dim, int vocabSize, int n);
 void mtl_fused_lm_head_pass2(void* hidden, void* embed, void* maxBuf, void* sumExp, void* targets, void* dHidden, void* loss, int dim, int vocabSize, int n);
+void mtl_lm_head_forward_grad(void* hidden, void* embed, void* maxBuf, void* sumExp, void* targets, void* dHidden, void* loss, int dim, int vocabSize, int n);
+void mtl_softmax_ce_grad(void* logits, void* targets, void* losses, void* grad, int seqLen, int vocabSize, float invN);
 void mtl_fused_gemm_tn_sparse(void* a, void* b, void* c, void* mask, int M, int K, int N);
 void mtl_fused_end_async(void);
 void mtl_fused_wait(void);
@@ -1020,6 +1022,17 @@ func (m *Metal) FusedLMHeadPass2(hidden, embed, maxBuf, sumExp, targets, dHidden
 	C.mtl_fused_lm_head_pass2(MtlBufPtr(hidden), MtlBufPtr(embed), MtlBufPtr(maxBuf), MtlBufPtr(sumExp),
 		MtlBufPtr(targets), MtlBufPtr(dHidden), MtlBufPtr(loss),
 		C.int(dim), C.int(vocabSize), C.int(n))
+}
+
+func (m *Metal) LMHeadForwardGrad(hidden, embed, maxBuf, sumExp, targets, dHidden, loss *Tensor, dim, vocabSize, n int) {
+	C.mtl_lm_head_forward_grad(MtlBufPtr(hidden), MtlBufPtr(embed), MtlBufPtr(maxBuf), MtlBufPtr(sumExp),
+		MtlBufPtr(targets), MtlBufPtr(dHidden), MtlBufPtr(loss),
+		C.int(dim), C.int(vocabSize), C.int(n))
+}
+
+func (m *Metal) SoftmaxCEGrad(logits, targets, losses, grad *Tensor, seqLen, vocabSize int, invN float32) {
+	C.mtl_softmax_ce_grad(MtlBufPtr(logits), MtlBufPtr(targets), MtlBufPtr(losses), MtlBufPtr(grad),
+		C.int(seqLen), C.int(vocabSize), C.float(invN))
 }
 
 func (m *Metal) FusedGemmF32TNSparse(a, b, c *Tensor, mask *HotRowMask, M, K, N int) {
