@@ -70,7 +70,7 @@ M1 Pro        66.8 tok/s    Metal fused Q8 inference
 
 SQ4 (Synaptic Quantization 4-bit) — weights encoded as 3-bit percentile magnitude bands + 1-bit sign, with FP32 outlier corrections for |weight| > p99.9. Same 4-bit budget as Q4_0, output indistinguishable from FP16. A 32B model fits in under 7 GB. [Format spec](https://github.com/tensorwire/ai/blob/main/docs/sq4-spec.md). [White paper](https://github.com/tensorwire/ai/blob/main/docs/sq4-whitepaper.md).
 
-**CUDA**: 16-entry LUT in registers, dequant is a single shift+mask — effectively free (1-2% of kernel time). The kernel is memory-bound at all sizes; reading half the bytes vs FP16 is pure gain.
+**CUDA**: 16-entry LUT in registers, dequant is a single shift+mask — effectively free (1-2% of kernel time). The kernel is memory-bound at all sizes; reading half the bytes vs FP16 is pure gain. TF32 tensor core path with tile-swizzled weights via inline PTX `mma.sync.aligned.m16n8k8`.
 
 **Metal**: MLX-derived INT4 matvec with per-group linear re-encoding (primary path on Metal 4+). 16-entry LUT kernel as fallback. Outlier corrections baked into linear encoding at load time. Above ~3B params, SQ4 is faster than FP16 where inference becomes bandwidth-bound.
 
@@ -87,7 +87,7 @@ SQ4 (Synaptic Quantization 4-bit) — weights encoded as 3-bit percentile magnit
 | `sq4_infer_metal.go` / `sq4_infer_metal_darwin.m` | Fused Metal inference engine — one command buffer per token, slab-allocated weights |
 | `sq4_metal.go` / `sq4_metal_darwin.m` | Standalone SQ4 matvec dispatch (Metal) |
 | `kernels/sq4_matvec.metal` | Metal compute shaders: `sq4_mlx_qmv`, `sq4_matvec_linear`, `sq4_matvec` |
-| `kernels/mongoose_sq4_matvec.cu` | CUDA SQ4 matvec: scalar LUT, outlier correction |
+| `kernels/mongoose_sq4_matvec.cu` | CUDA SQ4 matvec: scalar LUT, TF32 tensor core, outlier correction |
 
 ## How it works
 
