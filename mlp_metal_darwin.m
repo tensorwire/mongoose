@@ -53,6 +53,33 @@ int mtl_mlp_init_path(const char* path) {
             if (g_mlp_lib) { NSLog(@"[MLP-Metal] loaded %@", p); }
         }
     }
+    // Fall back to the standard search paths when no explicit path is given.
+    //
+    // Without this, every entry point in this file silently no-ops: the
+    // dispatch helpers all begin `if (!ps_x) return;`, so a caller that never
+    // happened to pass a path gets a GEMM that writes nothing and leaves the
+    // output buffer at its initial zeros. That reads as a broken kernel rather
+    // than an uninitialized library, and it is why MtlGemmBT appeared to return
+    // all zeros for small matrices.
+    if (!g_mlp_lib) {
+        NSArray<NSString*>* dirs = @[
+            [[[NSBundle mainBundle] executablePath] stringByDeletingLastPathComponent],
+            [[[[NSBundle mainBundle] executablePath] stringByDeletingLastPathComponent]
+                stringByAppendingPathComponent:@"kernels"],
+            @".", @"kernels",
+            [[NSFileManager defaultManager] currentDirectoryPath],
+            [[[NSFileManager defaultManager] currentDirectoryPath]
+                stringByAppendingPathComponent:@"kernels"],
+        ];
+        for (NSString* dir in dirs) {
+            NSString* p = [dir stringByAppendingPathComponent:@"mlp_train.metallib"];
+            if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
+                NSError* e = nil;
+                g_mlp_lib = [g_device newLibraryWithURL:[NSURL fileURLWithPath:p] error:&e];
+                if (g_mlp_lib) { NSLog(@"[MLP-Metal] loaded %@", p); break; }
+            }
+        }
+    }
     if (!g_mlp_lib) { NSLog(@"[MLP-Metal] mlp_train.metallib not found at %s", path ? path : "(nil)"); return 0; }
 
     ps_bias_add       = mk_ps(@"mlp_bias_add");
@@ -406,6 +433,9 @@ void mtl_mlp_train_step(
 // ======================== TEST DISPATCH HELPERS ========================
 
 void mtl_mlp_gemm_bt(void* a, void* b, void* c, int M, int K, int N) {
+    // Initialize on demand: a silent return here leaves the caller's output
+    // buffer untouched, which looks exactly like a GEMM that computed zeros.
+    if (!ps_gemm_bt) mtl_mlp_init_path(NULL);
     if (!ps_gemm_bt) return;
     id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
@@ -414,6 +444,9 @@ void mtl_mlp_gemm_bt(void* a, void* b, void* c, int M, int K, int N) {
 }
 
 void mtl_mlp_gemm_tn(void* a, void* b, void* c, int M, int K, int N) {
+    // Initialize on demand: a silent return here leaves the caller's output
+    // buffer untouched, which looks exactly like a GEMM that computed zeros.
+    if (!ps_gemm_tn) mtl_mlp_init_path(NULL);
     if (!ps_gemm_tn) return;
     id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
@@ -422,6 +455,9 @@ void mtl_mlp_gemm_tn(void* a, void* b, void* c, int M, int K, int N) {
 }
 
 void mtl_mlp_gemm_nn(void* a, void* b, void* c, int M, int K, int N) {
+    // Initialize on demand: a silent return here leaves the caller's output
+    // buffer untouched, which looks exactly like a GEMM that computed zeros.
+    if (!ps_gemm_nn) mtl_mlp_init_path(NULL);
     if (!ps_gemm_nn) return;
     id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];

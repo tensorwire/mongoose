@@ -3435,10 +3435,19 @@ void mtl_fused_gemm_bt(void* aRef, void* bRef, void* cRef, int M, int K, int N) 
     [g_fused_enc[g_active_fused_slot] setBuffer:mBuf offset:0 atIndex:3];
     [g_fused_enc[g_active_fused_slot] setBuffer:kBuf offset:0 atIndex:4];
     [g_fused_enc[g_active_fused_slot] setBuffer:nBuf offset:0 atIndex:5];
-    if (g_use_metal4_gemm) {
+    // gemm4_bt's operands are `half`, but every caller of this function passes
+    // FP32 buffers. Dispatching it on them reinterprets each pair of floats as
+    // two halves; for typical weight magnitudes those are denormal and flush to
+    // zero, so the GEMM writes zeros instead of failing. That is what made
+    // LoRA forward passes silently produce nothing.
+    //
+    // Use the FP32 cooperative variant when it loaded, and fall back to the
+    // FP32 scalar kernel otherwise. gemm4f_bt tiles 64x32, so shapes smaller
+    // than a tile go to the scalar path too.
+    if (g_use_metal4_gemm && g_ps_gemm4f_bt && M >= 32 && N >= 32) {
         // Metal 4 matmul2d: 4 simdgroups per threadgroup, 64x32 tiles
-        [g_fused_enc[g_active_fused_slot] setComputePipelineState:g_ps_gemm4_bt];
-        NSUInteger simdWidth = g_ps_gemm4_bt.threadExecutionWidth;
+        [g_fused_enc[g_active_fused_slot] setComputePipelineState:g_ps_gemm4f_bt];
+        NSUInteger simdWidth = g_ps_gemm4f_bt.threadExecutionWidth;
         [g_fused_enc[g_active_fused_slot] dispatchThreadgroups:MTLSizeMake((N+31)/32, (M+63)/64, 1)
                     threadsPerThreadgroup:MTLSizeMake(simdWidth * 4, 1, 1)];
     } else {
@@ -3587,7 +3596,34 @@ void mtl_softmax_ce_grad(void* logitsRef, void* targetsRef, void* lossesRef,
 
 // Fused FP32 GEMM: C = A @ B^T (FP32 in, FP32 out, Metal 4 cooperative path).
 void mtl_fused_gemm_f32_bt(void* aRef, void* bRef, void* cRef, int M, int K, int N) {
-    if (!g_ps_gemm4f_bt || N < 32 || M < 32) { mtl_fused_gemm_bt(aRef, bRef, cRef, M, K, N); return; }
+    // Small shapes cannot use the tensor-core path: gemm4f_bt tiles 64x32, so
+    // an M or N below the tile leaves it with no full tile to emit.
+    //
+    // They must NOT fall back to mtl_fused_gemm_bt either. That function honours
+    // g_use_metal4_gemm and dispatches gemm4_bt, whose operands are `half` —
+    // while every caller of *this* function passes FP32 buffers. Reading FP32
+    // bytes as FP16 reinterprets each pair of floats as two halves, which for
+    // typical weight magnitudes are denormal and flush to zero. The result is a
+    // GEMM that silently returns all zeros instead of failing, which is how this
+    // survived: LoRA trained against it, saw no error, and learned nothing.
+    //
+    // gemm_bt is the FP32 scalar tiled kernel and is correct at any size.
+    if (!g_ps_gemm4f_bt || N < 32 || M < 32) {
+        uint32_t um2 = M, uk2 = K, un2 = N;
+        id<MTLBuffer> mB = const_buf(&um2, 4);
+        id<MTLBuffer> kB = const_buf(&uk2, 4);
+        id<MTLBuffer> nB = const_buf(&un2, 4);
+        [g_fused_enc[g_active_fused_slot] setComputePipelineState:g_ps_gemm_bt];
+        [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)aRef offset:0 atIndex:0];
+        [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)bRef offset:0 atIndex:1];
+        [g_fused_enc[g_active_fused_slot] setBuffer:(__bridge id<MTLBuffer>)cRef offset:0 atIndex:2];
+        [g_fused_enc[g_active_fused_slot] setBuffer:mB offset:0 atIndex:3];
+        [g_fused_enc[g_active_fused_slot] setBuffer:kB offset:0 atIndex:4];
+        [g_fused_enc[g_active_fused_slot] setBuffer:nB offset:0 atIndex:5];
+        [g_fused_enc[g_active_fused_slot] dispatchThreadgroups:MTLSizeMake((N+31)/32, (M+31)/32, 1)
+                    threadsPerThreadgroup:MTLSizeMake(32, 32, 1)];
+        return;
+    }
     uint32_t um = M, uk = K, un = N;
     id<MTLBuffer> mBuf = const_buf(&um, 4);
     id<MTLBuffer> kBuf = const_buf(&uk, 4);
