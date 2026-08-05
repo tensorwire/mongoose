@@ -101,13 +101,25 @@ static MPSGraphTensor* buildRoPE(MPSGraph* g, MPSGraphTensor* x,
     int totalDim = nHeads * headDim;
     MPSGraphTensor* xr = [g reshapeTensor:x withShape:@[@(n), @(nHeads), @(headDim)] name:nil];
 
-    // Split into pairs: reshape [n, nHeads, headDim] → [n, nHeads, halfDim, 2] then slice
-    // Split pairs: [n, nHeads, headDim] → [n, nHeads, halfDim, 2] → slice → reshape (no squeeze!)
-    MPSGraphTensor* xPairs = [g reshapeTensor:xr withShape:@[@(n), @(nHeads), @(halfDim), @2] name:nil];
-    MPSGraphTensor* xEven = [g sliceTensor:xPairs dimension:3 start:0 length:1 name:nil];
-    xEven = [g reshapeTensor:xEven withShape:@[@(n), @(nHeads), @(halfDim)] name:nil];
-    MPSGraphTensor* xOdd = [g sliceTensor:xPairs dimension:3 start:1 length:1 name:nil];
-    xOdd = [g reshapeTensor:xOdd withShape:@[@(n), @(nHeads), @(halfDim)] name:nil];
+    // SPLIT-HALF (NeoX / Llama-HF / Granite) pairing: (x[i], x[i + halfDim]).
+    //
+    // This used to reshape to [n, nHeads, halfDim, 2] and slice adjacent pairs,
+    // which is the INTERLEAVED (GPT-J) convention, (x[2i], x[2i+1]). The
+    // inference kernel rope_rotate_half has always been split-half, so training
+    // and serving rotated differently. Nothing detects that: each path is
+    // self-consistent, so training converges to a slightly worse loss and a
+    // served checkpoint is subtly wrong, with no error anywhere.
+    //
+    // transformers' GraniteForCausalLM.rotate_half is the reference. Inference
+    // is the path that must not change — it already serves correct checkpoints —
+    // so training moves to match it.
+    //
+    // Note the frequency exponent is 2*i/headDim with i stepping by 1 over
+    // halfDim, which is the same set of frequencies the interleaved form got
+    // from i stepping by 2 over headDim. Only the PAIRING changes here, not the
+    // frequencies, so cosT/sinT above stay as they are.
+    MPSGraphTensor* xEven = [g sliceTensor:xr dimension:2 start:0 length:halfDim name:nil];
+    MPSGraphTensor* xOdd  = [g sliceTensor:xr dimension:2 start:halfDim length:halfDim name:nil];
 
     // Rotate: even' = even*cos - odd*sin, odd' = even*sin + odd*cos
     MPSGraphTensor* outEven = [g subtractionWithPrimaryTensor:[g multiplicationWithPrimaryTensor:xEven secondaryTensor:cosT name:nil]
@@ -115,17 +127,26 @@ static MPSGraphTensor* buildRoPE(MPSGraph* g, MPSGraphTensor* x,
     MPSGraphTensor* outOdd = [g additionWithPrimaryTensor:[g multiplicationWithPrimaryTensor:xEven secondaryTensor:sinT name:nil]
                                           secondaryTensor:[g multiplicationWithPrimaryTensor:xOdd secondaryTensor:cosT name:nil] name:nil];
 
-    // Interleave: reshape to add trailing dim, concat, reshape back
-    MPSGraphTensor* ee = [g reshapeTensor:outEven withShape:@[@(n), @(nHeads), @(halfDim), @1] name:nil];
-    MPSGraphTensor* oe = [g reshapeTensor:outOdd withShape:@[@(n), @(nHeads), @(halfDim), @1] name:nil];
-    MPSGraphTensor* stacked = [g concatTensors:@[ee, oe] dimension:3 name:nil]; // [n, nHeads, halfDim, 2]
-    MPSGraphTensor* result = [g reshapeTensor:stacked withShape:@[@(n), @(nHeads), @(headDim)] name:nil];
+    // Recombine split-half: the two halves concatenate along the feature
+    // dimension, so element i and element i+halfDim end up where they started.
+    // (The interleaved form needed a [.., halfDim, 2] stack-and-flatten here;
+    // doing that with split-half slices would scramble the head.)
+    MPSGraphTensor* result = [g concatTensors:@[outEven, outOdd] dimension:2 name:nil];
     return [g reshapeTensor:result withShape:@[@(n), @(totalDim)] name:nil];
 }
 
 // --- Build full graph ---
 
 // mode: 0 = split (placeholders, gradient output), 1 = graph-Adam (variables, internal optimizer)
+// Architecture scalars for the TRAINING graph. Same contract as the inference
+// side in metal_impl_darwin.m: zero means "Llama default", and each use site
+// skips its node entirely, so an unset arch builds a byte-identical graph.
+static float g_train_arch_embedding_mult = 0.0f;
+static float g_train_arch_residual_mult  = 0.0f;
+static float g_train_arch_attn_scale     = 0.0f;
+static float g_train_arch_logits_scaling = 0.0f;
+static float g_train_arch_adam_beta2     = 0.0f;
+
 int mtl_graph_build_full(int dim, int kvDim, int headDim,
                          int nHeads, int nKVHeads, int ffnDim,
                          int vocabSize, int nLayers, int seqLen,
@@ -187,6 +208,11 @@ int mtl_graph_build_full(int dim, int kvDim, int headDim,
                                                   dataType:MPSDataTypeFloat32 onValue:1.0f offValue:0.0f name:@"tok_oh"];
     MPSGraphTensor* hidden = [g matrixMultiplicationWithPrimaryTensor:tokOneHot
                                                      secondaryTensor:cEmbedW name:@"embed"];
+    if (g_train_arch_embedding_mult != 0.0f) {
+        MPSGraphTensor* em = [g constantWithScalar:g_train_arch_embedding_mult
+                                          dataType:MPSDataTypeFloat32];
+        hidden = [g multiplicationWithPrimaryTensor:hidden secondaryTensor:em name:nil];
+    }
 
     // Causal mask
     float* maskData = (float*)malloc(n*n*sizeof(float));
@@ -197,7 +223,12 @@ int mtl_graph_build_full(int dim, int kvDim, int headDim,
     MPSGraphTensor* causalMask = [g constantWithData:maskNS shape:@[@1,@(n),@(n)] dataType:MPSDataTypeFloat32];
     free(maskData);
 
-    MPSGraphTensor* attnScale = [g constantWithScalar:1.0f/sqrtf((float)headDim) dataType:MPSDataTypeFloat32];
+    // Granite's attention_multiplier REPLACES 1/sqrt(headDim) (it is 1/headDim),
+    // it does not multiply it.
+    MPSGraphTensor* attnScale = [g constantWithScalar:
+        (g_train_arch_attn_scale != 0.0f ? g_train_arch_attn_scale
+                                         : 1.0f/sqrtf((float)headDim))
+                                            dataType:MPSDataTypeFloat32];
 
     for (int l = 0; l < nLayers; l++) {
         int base = 2 + l * 12;
@@ -267,6 +298,11 @@ int mtl_graph_build_full(int dim, int kvDim, int headDim,
                                           withShape:@[@(n),@(dim)] name:nil];
         MPSGraphTensor* proj = [g matrixMultiplicationWithPrimaryTensor:attnFlat
                                    secondaryTensor:[g transposeTensor:wo dimension:0 withDimension:1 name:nil] name:nil];
+        if (g_train_arch_residual_mult != 0.0f) {
+            MPSGraphTensor* rm = [g constantWithScalar:g_train_arch_residual_mult
+                                              dataType:MPSDataTypeFloat32];
+            proj = [g multiplicationWithPrimaryTensor:proj secondaryTensor:rm name:nil];
+        }
         hidden = [g additionWithPrimaryTensor:hidden secondaryTensor:proj name:nil];
 
         // FFN
@@ -280,6 +316,11 @@ int mtl_graph_build_full(int dim, int kvDim, int headDim,
         MPSGraphTensor* ffn = [g multiplicationWithPrimaryTensor:silu secondaryTensor:up name:nil];
         MPSGraphTensor* down = [g matrixMultiplicationWithPrimaryTensor:ffn
                                    secondaryTensor:[g transposeTensor:wd dimension:0 withDimension:1 name:nil] name:nil];
+        if (g_train_arch_residual_mult != 0.0f) {
+            MPSGraphTensor* rm = [g constantWithScalar:g_train_arch_residual_mult
+                                              dataType:MPSDataTypeFloat32];
+            down = [g multiplicationWithPrimaryTensor:down secondaryTensor:rm name:nil];
+        }
         hidden = [g additionWithPrimaryTensor:hidden secondaryTensor:down name:nil];
     }
 
@@ -287,6 +328,14 @@ int mtl_graph_build_full(int dim, int kvDim, int headDim,
     MPSGraphTensor* finalNormed = buildRMSNorm(g, hidden, cFinalNormW, dim);
     MPSGraphTensor* logits = [g matrixMultiplicationWithPrimaryTensor:finalNormed
                                  secondaryTensor:[g transposeTensor:cEmbedW dimension:0 withDimension:1 name:nil] name:nil];
+    // logits_scaling DIVIDES. Applied before the loss so gradients see the same
+    // scaling inference will, otherwise training optimizes a different function
+    // than the one that gets served.
+    if (g_train_arch_logits_scaling != 0.0f) {
+        MPSGraphTensor* ls = [g constantWithScalar:g_train_arch_logits_scaling
+                                          dataType:MPSDataTypeFloat32];
+        logits = [g divisionWithPrimaryTensor:logits secondaryTensor:ls name:nil];
+    }
     MPSGraphTensor* logitsSliced = [g sliceTensor:logits dimension:0 start:0 length:n-1 name:nil];
 
     // Cross-entropy loss
@@ -317,7 +366,9 @@ int mtl_graph_build_full(int dim, int kvDim, int headDim,
         MPSGraphTensor* lrTensor = [g placeholderWithShape:@[@1] dataType:MPSDataTypeFloat32 name:@"lr"];
         tg.lrPlaceholder = lrTensor;
         MPSGraphTensor* beta1T = [g constantWithScalar:0.9 dataType:MPSDataTypeFloat32];
-        MPSGraphTensor* beta2T = [g constantWithScalar:0.95 dataType:MPSDataTypeFloat32];
+        MPSGraphTensor* beta2T = [g constantWithScalar:
+        (g_train_arch_adam_beta2 != 0.0f ? g_train_arch_adam_beta2 : 0.95)
+                                          dataType:MPSDataTypeFloat32];
         MPSGraphTensor* epsT = [g constantWithScalar:1e-8 dataType:MPSDataTypeFloat32];
 
         if (mode == 2) {
@@ -1187,6 +1238,37 @@ static int g_fused_halfDim = 0;
 static int g_fused_vocabSize = 0;
 static int g_fused_maxSeq = 0;
 
+// Architecture scalar multipliers, applied when the graph is built.
+//
+// Granite's tensor layout is identical to Llama's, so a model run without these
+// produces fluent-looking nonsense rather than a shape error. There is nothing
+// downstream that can catch the mistake — hence the explicit "set before build"
+// contract below.
+//
+// A zero multiplier means "not set", and every use site skips the corresponding
+// graph node entirely, so an unset arch leaves the graph byte-identical to one
+// built before these existed.
+static float g_arch_embedding_mult = 0.0f;
+static float g_arch_residual_mult  = 0.0f;
+static float g_arch_attn_scale     = 0.0f;
+static float g_arch_logits_scaling = 0.0f;
+
+// mtl_fused_set_arch records the scalars for the next graph build.
+//
+// MPSGraph bakes constants in at construction, so this MUST be called before
+// mtl_fused_infer_build. Calling it afterwards returns -1 rather than silently
+// having no effect, because a silent no-op here is exactly the failure that
+// costs hours: the model loads, runs, and emits confident garbage.
+int mtl_fused_set_arch(float embeddingMultiplier, float residualMultiplier,
+                       float attentionScale, float logitsScaling) {
+    if (g_fused_graph) return -1;
+    g_arch_embedding_mult = embeddingMultiplier;
+    g_arch_residual_mult  = residualMultiplier;
+    g_arch_attn_scale     = attentionScale;
+    g_arch_logits_scaling = logitsScaling;
+    return 0;
+}
+
 int mtl_fused_infer_build(int dim, int kvDim, int headDim,
                           int nHeads, int nKVHeads, int ffnDim,
                           int vocabSize, int nLayers, int maxSeq,
@@ -1217,9 +1299,27 @@ int mtl_fused_infer_build(int dim, int kvDim, int headDim,
     MPSGraphTensor* one_i32 = [g constantWithScalar:1 dataType:MPSDataTypeInt32];
     MPSGraphTensor* seqLen = [g additionWithPrimaryTensor:g_fused_pos secondaryTensor:one_i32 name:nil];
 
+    // Granite's attention_multiplier REPLACES 1/sqrt(headDim); it is not a
+    // further factor on top of it. For Granite-4.1 it equals 1/headDim, which
+    // is a much smaller number — treating it as multiplicative, or "fixing" it
+    // into a sqrt, silently changes the function the model computes.
+    if (g_arch_attn_scale != 0.0f) scale = g_arch_attn_scale;
     MPSGraphTensor* scaleTensor = [g constantWithScalar:scale dataType:MPSDataTypeFloat32];
 
+    MPSGraphTensor* residualMultTensor = nil;
+    if (g_arch_residual_mult != 0.0f) {
+        residualMultTensor = [g constantWithScalar:g_arch_residual_mult
+                                          dataType:MPSDataTypeFloat32];
+    }
+
     MPSGraphTensor* x = g_fused_hidden_in;
+
+    // Embeddings are scaled once on entry to the stack.
+    if (g_arch_embedding_mult != 0.0f) {
+        MPSGraphTensor* embMult = [g constantWithScalar:g_arch_embedding_mult
+                                               dataType:MPSDataTypeFloat32];
+        x = [g multiplicationWithPrimaryTensor:x secondaryTensor:embMult name:nil];
+    }
 
     for (int l = 0; l < nLayers; l++) {
         // Weight variables — same order as multi-dispatch: norm1, wq, wk, wv, bq, bk, bv, wo, norm2, gate, up, down
@@ -1389,6 +1489,12 @@ int mtl_fused_infer_build(int dim, int kvDim, int headDim,
         // === O-proj + residual ===
         MPSGraphTensor* proj = [g matrixMultiplicationWithPrimaryTensor:attnOut
                                    secondaryTensor:[g transposeTensor:wo dimension:0 withDimension:1 name:nil] name:nil];
+        // Granite scales each block's contribution, not the running stream, so
+        // the multiplier lands on proj rather than on x.
+        if (residualMultTensor) {
+            proj = [g multiplicationWithPrimaryTensor:proj
+                                      secondaryTensor:residualMultTensor name:nil];
+        }
         x = [g additionWithPrimaryTensor:x secondaryTensor:proj name:nil];
 
         // === FFN: RMSNorm → gate/up → SiLU → down → residual ===
@@ -1402,6 +1508,10 @@ int mtl_fused_infer_build(int dim, int kvDim, int headDim,
         MPSGraphTensor* ffn = [g multiplicationWithPrimaryTensor:siluG secondaryTensor:up name:nil];
         MPSGraphTensor* down = [g matrixMultiplicationWithPrimaryTensor:ffn
                                    secondaryTensor:[g transposeTensor:wd dimension:0 withDimension:1 name:nil] name:nil];
+        if (residualMultTensor) {
+            down = [g multiplicationWithPrimaryTensor:down
+                                      secondaryTensor:residualMultTensor name:nil];
+        }
         x = [g additionWithPrimaryTensor:x secondaryTensor:down name:nil];
     }
 
@@ -1416,6 +1526,17 @@ int mtl_fused_infer_build(int dim, int kvDim, int headDim,
     MPSGraphTensor* finalNormed = buildRMSNorm1(g, x, finalNormW, dim);
     g_fused_logits = [g matrixMultiplicationWithPrimaryTensor:finalNormed
                          secondaryTensor:[g transposeTensor:lmHeadW dimension:0 withDimension:1 name:nil] name:nil];
+
+    // logits_scaling DIVIDES, despite reading like a multiplier. Granite-4.1-3b
+    // ships 6.0, so multiplying instead would be a 36x error on every logit —
+    // which does not crash, it just flattens or sharpens the distribution and
+    // quietly wrecks sampling.
+    if (g_arch_logits_scaling != 0.0f) {
+        MPSGraphTensor* ls = [g constantWithScalar:g_arch_logits_scaling
+                                          dataType:MPSDataTypeFloat32];
+        g_fused_logits = [g divisionWithPrimaryTensor:g_fused_logits
+                                      secondaryTensor:ls name:nil];
+    }
 
     g_fused_graph = g;
     return 0;
@@ -1501,4 +1622,114 @@ int mtl_fused_infer_reset(void) {
         [g_fused_graph runWithMTLCommandQueue:g_queue feeds:@{} targetTensors:@[] targetOperations:@[ka, va]];
     }
     return 0;
+}
+
+// mtl_init lives in metal_impl_darwin.m; both files share g_device/g_queue.
+int mtl_init(void);
+
+// Mirrors the declaration in metal.go's cgo preamble. Field order and types
+// must match exactly — this is passed by value across the cgo boundary.
+typedef struct {
+    float embeddingMultiplier;
+    float residualMultiplier;
+    float attentionScale;
+    float logitsScaling;
+    float adamBeta2;
+} MongooseArchParams;
+
+// ============================================================================
+// RoPE probes — direct entry points into each RoPE implementation.
+//
+// Each RoPE site is otherwise reachable only through a full graph or model
+// build, where a wrong rotation convention shows up as nothing more than a
+// slightly worse scalar loss. That opacity is how the training path stayed on
+// the INTERLEAVED (GPT-J) convention while inference used SPLIT-HALF
+// (NeoX/Llama-HF/Granite): each path agreed with itself and nothing compared
+// them. These probes make the three implementations directly comparable.
+// ============================================================================
+
+int mtl_graph_rope_probe(float* x, int n, int nHeads, int headDim, float theta) {
+    if (!x || n <= 0 || nHeads <= 0 || headDim < 2 || (headDim & 1)) return -1;
+    if (mtl_init() != 0) return -2;
+    @autoreleasepool {
+        int totalDim = nHeads * headDim;
+        MPSGraph* g = [[MPSGraph alloc] init];
+        MPSGraphTensor* ph = [g placeholderWithShape:@[@(n), @(totalDim)]
+                                            dataType:MPSDataTypeFloat32 name:@"x"];
+        MPSGraphTensor* out = buildRoPE(g, ph, n, nHeads, headDim, theta);
+
+        NSData* xNS = [NSData dataWithBytes:x length:(size_t)n * totalDim * sizeof(float)];
+        MPSGraphTensorData* xTD = [[MPSGraphTensorData alloc]
+            initWithDevice:[MPSGraphDevice deviceWithMTLDevice:g_device]
+                      data:xNS shape:@[@(n), @(totalDim)] dataType:MPSDataTypeFloat32];
+
+        NSDictionary* res = [g runWithMTLCommandQueue:g_queue
+                                                feeds:@{ph: xTD}
+                                        targetTensors:@[out]
+                                     targetOperations:nil];
+        [[res[out] mpsndarray] readBytes:x strideBytes:nil];
+    }
+    return 0;
+}
+
+int mtl_graph_rope1_probe(float* x, int nHeads, int headDim, int pos, float theta) {
+    if (!x || nHeads <= 0 || headDim < 2 || (headDim & 1) || pos < 0) return -1;
+    if (mtl_init() != 0) return -2;
+    @autoreleasepool {
+        int totalDim = nHeads * headDim, halfDim = headDim / 2;
+        MPSGraph* g = [[MPSGraph alloc] init];
+        MPSGraphTensor* ph = [g placeholderWithShape:@[@1, @(totalDim)]
+                                            dataType:MPSDataTypeFloat32 name:@"x"];
+        // buildRoPE1 takes cos/sin as tensors, matching the inference path where
+        // they are fed per step rather than baked in as constants.
+        float* cosD = (float*)malloc(halfDim * sizeof(float));
+        float* sinD = (float*)malloc(halfDim * sizeof(float));
+        for (int i = 0; i < halfDim; i++) {
+            float freq = 1.0f / powf(theta, (float)(2*i) / (float)headDim);
+            float v = (float)pos * freq;
+            cosD[i] = cosf(v); sinD[i] = sinf(v);
+        }
+        NSData* cosNS = [NSData dataWithBytes:cosD length:halfDim * sizeof(float)];
+        NSData* sinNS = [NSData dataWithBytes:sinD length:halfDim * sizeof(float)];
+        free(cosD); free(sinD);
+        MPSGraphTensor* cosT = [g constantWithData:cosNS shape:@[@1, @1, @(halfDim)]
+                                          dataType:MPSDataTypeFloat32];
+        MPSGraphTensor* sinT = [g constantWithData:sinNS shape:@[@1, @1, @(halfDim)]
+                                          dataType:MPSDataTypeFloat32];
+
+        MPSGraphTensor* out = buildRoPE1(g, ph, cosT, sinT, nHeads, headDim);
+
+        NSData* xNS = [NSData dataWithBytes:x length:(size_t)totalDim * sizeof(float)];
+        MPSGraphTensorData* xTD = [[MPSGraphTensorData alloc]
+            initWithDevice:[MPSGraphDevice deviceWithMTLDevice:g_device]
+                      data:xNS shape:@[@1, @(totalDim)] dataType:MPSDataTypeFloat32];
+
+        NSDictionary* res = [g runWithMTLCommandQueue:g_queue
+                                                feeds:@{ph: xTD}
+                                        targetTensors:@[out]
+                                     targetOperations:nil];
+        [[res[out] mpsndarray] readBytes:x strideBytes:nil];
+    }
+    return 0;
+}
+
+// mtl_graph_build_full_arch builds the training graph with architecture scalars.
+//
+// Records the scalars, then delegates: MPSGraph bakes constants in at build
+// time, so the scalars must be in place before mtl_graph_build_full runs. A
+// zero field means "Llama default" and its graph node is skipped entirely,
+// which is what makes ArchParams{} produce a byte-identical graph.
+int mtl_graph_build_full_arch(int dim, int kvDim, int headDim,
+                              int nHeads, int nKVHeads, int ffnDim,
+                              int vocabSize, int nLayers, int seqLen,
+                              float ropeTheta, int mode,
+                              MongooseArchParams arch) {
+    if (g_train_graph) return 0;
+    g_train_arch_embedding_mult = arch.embeddingMultiplier;
+    g_train_arch_residual_mult  = arch.residualMultiplier;
+    g_train_arch_attn_scale     = arch.attentionScale;
+    g_train_arch_logits_scaling = arch.logitsScaling;
+    g_train_arch_adam_beta2     = arch.adamBeta2;
+    return mtl_graph_build_full(dim, kvDim, headDim, nHeads, nKVHeads, ffnDim,
+                                vocabSize, nLayers, seqLen, ropeTheta, mode);
 }

@@ -270,6 +270,11 @@ kernel void decode_attn(
     device const uint* p_nHeads  [[buffer(6)]],
     device const uint* p_nKVH   [[buffer(7)]],
     device const uint* p_seqLen [[buffer(8)]],
+    // Optional architecture attention scale. Bound to nullptr (or simply left
+    // unbound) for Llama-family models, which keep 1/sqrt(headDim). Granite
+    // passes attention_multiplier here, which is 1/headDim — a different value,
+    // not a correction factor on top of the default.
+    device const float* p_attnScale [[buffer(9)]],
     uint h [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]])
 {
@@ -278,33 +283,114 @@ kernel void decode_attn(
     if (h >= nHeads || tid >= headDim) return;
     uint kvMul = nHeads / nKVH;
     uint kvH = h / kvMul;
-    float scale = 1.0f / sqrt(float(headDim));
-    threadgroup float scores[4096];
-    threadgroup float smax[1];
-    threadgroup float ssum[1];
-    uint work = (seqLen + headDim - 1) / headDim;
-    for (uint w = 0; w < work; w++) {
-        uint t = tid + w * headDim;
-        if (t < seqLen) {
+    float scale = p_attnScale ? p_attnScale[0] : (1.0f / sqrt(float(headDim)));
+
+    // Tiled online softmax.
+    //
+    // Two constraints have to be satisfied at once, and satisfying either alone
+    // gives a slower kernel than the naive version:
+    //
+    //  1. The scores must stay SHARED. Each score is one Q·K dot over headDim.
+    //     If every thread recomputes the score for every t, the kernel does
+    //     headDim (=64) times the necessary dot-product work. Measured: 3x
+    //     slower end to end than the code it replaced, despite removing the
+    //     serial reduction.
+    //  2. The reduction must stay PARALLEL. The previous version staged all
+    //     scores in threadgroup memory and folded them with
+    //     `if (tid == 0) for (t < seqLen)` — one thread of headDim doing
+    //     O(seqLen) serial work per head, per layer, per token. In prefill,
+    //     which runs this once per prompt token, that makes total cost
+    //     quadratic in prompt length: 11 -> 50 ms/token as prompts grew
+    //     149 -> 4209 tokens.
+    //
+    // So: process the sequence in tiles of TILE. Threads cooperate to compute
+    // TILE scores (each score still computed exactly once), reduce the tile's
+    // max and sum with simd intrinsics, then fold the tile into a running
+    // (max, sum, acc) with the standard online-softmax rescale. Threadgroup
+    // memory is O(TILE) rather than O(seqLen), which also removes the 4096
+    // context cap that silently truncated longer prompts.
+    const uint TILE = 256;
+    const uint MAX_SG = 32;        // headDim <= 1024 threads / 32 per simdgroup
+    threadgroup float sc[256];
+    // Per-simdgroup reduction slots. A single shared accumulator written by
+    // every simdgroup is a race: `if (simd_is_first()) tgRed += x` has no
+    // ordering between simdgroups, and with headDim=64 there are two of them.
+    // That produced results that were exactly right whenever only one simdgroup
+    // had work (seqLen % 256 <= 32) and wrong otherwise — the kind of bug that
+    // passes a spot check at one length and fails everywhere else.
+    threadgroup float sgMax[MAX_SG];
+    threadgroup float sgSum[MAX_SG];
+
+    uint nSG   = (headDim + 31u) / 32u;
+    uint sgId  = tid / 32u;
+    uint lane  = tid % 32u;
+
+    device const float* qHead = Q + h * headDim;
+    device const float* kBase = kCache + kvH * headDim;
+    device const float* vBase = vCache + kvH * headDim;
+
+    float runMax = -INFINITY;
+    float runSum = 0.0f;
+    float acc    = 0.0f;
+
+    for (uint base = 0; base < seqLen; base += TILE) {
+        uint n = min(TILE, seqLen - base);
+
+        // Each thread computes scores for a strided subset of the tile, so a
+        // given score is computed once regardless of how many threads there are.
+        for (uint i = tid; i < n; i += headDim) {
+            uint t = base + i;
             float dot = 0.0f;
-            for (uint d = 0; d < headDim; d++)
-                dot += Q[h * headDim + d] * kCache[t * kvDim + kvH * headDim + d];
-            scores[t] = dot * scale;
+            device const float* kRow = kBase + t * kvDim;
+            for (uint d = 0; d < headDim; d++) dot += qHead[d] * kRow[d];
+            sc[i] = dot * scale;
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Tile max: reduce within each simdgroup, then across simdgroups via
+        // dedicated slots. Every thread reads all nSG slots, so the result is
+        // identical on all threads without a second barrier.
+        float local = -INFINITY;
+        for (uint i = tid; i < n; i += headDim) local = max(local, sc[i]);
+        local = simd_max(local);
+        if (lane == 0) sgMax[sgId] = local;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float tileMax = sgMax[0];
+        for (uint s = 1; s < nSG; s++) tileMax = max(tileMax, sgMax[s]);
+
+        // exp() relative to the tile max, then tile sum, also reduced in
+        // parallel. Writing exp back into sc lets the value pass below reuse it.
+        float lsum = 0.0f;
+        for (uint i = tid; i < n; i += headDim) {
+            float w = exp(sc[i] - tileMax);
+            sc[i] = w;
+            lsum += w;
+        }
+        lsum = simd_sum(lsum);
+        if (lane == 0) sgSum[sgId] = lsum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float tileSum = 0.0f;
+        for (uint s = 0; s < nSG; s++) tileSum += sgSum[s];
+
+        // Fold this tile into the running accumulator. correction is 1.0 while
+        // the max is unchanged, so a monotone-decreasing score sequence costs
+        // nothing extra.
+        float newMax = max(runMax, tileMax);
+        float corr = exp(runMax - newMax);
+        float tcorr = exp(tileMax - newMax);
+        runSum = runSum * corr + tileSum * tcorr;
+
+        // Value pass: every thread owns one output component (tid = d), and
+        // walks the tile accumulating sc[i] * V[t][d].
+        float vacc = 0.0f;
+        for (uint i = 0; i < n; i++) vacc += sc[i] * vBase[(base + i) * kvDim + tid];
+        acc = acc * corr + vacc * tcorr;
+        runMax = newMax;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0) { float mx = -1e30f; for (uint t = 0; t < seqLen; t++) mx = max(mx, scores[t]); smax[0] = mx; }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float mx = smax[0];
-    for (uint w = 0; w < work; w++) { uint t = tid + w * headDim; if (t < seqLen) scores[t] = exp(scores[t] - mx); }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0) { float s = 0.0f; for (uint t = 0; t < seqLen; t++) s += scores[t]; ssum[0] = s; }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float invSum = 1.0f / ssum[0];
-    float acc = 0.0f;
-    for (uint t = 0; t < seqLen; t++)
-        acc += scores[t] * invSum * vCache[t * kvDim + kvH * headDim + tid];
-    out[h * headDim + tid] = acc;
+
+    out[h * headDim + tid] = acc / runSum;
 }
 
 // ============================================================================

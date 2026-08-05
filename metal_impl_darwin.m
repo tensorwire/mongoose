@@ -5731,15 +5731,20 @@ static NSString* g_infer_kernel_src =
 "// Decode attention: single Q over KV cache.\n"
 "// One threadgroup per head, headDim threads.\n"
 "kernel void decode_attn(\n"
-"    device const float* Q      [[buffer(0)]],  // [1, dim]\n"
-"    device const float* kCache [[buffer(1)]],  // [maxSeq, kvDim]\n"
-"    device const float* vCache [[buffer(2)]],  // [maxSeq, kvDim]\n"
-"    device float* out          [[buffer(3)]],  // [1, dim]\n"
+"    device const float* Q      [[buffer(0)]],\n"
+"    device const float* kCache [[buffer(1)]],\n"
+"    device const float* vCache [[buffer(2)]],\n"
+"    device float* out          [[buffer(3)]],\n"
 "    device const uint* p_kvDim   [[buffer(4)]],\n"
 "    device const uint* p_headDim [[buffer(5)]],\n"
 "    device const uint* p_nHeads  [[buffer(6)]],\n"
 "    device const uint* p_nKVH   [[buffer(7)]],\n"
 "    device const uint* p_seqLen [[buffer(8)]],\n"
+"    // Optional architecture attention scale. Bound to nullptr (or simply left\n"
+"    // unbound) for Llama-family models, which keep 1/sqrt(headDim). Granite\n"
+"    // passes attention_multiplier here, which is 1/headDim — a different value,\n"
+"    // not a correction factor on top of the default.\n"
+"    device const float* p_attnScale [[buffer(9)]],\n"
 "    uint h [[threadgroup_position_in_grid]],\n"
 "    uint tid [[thread_index_in_threadgroup]])\n"
 "{\n"
@@ -5748,33 +5753,114 @@ static NSString* g_infer_kernel_src =
 "    if (h >= nHeads || tid >= headDim) return;\n"
 "    uint kvMul = nHeads / nKVH;\n"
 "    uint kvH = h / kvMul;\n"
-"    float scale = 1.0f / sqrt(float(headDim));\n"
-"    threadgroup float scores[4096];\n"
-"    threadgroup float smax[1];\n"
-"    threadgroup float ssum[1];\n"
-"    uint work = (seqLen + headDim - 1) / headDim;\n"
-"    for (uint w = 0; w < work; w++) {\n"
-"        uint t = tid + w * headDim;\n"
-"        if (t < seqLen) {\n"
+"    float scale = p_attnScale ? p_attnScale[0] : (1.0f / sqrt(float(headDim)));\n"
+"\n"
+"    // Tiled online softmax.\n"
+"    //\n"
+"    // Two constraints have to be satisfied at once, and satisfying either alone\n"
+"    // gives a slower kernel than the naive version:\n"
+"    //\n"
+"    //  1. The scores must stay SHARED. Each score is one Q·K dot over headDim.\n"
+"    //     If every thread recomputes the score for every t, the kernel does\n"
+"    //     headDim (=64) times the necessary dot-product work. Measured: 3x\n"
+"    //     slower end to end than the code it replaced, despite removing the\n"
+"    //     serial reduction.\n"
+"    //  2. The reduction must stay PARALLEL. The previous version staged all\n"
+"    //     scores in threadgroup memory and folded them with\n"
+"    //     `if (tid == 0) for (t < seqLen)` — one thread of headDim doing\n"
+"    //     O(seqLen) serial work per head, per layer, per token. In prefill,\n"
+"    //     which runs this once per prompt token, that makes total cost\n"
+"    //     quadratic in prompt length: 11 -> 50 ms/token as prompts grew\n"
+"    //     149 -> 4209 tokens.\n"
+"    //\n"
+"    // So: process the sequence in tiles of TILE. Threads cooperate to compute\n"
+"    // TILE scores (each score still computed exactly once), reduce the tile's\n"
+"    // max and sum with simd intrinsics, then fold the tile into a running\n"
+"    // (max, sum, acc) with the standard online-softmax rescale. Threadgroup\n"
+"    // memory is O(TILE) rather than O(seqLen), which also removes the 4096\n"
+"    // context cap that silently truncated longer prompts.\n"
+"    const uint TILE = 256;\n"
+"    const uint MAX_SG = 32;        // headDim <= 1024 threads / 32 per simdgroup\n"
+"    threadgroup float sc[256];\n"
+"    // Per-simdgroup reduction slots. A single shared accumulator written by\n"
+"    // every simdgroup is a race: `if (simd_is_first()) tgRed += x` has no\n"
+"    // ordering between simdgroups, and with headDim=64 there are two of them.\n"
+"    // That produced results that were exactly right whenever only one simdgroup\n"
+"    // had work (seqLen % 256 <= 32) and wrong otherwise — the kind of bug that\n"
+"    // passes a spot check at one length and fails everywhere else.\n"
+"    threadgroup float sgMax[MAX_SG];\n"
+"    threadgroup float sgSum[MAX_SG];\n"
+"\n"
+"    uint nSG   = (headDim + 31u) / 32u;\n"
+"    uint sgId  = tid / 32u;\n"
+"    uint lane  = tid % 32u;\n"
+"\n"
+"    device const float* qHead = Q + h * headDim;\n"
+"    device const float* kBase = kCache + kvH * headDim;\n"
+"    device const float* vBase = vCache + kvH * headDim;\n"
+"\n"
+"    float runMax = -INFINITY;\n"
+"    float runSum = 0.0f;\n"
+"    float acc    = 0.0f;\n"
+"\n"
+"    for (uint base = 0; base < seqLen; base += TILE) {\n"
+"        uint n = min(TILE, seqLen - base);\n"
+"\n"
+"        // Each thread computes scores for a strided subset of the tile, so a\n"
+"        // given score is computed once regardless of how many threads there are.\n"
+"        for (uint i = tid; i < n; i += headDim) {\n"
+"            uint t = base + i;\n"
 "            float dot = 0.0f;\n"
-"            for (uint d = 0; d < headDim; d++)\n"
-"                dot += Q[h * headDim + d] * kCache[t * kvDim + kvH * headDim + d];\n"
-"            scores[t] = dot * scale;\n"
+"            device const float* kRow = kBase + t * kvDim;\n"
+"            for (uint d = 0; d < headDim; d++) dot += qHead[d] * kRow[d];\n"
+"            sc[i] = dot * scale;\n"
 "        }\n"
+"        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"\n"
+"        // Tile max: reduce within each simdgroup, then across simdgroups via\n"
+"        // dedicated slots. Every thread reads all nSG slots, so the result is\n"
+"        // identical on all threads without a second barrier.\n"
+"        float local = -INFINITY;\n"
+"        for (uint i = tid; i < n; i += headDim) local = max(local, sc[i]);\n"
+"        local = simd_max(local);\n"
+"        if (lane == 0) sgMax[sgId] = local;\n"
+"        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"        float tileMax = sgMax[0];\n"
+"        for (uint s = 1; s < nSG; s++) tileMax = max(tileMax, sgMax[s]);\n"
+"\n"
+"        // exp() relative to the tile max, then tile sum, also reduced in\n"
+"        // parallel. Writing exp back into sc lets the value pass below reuse it.\n"
+"        float lsum = 0.0f;\n"
+"        for (uint i = tid; i < n; i += headDim) {\n"
+"            float w = exp(sc[i] - tileMax);\n"
+"            sc[i] = w;\n"
+"            lsum += w;\n"
+"        }\n"
+"        lsum = simd_sum(lsum);\n"
+"        if (lane == 0) sgSum[sgId] = lsum;\n"
+"        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"        float tileSum = 0.0f;\n"
+"        for (uint s = 0; s < nSG; s++) tileSum += sgSum[s];\n"
+"\n"
+"        // Fold this tile into the running accumulator. correction is 1.0 while\n"
+"        // the max is unchanged, so a monotone-decreasing score sequence costs\n"
+"        // nothing extra.\n"
+"        float newMax = max(runMax, tileMax);\n"
+"        float corr = exp(runMax - newMax);\n"
+"        float tcorr = exp(tileMax - newMax);\n"
+"        runSum = runSum * corr + tileSum * tcorr;\n"
+"\n"
+"        // Value pass: every thread owns one output component (tid = d), and\n"
+"        // walks the tile accumulating sc[i] * V[t][d].\n"
+"        float vacc = 0.0f;\n"
+"        for (uint i = 0; i < n; i++) vacc += sc[i] * vBase[(base + i) * kvDim + tid];\n"
+"        acc = acc * corr + vacc * tcorr;\n"
+"        runMax = newMax;\n"
+"\n"
+"        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
 "    }\n"
-"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-"    if (tid == 0) { float mx = -1e30f; for (uint t = 0; t < seqLen; t++) mx = max(mx, scores[t]); smax[0] = mx; }\n"
-"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-"    float mx = smax[0];\n"
-"    for (uint w = 0; w < work; w++) { uint t = tid + w * headDim; if (t < seqLen) scores[t] = exp(scores[t] - mx); }\n"
-"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-"    if (tid == 0) { float s = 0.0f; for (uint t = 0; t < seqLen; t++) s += scores[t]; ssum[0] = s; }\n"
-"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-"    float invSum = 1.0f / ssum[0];\n"
-"    float acc = 0.0f;\n"
-"    for (uint t = 0; t < seqLen; t++)\n"
-"        acc += scores[t] * invSum * vCache[t * kvDim + kvH * headDim + tid];\n"
-"    out[h * headDim + tid] = acc;\n"
+"\n"
+"    out[h * headDim + tid] = acc / runSum;\n"
 "}\n";
 
 static id<MTLComputePipelineState> g_ps_rope_rh = nil;  // rotate-half RoPE
@@ -5961,7 +6047,8 @@ int mtl_fused_build(int dim, int kvDim, int headDim,
         }
     }
 
-    if (maxSeq > 4096) maxSeq = 4096; // decode_attn threadgroup memory limit
+    // (The former 4096 clamp is gone: decode_attn no longer stages scores in
+    // threadgroup memory, so context length is not bounded by it.)
 
     // Metal 4: use FP32 weights + hardware matmul2d TensorOp.
     // Otherwise: Q8 (<4B) or Q4 (>4B) with fused dequant matvec kernel.
@@ -6328,6 +6415,172 @@ int mtl_fused_partial_step(const float* hiddenIn, int pos,
     return mtl_fused_partial_step_slot(0, hiddenIn, pos, layerStart, layerEnd, hiddenOut, logitsOut);
 }
 
+// PREFILL_TILE bounds how many prompt tokens mtl_fused_prefill_batch accepts per
+// call. Callers must chunk longer prompts.
+//
+// 256 is not a tunable — it is the only value measured to be sane. It was swept
+// by rebuilding infer.metallib at each value under an otherwise identical
+// binary, on the same 2738-token prompt and 178-token generation:
+//
+//     tile   decode        cold prefill
+//     256    74.3 tok/s    4.16 s     <- shipped
+//     320    75.7 tok/s    (not measured)
+//     384    85.9 tok/s    56.8 s     <- prefill collapses
+//     512     3.5 tok/s    3.83 s     <- decode collapses (20x regression)
+//
+// Both 384 and 512 fall off a cliff, in opposite directions, because this sizes
+// per-lane register arrays in kernels that DECODE also uses. A prefill-only
+// benchmark cannot see the decode side; that is how 512 shipped once before and
+// had to be reverted. Measure both paths before touching this.
+#define PREFILL_TILE 256
+
+int mtl_fused_prefill_tile(void) { return PREFILL_TILE; }
+
+// mtl_fused_prefill_batch runs B consecutive prompt tokens through every layer,
+// appending them to slot's KV cache starting at basePos.
+//
+// Prefilling token-by-token is memory-bound on weights: each token re-reads the
+// entire model, so an N-token prompt reads the weights N times. Encoding all B
+// tokens into ONE command buffer lets those reads stay resident in cache across
+// the batch, and collapses B * nLayers * ~20 command-buffer round trips into
+// one. That is where the speedup comes from — not from any single kernel.
+//
+// hiddenIn is B rows of dim embeddings, contiguous. logitsOut may be NULL, and
+// should be non-NULL only for the final tile of a prompt: only the last token's
+// logits are ever sampled, and computing them per token adds a full
+// vocab-sized matvec per token for nothing.
+//
+// Positions are absolute throughout (RoPE at basePos+b, KV written to
+// (basePos+b)*kvDim, attention bounded by basePos+b+1), so a caller may resume
+// mid-prompt — which is exactly what prefix-cache reuse needs.
+int mtl_fused_prefill_batch(int slot, const float* hiddenIn, int B, int basePos,
+                            float* logitsOut) {
+    if (!g_inf.built || slot < 0 || slot >= INF_NUM_SLOTS) return -1;
+    if (B <= 0 || !hiddenIn) return -1;
+    if (B > PREFILL_TILE) return -1;
+
+    inf_slot_t* sl = &g_inf.slots[slot];
+    id<MTLCommandQueue> queue = (slot == 0) ? g_queue : g_queue2;
+
+    int dim=g_inf.dim, kvDim=g_inf.kvDim, headDim=g_inf.headDim;
+    int nHeads=g_inf.nHeads, nKVHeads=g_inf.nKVHeads, ffnDim=g_inf.ffnDim;
+    int nLayers=g_inf.nLayers, vocabSize=g_inf.vocabSize;
+
+    if (basePos + B > g_inf.maxSeq) return -1;
+
+    NSUInteger tpg_norm = (dim / 32) * 32; if (tpg_norm == 0) tpg_norm = 32;
+    if (tpg_norm > g_ps_rmsnorm_save.maxTotalThreadsPerThreadgroup)
+        tpg_norm = g_ps_rmsnorm_save.maxTotalThreadsPerThreadgroup;
+
+    // Per-token scalar buffers are allocated once for the whole batch: writing
+    // g_inf.cb_pos between dispatches would not work, because all dispatches in
+    // an encoder observe the value at COMMIT time, not at encode time. Each
+    // token therefore needs its own position/seqLen buffer.
+    id<MTLBuffer> posBufs[PREFILL_TILE];
+    id<MTLBuffer> seqBufs[PREFILL_TILE];
+    for (int b = 0; b < B; b++) {
+        uint32_t p = (uint32_t)(basePos + b);
+        uint32_t s = p + 1u;
+        posBufs[b] = [g_device newBufferWithBytes:&p length:sizeof(uint32_t)
+                                          options:MTLResourceStorageModeShared];
+        seqBufs[b] = [g_device newBufferWithBytes:&s length:sizeof(uint32_t)
+                                          options:MTLResourceStorageModeShared];
+    }
+
+    id<MTLCommandBuffer> cmd = [queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+
+    for (int b = 0; b < B; b++) {
+        int pos = basePos + b;
+        id<MTLBuffer> cb_pos = posBufs[b];
+        id<MTLBuffer> cb_seq = seqBufs[b];
+        bool lastTok = (b == B - 1);
+
+        memcpy(((__bridge id<MTLBuffer>)sl->hidden).contents,
+               hiddenIn + (size_t)b * dim, dim * sizeof(float));
+
+        for (int l = 0; l < nLayers; l++) {
+            PS(g_ps_copy_mem); BUF(sl->hidden, 0); BUF(sl->normed, 1);
+            DT(dim,1,1, 256,1,1); BARRIER();
+
+            PS(g_ps_rmsnorm_save); BUF(sl->normed, 0); BUF(g_inf.norm1[l], 1); BUF(sl->rmsScale, 2);
+            CB(g_inf.cb_dim, 3); CB(g_inf.cb_eps, 4); DTG(1,1,1, tpg_norm,1,1); BARRIER();
+
+            MV(sl->normed, g_inf.wq[l], sl->Q, g_inf.cb_Kdim, g_inf.cb_dim);
+            MV(sl->normed, g_inf.wk[l], sl->K, g_inf.cb_Kdim, g_inf.cb_Nkvdim);
+            MV(sl->normed, g_inf.wv[l], sl->V, g_inf.cb_Kdim, g_inf.cb_Nkvdim);
+            BARRIER();
+
+            PS(g_ps_bias_add);
+            BUF(sl->Q, 0); BUF(g_inf.bq[l], 1); CB(g_inf.cb_dim, 2); DT(dim,1,1, 256,1,1);
+            BUF(sl->K, 0); BUF(g_inf.bk[l], 1); CB(g_inf.cb_kvDim, 2); DT(kvDim,1,1, 256,1,1);
+            BUF(sl->V, 0); BUF(g_inf.bv[l], 1); CB(g_inf.cb_kvDim, 2); DT(kvDim,1,1, 256,1,1);
+            BARRIER();
+
+            int nPQ = nHeads * (headDim / 2), nPK = nKVHeads * (headDim / 2);
+            PS(g_ps_rope_rh);
+            BUF(sl->Q, 0); CB(g_inf.cb_headDim, 1); CB(g_inf.cb_nHeads, 2); CB(cb_pos, 3); CB(g_inf.cb_theta, 4);
+            DT(nPQ,1,1, MIN(256,(int)g_ps_rope_rh.maxTotalThreadsPerThreadgroup),1,1);
+            BUF(sl->K, 0); CB(g_inf.cb_headDim, 1); CB(g_inf.cb_nKVHeads, 2); CB(cb_pos, 3); CB(g_inf.cb_theta, 4);
+            DT(nPK,1,1, MIN(256,(int)g_ps_rope_rh.maxTotalThreadsPerThreadgroup),1,1);
+            BARRIER();
+
+            int cOff = pos * kvDim * (int)sizeof(float);
+            PS(g_ps_copy_mem);
+            BUF(sl->K, 0); BUFO(sl->kCache[l], cOff, 1); DT(kvDim,1,1, 256,1,1);
+            BUF(sl->V, 0); BUFO(sl->vCache[l], cOff, 1); DT(kvDim,1,1, 256,1,1);
+            BARRIER();
+
+            PS(g_ps_dec_attn);
+            BUF(sl->Q, 0); BUF(sl->kCache[l], 1); BUF(sl->vCache[l], 2); BUF(sl->attnOut, 3);
+            CB(g_inf.cb_kvDim, 4); CB(g_inf.cb_headDim, 5); CB(g_inf.cb_nHeads, 6);
+            CB(g_inf.cb_nKVHeads, 7); CB(cb_seq, 8);
+            DTG(nHeads,1,1, headDim,1,1); BARRIER();
+
+            MV(sl->attnOut, g_inf.wo[l], sl->proj, g_inf.cb_Kdim, g_inf.cb_dim); BARRIER();
+            PS(g_ps_add_inplace); BUF(sl->hidden, 0); BUF(sl->proj, 1);
+            DT(dim,1,1, 256,1,1); BARRIER();
+
+            PS(g_ps_copy_mem); BUF(sl->hidden, 0); BUF(sl->normed2, 1);
+            DT(dim,1,1, 256,1,1); BARRIER();
+            PS(g_ps_rmsnorm_save); BUF(sl->normed2, 0); BUF(g_inf.norm2[l], 1); BUF(sl->rmsScale2, 2);
+            CB(g_inf.cb_dim, 3); CB(g_inf.cb_eps, 4); DTG(1,1,1, tpg_norm,1,1); BARRIER();
+
+            MV(sl->normed2, g_inf.wgate[l], sl->gatePre, g_inf.cb_Kdim, g_inf.cb_Nffn);
+            MV(sl->normed2, g_inf.wup[l], sl->upOut, g_inf.cb_Kdim, g_inf.cb_Nffn);
+            BARRIER();
+            PS(g_ps_silu_gate_mul); BUF(sl->gatePre, 0); BUF(sl->upOut, 1); BUF(sl->ffnMid, 2);
+            DT(ffnDim,1,1, 256,1,1); BARRIER();
+            MV(sl->ffnMid, g_inf.wdown[l], sl->proj, g_inf.cb_Nffn, g_inf.cb_dim); BARRIER();
+            PS(g_ps_add_inplace); BUF(sl->hidden, 0); BUF(sl->proj, 1);
+            DT(dim,1,1, 256,1,1); BARRIER();
+        }
+
+        // The LM head is the single most expensive matvec in the model
+        // (vocabSize x dim). Only the final token's logits are ever sampled, so
+        // every other token skips it entirely.
+        if (lastTok && logitsOut) {
+            PS(g_ps_rmsnorm_save); BUF(sl->hidden, 0); BUF(g_inf.finalNorm, 1); BUF(sl->rmsScale, 2);
+            CB(g_inf.cb_dim, 3); CB(g_inf.cb_eps, 4); DTG(1,1,1, tpg_norm,1,1); BARRIER();
+            MV(sl->hidden, g_inf.lmHead, sl->logits, g_inf.cb_Kdim, g_inf.cb_Nvocab);
+            BARRIER();
+        }
+    }
+
+    [enc endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+
+    if (cmd.error) { NSLog(@"prefill_batch: %@", cmd.error); return -2; }
+
+    if (logitsOut) {
+        memcpy(logitsOut, ((__bridge id<MTLBuffer>)sl->logits).contents,
+               vocabSize * sizeof(float));
+    }
+    (void)vocabSize;
+    return 0;
+}
+
 // Streaming inference state — ping-pong weight buffers for 19x less VRAM.
 // Only 2 layers' worth of weights in GPU memory at any time.
 static struct {
@@ -6517,3 +6770,130 @@ void mtl_stream_set_hidden(const float* hiddenIn) {
 #undef DTG
 #undef BARRIER
 #undef MV
+
+// mtl_infer_rope_probe applies the INFERENCE kernel (rope_rotate_half) to x in
+// place. This is the kernel that actually serves tokens, so it is the reference
+// the training path must agree with: changing it instead would invalidate every
+// checkpoint already served correctly.
+int mtl_infer_rope_probe(float* x, int nHeads, int headDim, int pos, float theta) {
+    if (!x || nHeads <= 0 || headDim < 2 || (headDim & 1) || pos < 0) return -1;
+    if (mtl_init() != 0) return -2;
+    @autoreleasepool {
+        // g_ps_rope_rh is only created by mtl_fused_build, which needs a whole
+        // model. The probe must work standalone, so it compiles the one kernel
+        // it needs from the same inline source the fused path falls back to —
+        // guaranteeing it tests the same code that ships.
+        static id<MTLComputePipelineState> probePS = nil;
+        if (!probePS) {
+            NSError* perr = nil;
+            id<MTLLibrary> plib = [g_device newLibraryWithSource:g_infer_kernel_src
+                                                        options:nil error:&perr];
+            if (!plib) { NSLog(@"rope probe lib: %@", perr); return -3; }
+            probePS = [g_device newComputePipelineStateWithFunction:
+                [plib newFunctionWithName:@"rope_rotate_half"] error:&perr];
+            if (!probePS) { NSLog(@"rope probe ps: %@", perr); return -3; }
+        }
+        int totalDim = nHeads * headDim, halfDim = headDim / 2;
+        size_t bytes = (size_t)totalDim * sizeof(float);
+        id<MTLBuffer> xb = [g_device newBufferWithBytes:x length:bytes
+                                                options:MTLResourceStorageModeShared];
+        uint32_t hd = (uint32_t)headDim, nh = (uint32_t)nHeads, pp = (uint32_t)pos;
+        float th = theta;
+        id<MTLBuffer> bhd = [g_device newBufferWithBytes:&hd length:4 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bnh = [g_device newBufferWithBytes:&nh length:4 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bps = [g_device newBufferWithBytes:&pp length:4 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bth = [g_device newBufferWithBytes:&th length:4 options:MTLResourceStorageModeShared];
+
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:probePS];
+        [enc setBuffer:xb offset:0 atIndex:0];
+        [enc setBuffer:bhd offset:0 atIndex:1];
+        [enc setBuffer:bnh offset:0 atIndex:2];
+        [enc setBuffer:bps offset:0 atIndex:3];
+        [enc setBuffer:bth offset:0 atIndex:4];
+        NSUInteger nThreads = (NSUInteger)(nHeads * halfDim);
+        NSUInteger tg = MIN((NSUInteger)256, probePS.maxTotalThreadsPerThreadgroup);
+        [enc dispatchThreads:MTLSizeMake(nThreads,1,1)
+       threadsPerThreadgroup:MTLSizeMake(MIN(tg, nThreads),1,1)];
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+        if (cmd.error) return -4;
+        memcpy(x, xb.contents, bytes);
+    }
+    return 0;
+}
+
+// ============================================================================
+// Q8 block GEMM (training path)
+//
+// Q8Quantize is implemented: block_q8_0 packing is a well-defined format and
+// the CPU implementation below is the reference the GPU path must match.
+//
+// mtl_q8_gemm_bt is NOT implemented, deliberately. The obvious approach — add a
+// per-row-scale variant of the Metal 4 tensor-core GEMM — was specced and put
+// through adversarial review, and failed on measured grounds:
+//
+//   - the tensor-core path measured 1.96 TFLOP/s against a required >=19.2,
+//     because a 32 KB weight tile pins occupancy to 1 threadgroup/core
+//   - two incompatible per-row scale conventions already coexist in this tree,
+//     and picking the wrong one is a silent 127x per-row gain
+//   - this device exposes only the `timestamp` counter set, so the profiling
+//     plan that would choose a geometry is unexecutable as written
+//
+// Reporting unavailable is the honest state: Q8Available() returns false, and
+// Q8GemmBT returns a clear error rather than silently producing wrong weights.
+// Returning plausible-looking garbage from a training GEMM is far worse than
+// returning nothing, because the failure shows up as a slightly worse loss
+// curve rather than an error.
+// ============================================================================
+
+int mtl_q8_gemm_init(void) { return 0; }
+
+int mtl_q8_gemm_available(void) { return 0; }
+
+// mtl_q8_quantize packs an [N,K] FP32 matrix into block_q8_0: for each run of
+// 32 elements, one FP16 scale followed by 32 int8 values.
+//
+// The scale is absmax/127 so the largest magnitude in the block maps to +-127.
+// Blocks that are entirely zero get scale 0, which dequantizes back to zeros
+// rather than producing NaN from a 0/0.
+int mtl_q8_quantize(const float* src, unsigned char* dst, int N, int K) {
+    if (!src || !dst || N <= 0 || K <= 0 || (K % 32) != 0) return -1;
+
+    const int blocksPerRow = K / 32;
+    for (int r = 0; r < N; r++) {
+        for (int b = 0; b < blocksPerRow; b++) {
+            const float* in = src + (size_t)r * K + (size_t)b * 32;
+            unsigned char* out = dst + ((size_t)r * blocksPerRow + b) * 34;
+
+            float absmax = 0.0f;
+            for (int i = 0; i < 32; i++) {
+                float a = fabsf(in[i]);
+                if (a > absmax) absmax = a;
+            }
+            float scale = absmax / 127.0f;
+            float inv = (scale > 0.0f) ? 1.0f / scale : 0.0f;
+
+            __fp16 hs = (__fp16)scale;
+            memcpy(out, &hs, sizeof(__fp16));
+
+            signed char* q = (signed char*)(out + 2);
+            for (int i = 0; i < 32; i++) {
+                float v = in[i] * inv;
+                int qi = (int)lrintf(v);
+                if (qi > 127) qi = 127;
+                if (qi < -127) qi = -127;
+                q[i] = (signed char)qi;
+            }
+        }
+    }
+    return 0;
+}
+
+int mtl_q8_gemm_bt(const float* A, const unsigned char* W, float* C,
+                   int M, int K, int N) {
+    (void)A; (void)W; (void)C; (void)M; (void)K; (void)N;
+    return -1;  // see the note above: unavailable, not silently wrong
+}
