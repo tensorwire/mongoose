@@ -1,3 +1,4 @@
+
 //go:build darwin && cgo
 
 package mongoose
@@ -36,6 +37,20 @@ int mtl_graph_build_full(int dim, int kvDim, int headDim,
                          int nHeads, int nKVHeads, int ffnDim,
                          int vocabSize, int nLayers, int seqLen,
                          float ropeTheta, int mode);
+
+typedef struct {
+    float embeddingMultiplier;
+    float residualMultiplier;
+    float attentionScale;
+    float logitsScaling;
+    float adamBeta2;
+} MongooseArchParams;
+
+int mtl_graph_build_full_arch(int dim, int kvDim, int headDim,
+                              int nHeads, int nKVHeads, int ffnDim,
+                              int vocabSize, int nLayers, int seqLen,
+                              float ropeTheta, int mode,
+                              MongooseArchParams arch);
 float mtl_graph_train_step(int* tokens, int* targets, int n,
                            void** weightBufs, void** gradBufs, int nWeights,
                            float learningRate, int mode);
@@ -66,6 +81,8 @@ int mtl_fused_build(int dim, int kvDim, int headDim,
                     int nHeads, int nKVHeads, int ffnDim,
                     int vocabSize, int nLayers, int maxSeq,
                     float ropeTheta, float rmsEps);
+int mtl_fused_set_arch(float embeddingMultiplier, float residualMultiplier,
+                       float attentionScale, float logitsScaling);
 int mtl_fused_num_weights(void);
 int mtl_fused_set_weight(int idx, const float* data, int nFloats);
 int mtl_fused_step(const float* hiddenIn, const float* cosData, const float* sinData,
@@ -79,6 +96,9 @@ int mtl_fused_partial_step(const float* hiddenIn, int pos,
 int mtl_fused_partial_step_slot(int slot, const float* hiddenIn, int pos,
                                 int layerStart, int layerEnd,
                                 float* hiddenOut, float* logitsOut);
+int mtl_fused_prefill_tile(void);
+int mtl_fused_prefill_batch(int slot, const float* hiddenIn, int B, int basePos,
+                            float* logitsOut);
 // Streaming inference — ping-pong weight buffers, per-layer dispatch
 int mtl_stream_build(void);
 void mtl_stream_upload_layer(int set, int layer,
@@ -185,6 +205,7 @@ void mtl_fused_needle_paired(void* d1, void* d2, void* s1, void* s2, void* g1, v
 
 */
 import "C"
+import _ "unsafe"
 
 import (
 	"fmt"
@@ -202,18 +223,17 @@ type Metal struct {
 	poolMu     sync.Mutex
 }
 
-
 func NewMetal() *Metal {
-	ret := C.mtl_init()
+	ret := (C.mtl_init)()
 	if ret != 0 {
 		log.Printf("WARN mongoose => Metal init failed (code %d)", ret)
 		return nil
 	}
 
-	name := C.GoString(C.mtl_device_name())
+	name := (C.GoString)((C.mtl_device_name)())
 	m := &Metal{deviceName: name, pool: make(map[int][]C.MTLBufferRef)}
 
-	if C.mtl_init_compute() == 0 {
+	if (C.mtl_init_compute)() == 0 {
 		log.Printf("[mongoose] Metal initialized: %s (compute kernels ready)", name)
 	} else {
 		log.Printf("[mongoose] Metal initialized: %s (compute kernels failed, CPU fallback)", name)
@@ -222,24 +242,59 @@ func NewMetal() *Metal {
 	return m
 }
 
-func (m *Metal) Name() string     { return fmt.Sprintf("metal/%s", m.deviceName) }
-func (m *Metal) Close()           {}
-func (m *Metal) BeginBatch()      { C.mtl_begin_batch() }
-func (m *Metal) EndBatch()        { C.mtl_end_batch() }
-func (m *Metal) Sync()            { C.mtl_graph_sync() }
-func MtlComputeReady() bool       { return C.mtl_compute_ready() == 1 }
+func (m *Metal) Name() string { return fmt.Sprintf("metal/%s", m.deviceName) }
+func (m *Metal) Close()       {}
+func (m *Metal) BeginBatch()  { (C.mtl_begin_batch)() }
+func (m *Metal) EndBatch()    { (C.mtl_end_batch)() }
+func (m *Metal) Sync()        { (C.mtl_graph_sync)() }
+func MtlComputeReady() bool   { return (C.mtl_compute_ready)() == 1 }
 
 func (m *Metal) MatMul(a, b []float32, rows, k, n int) []float32 {
 	bufA := m.poolGet(len(a))
 	bufB := m.poolGet(len(b))
 	bufC := m.poolGet(rows * n)
 
-	C.mtl_upload(bufA, unsafe.Pointer(&a[0]), C.size_t(len(a)*4))
-	C.mtl_upload(bufB, unsafe.Pointer(&b[0]), C.size_t(len(b)*4))
-	C.mtl_sgemm(bufA, bufB, bufC, C.int(rows), C.int(k), C.int(n))
+	func() {
+		_cgo0 := bufA
+		_cgoIndex1 := &a
+		_cgo1 := unsafe.Pointer(&(*_cgoIndex1)[0])
+		var _cgo2 C.size_t = C.size_t(len(a) * 4)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, *_cgoIndex1)
+		C.mtl_upload(_cgo0, _cgo1, _cgo2)
+	}()
+	func() {
+		_cgo0 := bufB
+		_cgoIndex1 := &b
+		_cgo1 := unsafe.Pointer(&(*_cgoIndex1)[0])
+		var _cgo2 C.size_t = C.size_t(len(b) * 4)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, *_cgoIndex1)
+		C.mtl_upload(_cgo0, _cgo1, _cgo2)
+	}()
+	func() C.int {
+		_cgo0 := bufA
+		_cgo1 := bufB
+		_cgo2 := bufC
+		var _cgo3 C.int = C.int(rows)
+		var _cgo4 C.int = C.int(k)
+		var _cgo5 C.int = C.int(n)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, nil)
+		_cgoCheckPointer(_cgo2, nil)
+		return C.mtl_sgemm(_cgo0, _cgo1, _cgo2, _cgo3, _cgo4, _cgo5)
+	}()
 
 	out := make([]float32, rows*n)
-	C.mtl_download(unsafe.Pointer(&out[0]), bufC, C.size_t(rows*n*4))
+	func() {
+		_cgoIndex0 := &out
+		_cgo0 := unsafe.Pointer(&(*_cgoIndex0)[0])
+		_cgo1 := bufC
+		var _cgo2 C.size_t = C.size_t(rows * n * 4)
+		_cgoCheckPointer(_cgo0, *_cgoIndex0)
+		_cgoCheckPointer(_cgo1, nil)
+		C.mtl_download(_cgo0, _cgo1, _cgo2)
+	}()
 
 	m.poolPut(len(a), bufA)
 	m.poolPut(len(b), bufB)
@@ -287,7 +342,7 @@ func (m *Metal) ReLU(x []float32) {
 }
 
 func (m *Metal) VRAM() uint64 {
-	return uint64(C.mtl_recommended_max_working_set_size())
+	return uint64((C.mtl_recommended_max_working_set_size)())
 }
 
 func (m *Metal) Benchmark() float64 {
@@ -318,10 +373,45 @@ func (m *Metal) MatMulTransBInto(out, A, B []float32, rows, k, n int) {
 	bufA := m.poolGet(rows * k)
 	bufB := m.poolGet(n * k)
 	bufC := m.poolGet(rows * n)
-	C.mtl_upload(bufA, unsafe.Pointer(&A[0]), C.size_t(rows*k*4))
-	C.mtl_upload(bufB, unsafe.Pointer(&B[0]), C.size_t(n*k*4))
-	C.mtl_sgemm_transB(bufA, bufB, bufC, C.int(rows), C.int(k), C.int(n))
-	C.mtl_download(unsafe.Pointer(&out[0]), bufC, C.size_t(rows*n*4))
+	func() {
+		_cgo0 := bufA
+		_cgoIndex1 := &A
+		_cgo1 := unsafe.Pointer(&(*_cgoIndex1)[0])
+		var _cgo2 C.size_t = C.size_t(rows * k * 4)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, *_cgoIndex1)
+		C.mtl_upload(_cgo0, _cgo1, _cgo2)
+	}()
+	func() {
+		_cgo0 := bufB
+		_cgoIndex1 := &B
+		_cgo1 := unsafe.Pointer(&(*_cgoIndex1)[0])
+		var _cgo2 C.size_t = C.size_t(n * k * 4)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, *_cgoIndex1)
+		C.mtl_upload(_cgo0, _cgo1, _cgo2)
+	}()
+	func() C.int {
+		_cgo0 := bufA
+		_cgo1 := bufB
+		_cgo2 := bufC
+		var _cgo3 C.int = C.int(rows)
+		var _cgo4 C.int = C.int(k)
+		var _cgo5 C.int = C.int(n)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, nil)
+		_cgoCheckPointer(_cgo2, nil)
+		return C.mtl_sgemm_transB(_cgo0, _cgo1, _cgo2, _cgo3, _cgo4, _cgo5)
+	}()
+	func() {
+		_cgoIndex0 := &out
+		_cgo0 := unsafe.Pointer(&(*_cgoIndex0)[0])
+		_cgo1 := bufC
+		var _cgo2 C.size_t = C.size_t(rows * n * 4)
+		_cgoCheckPointer(_cgo0, *_cgoIndex0)
+		_cgoCheckPointer(_cgo1, nil)
+		C.mtl_download(_cgo0, _cgo1, _cgo2)
+	}()
 	m.poolPut(rows*k, bufA)
 	m.poolPut(n*k, bufB)
 	m.poolPut(rows*n, bufC)
@@ -331,10 +421,45 @@ func (m *Metal) MatMulInto(out, A, B []float32, rows, k, n int) {
 	bufA := m.poolGet(rows * k)
 	bufB := m.poolGet(k * n)
 	bufC := m.poolGet(rows * n)
-	C.mtl_upload(bufA, unsafe.Pointer(&A[0]), C.size_t(rows*k*4))
-	C.mtl_upload(bufB, unsafe.Pointer(&B[0]), C.size_t(k*n*4))
-	C.mtl_sgemm(bufA, bufB, bufC, C.int(rows), C.int(k), C.int(n))
-	C.mtl_download(unsafe.Pointer(&out[0]), bufC, C.size_t(rows*n*4))
+	func() {
+		_cgo0 := bufA
+		_cgoIndex1 := &A
+		_cgo1 := unsafe.Pointer(&(*_cgoIndex1)[0])
+		var _cgo2 C.size_t = C.size_t(rows * k * 4)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, *_cgoIndex1)
+		C.mtl_upload(_cgo0, _cgo1, _cgo2)
+	}()
+	func() {
+		_cgo0 := bufB
+		_cgoIndex1 := &B
+		_cgo1 := unsafe.Pointer(&(*_cgoIndex1)[0])
+		var _cgo2 C.size_t = C.size_t(k * n * 4)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, *_cgoIndex1)
+		C.mtl_upload(_cgo0, _cgo1, _cgo2)
+	}()
+	func() C.int {
+		_cgo0 := bufA
+		_cgo1 := bufB
+		_cgo2 := bufC
+		var _cgo3 C.int = C.int(rows)
+		var _cgo4 C.int = C.int(k)
+		var _cgo5 C.int = C.int(n)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, nil)
+		_cgoCheckPointer(_cgo2, nil)
+		return C.mtl_sgemm(_cgo0, _cgo1, _cgo2, _cgo3, _cgo4, _cgo5)
+	}()
+	func() {
+		_cgoIndex0 := &out
+		_cgo0 := unsafe.Pointer(&(*_cgoIndex0)[0])
+		_cgo1 := bufC
+		var _cgo2 C.size_t = C.size_t(rows * n * 4)
+		_cgoCheckPointer(_cgo0, *_cgoIndex0)
+		_cgoCheckPointer(_cgo1, nil)
+		C.mtl_download(_cgo0, _cgo1, _cgo2)
+	}()
 	m.poolPut(rows*k, bufA)
 	m.poolPut(k*n, bufB)
 	m.poolPut(rows*n, bufC)
@@ -344,11 +469,46 @@ func (m *Metal) MatMulAddInto(G, A, B []float32, rows, k, n int) {
 	bufA := m.poolGet(rows * k)
 	bufB := m.poolGet(k * n)
 	bufC := m.poolGet(rows * n)
-	C.mtl_upload(bufA, unsafe.Pointer(&A[0]), C.size_t(rows*k*4))
-	C.mtl_upload(bufB, unsafe.Pointer(&B[0]), C.size_t(k*n*4))
-	C.mtl_sgemm_transA(bufA, bufB, bufC, C.int(rows), C.int(k), C.int(n))
+	func() {
+		_cgo0 := bufA
+		_cgoIndex1 := &A
+		_cgo1 := unsafe.Pointer(&(*_cgoIndex1)[0])
+		var _cgo2 C.size_t = C.size_t(rows * k * 4)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, *_cgoIndex1)
+		C.mtl_upload(_cgo0, _cgo1, _cgo2)
+	}()
+	func() {
+		_cgo0 := bufB
+		_cgoIndex1 := &B
+		_cgo1 := unsafe.Pointer(&(*_cgoIndex1)[0])
+		var _cgo2 C.size_t = C.size_t(k * n * 4)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, *_cgoIndex1)
+		C.mtl_upload(_cgo0, _cgo1, _cgo2)
+	}()
+	func() C.int {
+		_cgo0 := bufA
+		_cgo1 := bufB
+		_cgo2 := bufC
+		var _cgo3 C.int = C.int(rows)
+		var _cgo4 C.int = C.int(k)
+		var _cgo5 C.int = C.int(n)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, nil)
+		_cgoCheckPointer(_cgo2, nil)
+		return C.mtl_sgemm_transA(_cgo0, _cgo1, _cgo2, _cgo3, _cgo4, _cgo5)
+	}()
 	tmp := make([]float32, rows*n)
-	C.mtl_download(unsafe.Pointer(&tmp[0]), bufC, C.size_t(rows*n*4))
+	func() {
+		_cgoIndex0 := &tmp
+		_cgo0 := unsafe.Pointer(&(*_cgoIndex0)[0])
+		_cgo1 := bufC
+		var _cgo2 C.size_t = C.size_t(rows * n * 4)
+		_cgoCheckPointer(_cgo0, *_cgoIndex0)
+		_cgoCheckPointer(_cgo1, nil)
+		C.mtl_download(_cgo0, _cgo1, _cgo2)
+	}()
 	for i := range G {
 		G[i] += tmp[i]
 	}
@@ -362,10 +522,45 @@ func (m *Metal) MatMulTransA(A, B []float32, rows, k, n int) []float32 {
 	bufA := m.poolGet(rows * k)
 	bufB := m.poolGet(k * n)
 	bufC := m.poolGet(rows * n)
-	C.mtl_upload(bufA, unsafe.Pointer(&A[0]), C.size_t(rows*k*4))
-	C.mtl_upload(bufB, unsafe.Pointer(&B[0]), C.size_t(k*n*4))
-	C.mtl_sgemm_transA(bufA, bufB, bufC, C.int(rows), C.int(k), C.int(n))
-	C.mtl_download(unsafe.Pointer(&out[0]), bufC, C.size_t(rows*n*4))
+	func() {
+		_cgo0 := bufA
+		_cgoIndex1 := &A
+		_cgo1 := unsafe.Pointer(&(*_cgoIndex1)[0])
+		var _cgo2 C.size_t = C.size_t(rows * k * 4)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, *_cgoIndex1)
+		C.mtl_upload(_cgo0, _cgo1, _cgo2)
+	}()
+	func() {
+		_cgo0 := bufB
+		_cgoIndex1 := &B
+		_cgo1 := unsafe.Pointer(&(*_cgoIndex1)[0])
+		var _cgo2 C.size_t = C.size_t(k * n * 4)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, *_cgoIndex1)
+		C.mtl_upload(_cgo0, _cgo1, _cgo2)
+	}()
+	func() C.int {
+		_cgo0 := bufA
+		_cgo1 := bufB
+		_cgo2 := bufC
+		var _cgo3 C.int = C.int(rows)
+		var _cgo4 C.int = C.int(k)
+		var _cgo5 C.int = C.int(n)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, nil)
+		_cgoCheckPointer(_cgo2, nil)
+		return C.mtl_sgemm_transA(_cgo0, _cgo1, _cgo2, _cgo3, _cgo4, _cgo5)
+	}()
+	func() {
+		_cgoIndex0 := &out
+		_cgo0 := unsafe.Pointer(&(*_cgoIndex0)[0])
+		_cgo1 := bufC
+		var _cgo2 C.size_t = C.size_t(rows * n * 4)
+		_cgoCheckPointer(_cgo0, *_cgoIndex0)
+		_cgoCheckPointer(_cgo1, nil)
+		C.mtl_download(_cgo0, _cgo1, _cgo2)
+	}()
 	m.poolPut(rows*k, bufA)
 	m.poolPut(k*n, bufB)
 	m.poolPut(rows*n, bufC)
@@ -407,43 +602,67 @@ func (m *Metal) AdamWStep(D, G, M, V []float32, n int, lr, beta1, beta2, bc1, bc
 // GraphTrainEngine — fused dispatch
 func (m *Metal) BuildFullGraph(dim, kvDim, headDim, nHeads, nKVHeads, ffnDim,
 	vocabSize, nLayers, seqLen int, ropeTheta float64, mode int) int {
-	return int(C.mtl_graph_build_full(
+	return int((C.mtl_graph_build_full)(
 		C.int(dim), C.int(kvDim), C.int(headDim),
 		C.int(nHeads), C.int(nKVHeads), C.int(ffnDim),
 		C.int(vocabSize), C.int(nLayers), C.int(seqLen),
 		C.float(ropeTheta), C.int(mode)))
 }
 
+// BuildFullGraphArch builds the training graph with architecture-specific
+// scalars. Zero fields fall back to Llama defaults, so ArchParams{} is
+// equivalent to BuildFullGraph.
+//
+// Granite requires all of these — see ArchParams. Its tensor layout is
+// identical to Llama's, so a graph built without them trains a different
+// function and yields plausible garbage instead of an error.
+func (m *Metal) BuildFullGraphArch(dim, kvDim, headDim, nHeads, nKVHeads, ffnDim,
+	vocabSize, nLayers, seqLen int, ropeTheta float64, mode int, arch ArchParams) int {
+
+	var c C.MongooseArchParams
+	c.embeddingMultiplier = C.float(arch.EmbeddingMultiplier)
+	c.residualMultiplier = C.float(arch.ResidualMultiplier)
+	c.attentionScale = C.float(arch.AttentionScale)
+	c.logitsScaling = C.float(arch.LogitsScaling)
+	c.adamBeta2 = C.float(arch.AdamBeta2)
+
+	return int((C.mtl_graph_build_full_arch)(
+		C.int(dim), C.int(kvDim), C.int(headDim),
+		C.int(nHeads), C.int(nKVHeads), C.int(ffnDim),
+		C.int(vocabSize), C.int(nLayers), C.int(seqLen),
+		C.float(ropeTheta), C.int(mode), c))
+}
+
 func (m *Metal) GraphTrainStepAdam(tokens, targets []int32, lr float32) float32 {
-	return float32(C.mtl_graph_train_step(
+	return float32((C.mtl_graph_train_step)(
 		(*C.int)(unsafe.Pointer(&tokens[0])),
 		(*C.int)(unsafe.Pointer(&targets[0])),
 		C.int(len(tokens)),
 		nil, nil, 0, C.float(lr), 1))
 }
 
-func (m *Metal) GraphFullBuilt() bool { return C.mtl_graph_full_built() == 1 }
-func (m *Metal) GraphNumWeights() int { return int(C.mtl_graph_num_weights()) }
-func (m *Metal) GraphNumDiffable() int { return int(C.mtl_graph_num_diffable()) }
+func (m *Metal) GraphFullBuilt() bool  { return (C.mtl_graph_full_built)() == 1 }
+func (m *Metal) GraphNumWeights() int  { return int((C.mtl_graph_num_weights)()) }
+func (m *Metal) GraphNumDiffable() int { return int((C.mtl_graph_num_diffable)()) }
 
 func (m *Metal) GraphSetVariable(varIdx int, data []float32) int {
-	return int(C.mtl_graph_set_variable(C.int(varIdx), (*C.float)(unsafe.Pointer(&data[0])), C.int(len(data))))
+	return int((C.mtl_graph_set_variable)(C.int(varIdx), (*C.float)(unsafe.Pointer(&data[0])), C.int(len(data))))
 }
 
 func (m *Metal) GraphReadVariable(varIdx int, dst []float32) int {
-	return int(C.mtl_graph_read_variable(C.int(varIdx), (*C.float)(unsafe.Pointer(&dst[0])), C.int(len(dst))))
+	return int((C.mtl_graph_read_variable)(C.int(varIdx), (*C.float)(unsafe.Pointer(&dst[0])), C.int(len(dst))))
 }
 
 func (m *Metal) GraphApplyWeights(varIdx int, data []float32) int {
-	return int(C.mtl_graph_apply_weights(C.int(varIdx), (*C.float)(unsafe.Pointer(&data[0])), C.int(len(data))))
+	return int((C.mtl_graph_apply_weights)(C.int(varIdx), (*C.float)(unsafe.Pointer(&data[0])), C.int(len(data))))
 }
 
 func (m *Metal) GraphAccumAdamStep(lr float32, accumScale float32) int {
-	return int(C.mtl_graph_accum_adam_step(C.float(lr), C.float(accumScale)))
+	return int((C.mtl_graph_accum_adam_step)(C.float(lr), C.float(accumScale)))
 }
 
 func (m *Metal) GraphTrainStepAccum(tokens, targets []int32) float32 {
-	return float32(C.mtl_graph_train_step(
+	return float32((C.mtl_graph_train_step)(
 		(*C.int)(unsafe.Pointer(&tokens[0])),
 		(*C.int)(unsafe.Pointer(&targets[0])),
 		C.int(len(tokens)),
@@ -453,21 +672,21 @@ func (m *Metal) GraphTrainStepAccum(tokens, targets []int32) float32 {
 // --- Inference Graph ---
 
 func (m *Metal) BuildInferGraph(dim, kvDim, headDim, nHeads, nKVHeads, ffnDim, vocabSize, nLayers int, ropeTheta float64) int {
-	return int(C.mtl_infer_build(C.int(dim), C.int(kvDim), C.int(headDim),
+	return int((C.mtl_infer_build)(C.int(dim), C.int(kvDim), C.int(headDim),
 		C.int(nHeads), C.int(nKVHeads), C.int(ffnDim),
 		C.int(vocabSize), C.int(nLayers), C.float(ropeTheta)))
 }
 
 func (m *Metal) InferNumWeights() int {
-	return int(C.mtl_infer_num_weights())
+	return int((C.mtl_infer_num_weights)())
 }
 
 func (m *Metal) InferSetWeight(idx int, data []float32) int {
-	return int(C.mtl_infer_set_weight(C.int(idx), (*C.float)(unsafe.Pointer(&data[0])), C.int(len(data))))
+	return int((C.mtl_infer_set_weight)(C.int(idx), (*C.float)(unsafe.Pointer(&data[0])), C.int(len(data))))
 }
 
 func (m *Metal) InferForwardA(hidden []float32, cosSlice, sinSlice []float32, qOut, kOut, vOut []float32, layer int) int {
-	return int(C.mtl_infer_forward(
+	return int((C.mtl_infer_forward)(
 		(*C.float)(unsafe.Pointer(&hidden[0])),
 		(*C.float)(unsafe.Pointer(&cosSlice[0])),
 		(*C.float)(unsafe.Pointer(&sinSlice[0])),
@@ -478,14 +697,14 @@ func (m *Metal) InferForwardA(hidden []float32, cosSlice, sinSlice []float32, qO
 }
 
 func (m *Metal) InferForwardB(hidden []float32, attnOut []float32, layer int) int {
-	return int(C.mtl_infer_forward_b(
+	return int((C.mtl_infer_forward_b)(
 		(*C.float)(unsafe.Pointer(&hidden[0])),
 		(*C.float)(unsafe.Pointer(&attnOut[0])),
 		C.int(layer)))
 }
 
 func (m *Metal) InferLogits(hidden []float32, logitsOut []float32) int {
-	return int(C.mtl_infer_forward(
+	return int((C.mtl_infer_forward)(
 		(*C.float)(unsafe.Pointer(&hidden[0])),
 		nil, nil, nil, nil, nil, nil,
 		(*C.float)(unsafe.Pointer(&logitsOut[0])),
@@ -493,22 +712,38 @@ func (m *Metal) InferLogits(hidden []float32, logitsOut []float32) int {
 }
 
 func (m *Metal) BuildFused(dim, kvDim, headDim, nHeads, nKVHeads, ffnDim, vocabSize, nLayers, maxSeq int, ropeTheta, rmsEps float64) int {
-	return int(C.mtl_fused_build(C.int(dim), C.int(kvDim), C.int(headDim),
+	return int((C.mtl_fused_build)(C.int(dim), C.int(kvDim), C.int(headDim),
 		C.int(nHeads), C.int(nKVHeads), C.int(ffnDim),
 		C.int(vocabSize), C.int(nLayers), C.int(maxSeq),
 		C.float(ropeTheta), C.float(rmsEps)))
 }
 
+// FusedSetArch applies architecture scalar multipliers to the fused inference
+// path. Call after BuildFused and before the first forward.
+//
+// A zero field means "Llama default", so FusedSetArch(ArchParams{}) — or never
+// calling it at all — leaves the forward pass byte-identical to before. Granite
+// requires all four; see ArchParams.
+//
+// AdamBeta2 is training-only and ignored here.
+func (m *Metal) FusedSetArch(arch ArchParams) int {
+	return int((C.mtl_fused_set_arch)(
+		C.float(arch.EmbeddingMultiplier),
+		C.float(arch.ResidualMultiplier),
+		C.float(arch.AttentionScale),
+		C.float(arch.LogitsScaling)))
+}
+
 func (m *Metal) FusedNumWeights() int {
-	return int(C.mtl_fused_num_weights())
+	return int((C.mtl_fused_num_weights)())
 }
 
 func (m *Metal) FusedSetWeight(idx int, data []float32) int {
-	return int(C.mtl_fused_set_weight(C.int(idx), (*C.float)(unsafe.Pointer(&data[0])), C.int(len(data))))
+	return int((C.mtl_fused_set_weight)(C.int(idx), (*C.float)(unsafe.Pointer(&data[0])), C.int(len(data))))
 }
 
 func (m *Metal) FusedStep(hidden []float32, cosSlice, sinSlice []float32, pos int, logitsOut []float32) int {
-	return int(C.mtl_fused_step(
+	return int((C.mtl_fused_step)(
 		(*C.float)(unsafe.Pointer(&hidden[0])),
 		(*C.float)(unsafe.Pointer(&cosSlice[0])),
 		(*C.float)(unsafe.Pointer(&sinSlice[0])),
@@ -517,15 +752,15 @@ func (m *Metal) FusedStep(hidden []float32, cosSlice, sinSlice []float32, pos in
 }
 
 func (m *Metal) FusedResetKV() {
-	C.mtl_fused_reset_kv()
+	(C.mtl_fused_reset_kv)()
 }
 
 func (m *Metal) FusedResetKVSlot(slot int) {
-	C.mtl_fused_reset_kv_slot(C.int(slot))
+	(C.mtl_fused_reset_kv_slot)(C.int(slot))
 }
 
 func (m *Metal) FusedNumSlots() int {
-	return int(C.mtl_fused_num_slots())
+	return int((C.mtl_fused_num_slots)())
 }
 
 func (m *Metal) FusedPartialStep(hiddenIn []float32, pos, layerStart, layerEnd int, hiddenOut, logitsOut []float32) int {
@@ -536,7 +771,7 @@ func (m *Metal) FusedPartialStep(hiddenIn []float32, pos, layerStart, layerEnd i
 	if logitsOut != nil {
 		lOut = (*C.float)(unsafe.Pointer(&logitsOut[0]))
 	}
-	return int(C.mtl_fused_partial_step(
+	return int((C.mtl_fused_partial_step)(
 		(*C.float)(unsafe.Pointer(&hiddenIn[0])), C.int(pos),
 		C.int(layerStart), C.int(layerEnd), hOut, lOut))
 }
@@ -549,13 +784,42 @@ func (m *Metal) FusedPartialStepSlot(slot int, hiddenIn []float32, pos, layerSta
 	if logitsOut != nil {
 		lOut = (*C.float)(unsafe.Pointer(&logitsOut[0]))
 	}
-	return int(C.mtl_fused_partial_step_slot(C.int(slot),
+	return int((C.mtl_fused_partial_step_slot)(C.int(slot),
 		(*C.float)(unsafe.Pointer(&hiddenIn[0])), C.int(pos),
 		C.int(layerStart), C.int(layerEnd), hOut, lOut))
 }
 
+// FusedPrefillTile is the maximum number of prompt tokens FusedPrefillBatch
+// accepts in one call.
+func (m *Metal) FusedPrefillTile() int {
+	return int((C.mtl_fused_prefill_tile)())
+}
+
+// FusedPrefillBatch runs B consecutive prompt tokens through the model in a
+// single pass, appending them to slot's KV cache from basePos.
+//
+// Prefilling token-by-token is memory-bound on weights: every token re-reads
+// the whole model. Batching reads each weight once per tile instead of once per
+// token, which is what makes a long prompt cost seconds rather than minutes.
+//
+// hiddenIn is B rows of dim embeddings, contiguous. logitsOut may be nil —
+// pass it only for the final tile of a prompt, since only the last token's
+// logits are sampled and computing them per token adds a full vocab-sized
+// matvec for nothing.
+func (m *Metal) FusedPrefillBatch(slot int, hiddenIn []float32, B, basePos int, logitsOut []float32) int {
+	if B <= 0 || len(hiddenIn) == 0 {
+		return -1
+	}
+	var lOut *C.float
+	if logitsOut != nil {
+		lOut = (*C.float)(unsafe.Pointer(&logitsOut[0]))
+	}
+	return int((C.mtl_fused_prefill_batch)(C.int(slot),
+		(*C.float)(unsafe.Pointer(&hiddenIn[0])), C.int(B), C.int(basePos), lOut))
+}
+
 func (m *Metal) StreamBuild() int {
-	return int(C.mtl_stream_build())
+	return int((C.mtl_stream_build)())
 }
 
 func (m *Metal) StreamUploadLayer(set, layer int,
@@ -572,7 +836,7 @@ func (m *Metal) StreamUploadLayer(set, layer int,
 	if bv != nil {
 		bvP = (*C.float)(unsafe.Pointer(&bv[0]))
 	}
-	C.mtl_stream_upload_layer(C.int(set), C.int(layer),
+	(C.mtl_stream_upload_layer)(C.int(set), C.int(layer),
 		(*C.float)(unsafe.Pointer(&norm1[0])),
 		(*C.float)(unsafe.Pointer(&wq[0])),
 		(*C.float)(unsafe.Pointer(&wk[0])),
@@ -586,33 +850,33 @@ func (m *Metal) StreamUploadLayer(set, layer int,
 }
 
 func (m *Metal) StreamStepLayer(set, layer, pos int) int {
-	return int(C.mtl_stream_step_layer(C.int(set), C.int(layer), C.int(pos)))
+	return int((C.mtl_stream_step_layer)(C.int(set), C.int(layer), C.int(pos)))
 }
 
 func (m *Metal) StreamStepFinal(pos int, logitsOut []float32) int {
-	return int(C.mtl_stream_step_final(C.int(pos), (*C.float)(unsafe.Pointer(&logitsOut[0]))))
+	return int((C.mtl_stream_step_final)(C.int(pos), (*C.float)(unsafe.Pointer(&logitsOut[0]))))
 }
 
 func (m *Metal) StreamSetHidden(hidden []float32) {
-	C.mtl_stream_set_hidden((*C.float)(unsafe.Pointer(&hidden[0])))
+	(C.mtl_stream_set_hidden)((*C.float)(unsafe.Pointer(&hidden[0])))
 }
 
 func (m *Metal) BuildFusedInfer(dim, kvDim, headDim, nHeads, nKVHeads, ffnDim, vocabSize, nLayers, maxSeq int, ropeTheta float64) int {
-	return int(C.mtl_fused_infer_build(C.int(dim), C.int(kvDim), C.int(headDim),
+	return int((C.mtl_fused_infer_build)(C.int(dim), C.int(kvDim), C.int(headDim),
 		C.int(nHeads), C.int(nKVHeads), C.int(ffnDim),
 		C.int(vocabSize), C.int(nLayers), C.int(maxSeq), C.float(ropeTheta)))
 }
 
 func (m *Metal) FusedInferNumWeights() int {
-	return int(C.mtl_fused_infer_num_weights())
+	return int((C.mtl_fused_infer_num_weights)())
 }
 
 func (m *Metal) FusedInferSetWeight(idx int, data []float32) int {
-	return int(C.mtl_fused_infer_set_weight(C.int(idx), (*C.float)(unsafe.Pointer(&data[0])), C.int(len(data))))
+	return int((C.mtl_fused_infer_set_weight)(C.int(idx), (*C.float)(unsafe.Pointer(&data[0])), C.int(len(data))))
 }
 
 func (m *Metal) FusedInferStep(hidden []float32, cosSlice, sinSlice []float32, pos int, logitsOut []float32) int {
-	return int(C.mtl_fused_infer_step(
+	return int((C.mtl_fused_infer_step)(
 		(*C.float)(unsafe.Pointer(&hidden[0])),
 		(*C.float)(unsafe.Pointer(&cosSlice[0])),
 		(*C.float)(unsafe.Pointer(&sinSlice[0])),
@@ -621,7 +885,7 @@ func (m *Metal) FusedInferStep(hidden []float32, cosSlice, sinSlice []float32, p
 }
 
 func (m *Metal) FusedInferReset() int {
-	return int(C.mtl_fused_infer_reset())
+	return int((C.mtl_fused_infer_reset)())
 }
 
 func (m *Metal) poolGet(sizeFloats int) C.MTLBufferRef {
@@ -633,14 +897,14 @@ func (m *Metal) poolGet(sizeFloats int) C.MTLBufferRef {
 		return buf
 	}
 	m.poolMu.Unlock()
-	return C.mtl_alloc(C.size_t(sizeFloats * 4))
+	return (C.mtl_alloc)(C.size_t(sizeFloats * 4))
 }
 
 func (m *Metal) poolPut(sizeFloats int, buf C.MTLBufferRef) {
 	m.poolMu.Lock()
 	if len(m.pool[sizeFloats]) >= 8 {
 		m.poolMu.Unlock()
-		C.mtl_free(buf)
+		func() { _cgo0 := buf; _cgoCheckPointer(_cgo0, nil); C.mtl_free(_cgo0) }()
 		return
 	}
 	m.pool[sizeFloats] = append(m.pool[sizeFloats], buf)
@@ -649,84 +913,323 @@ func (m *Metal) poolPut(sizeFloats int, buf C.MTLBufferRef) {
 
 // === Fused Training Compute Kernels ===
 
-func (m *Metal) FusedBegin()             { C.mtl_fused_begin() }
-func (m *Metal) FusedEnd()               { C.mtl_fused_end() }
-func (m *Metal) FusedBeginSlot(slot int)  { C.mtl_fused_begin_slot(C.int(slot)) }
-func (m *Metal) FusedEndSlot(slot int)    { C.mtl_fused_end_slot(C.int(slot)) }
-func (m *Metal) FusedSetSlot(slot int)    { C.mtl_fused_set_slot(C.int(slot)) }
-func (m *Metal) FusedCommitSlot(slot int) { C.mtl_fused_commit_slot(C.int(slot)) }
-func (m *Metal) FusedWaitSlot(slot int)   { C.mtl_fused_wait_slot(C.int(slot)) }
-func (m *Metal) FusedSyncAll()           { C.mtl_fused_sync_all() }
+func (m *Metal) FusedBegin()              { (C.mtl_fused_begin)() }
+func (m *Metal) FusedEnd()                { (C.mtl_fused_end)() }
+func (m *Metal) FusedBeginSlot(slot int)  { (C.mtl_fused_begin_slot)(C.int(slot)) }
+func (m *Metal) FusedEndSlot(slot int)    { (C.mtl_fused_end_slot)(C.int(slot)) }
+func (m *Metal) FusedSetSlot(slot int)    { (C.mtl_fused_set_slot)(C.int(slot)) }
+func (m *Metal) FusedCommitSlot(slot int) { (C.mtl_fused_commit_slot)(C.int(slot)) }
+func (m *Metal) FusedWaitSlot(slot int)   { (C.mtl_fused_wait_slot)(C.int(slot)) }
+func (m *Metal) FusedSyncAll()            { (C.mtl_fused_sync_all)() }
 
 func (m *Metal) FusedGemmBT(a, b, c *Tensor, M, K, N int) {
-	C.mtl_fused_gemm_bt(MtlBufPtr(a), MtlBufPtr(b), MtlBufPtr(c), C.int(M), C.int(K), C.int(N))
+	func() {
+		_cgo0 := MtlBufPtr(a)
+		_cgo1 := MtlBufPtr(b)
+		_cgo2 := MtlBufPtr(c)
+		var _cgo3 C.int = C.int(M)
+		var _cgo4 C.int = C.int(K)
+		var _cgo5 C.int = C.int(N)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, nil)
+		_cgoCheckPointer(_cgo2, nil)
+		C.mtl_fused_gemm_bt(_cgo0, _cgo1, _cgo2, _cgo3, _cgo4, _cgo5)
+	}()
 }
 func (m *Metal) FusedGemmNN(a, b, c *Tensor, M, K, N int) {
-	C.mtl_fused_gemm_nn(MtlBufPtr(a), MtlBufPtr(b), MtlBufPtr(c), C.int(M), C.int(K), C.int(N))
+	func() {
+		_cgo0 := MtlBufPtr(a)
+		_cgo1 := MtlBufPtr(b)
+		_cgo2 := MtlBufPtr(c)
+		var _cgo3 C.int = C.int(M)
+		var _cgo4 C.int = C.int(K)
+		var _cgo5 C.int = C.int(N)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, nil)
+		_cgoCheckPointer(_cgo2, nil)
+		C.mtl_fused_gemm_nn(_cgo0, _cgo1, _cgo2, _cgo3, _cgo4, _cgo5)
+	}()
 }
 func (m *Metal) FusedGemmTN(a, b, c *Tensor, M, K, N int) {
-	C.mtl_fused_gemm_tn(MtlBufPtr(a), MtlBufPtr(b), MtlBufPtr(c), C.int(M), C.int(K), C.int(N))
+	func() {
+		_cgo0 := MtlBufPtr(a)
+		_cgo1 := MtlBufPtr(b)
+		_cgo2 := MtlBufPtr(c)
+		var _cgo3 C.int = C.int(M)
+		var _cgo4 C.int = C.int(K)
+		var _cgo5 C.int = C.int(N)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, nil)
+		_cgoCheckPointer(_cgo2, nil)
+		C.mtl_fused_gemm_tn(_cgo0, _cgo1, _cgo2, _cgo3, _cgo4, _cgo5)
+	}()
 }
 func (m *Metal) FusedGemmF32BT(a, b, c *Tensor, M, K, N int) {
-	C.mtl_fused_gemm_f32_bt(MtlBufPtr(a), MtlBufPtr(b), MtlBufPtr(c), C.int(M), C.int(K), C.int(N))
+	func() {
+		_cgo0 := MtlBufPtr(a)
+		_cgo1 := MtlBufPtr(b)
+		_cgo2 := MtlBufPtr(c)
+		var _cgo3 C.int = C.int(M)
+		var _cgo4 C.int = C.int(K)
+		var _cgo5 C.int = C.int(N)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, nil)
+		_cgoCheckPointer(_cgo2, nil)
+		C.mtl_fused_gemm_f32_bt(_cgo0, _cgo1, _cgo2, _cgo3, _cgo4, _cgo5)
+	}()
 }
 func (m *Metal) FusedGemmF32NN(a, b, c *Tensor, M, K, N int) {
-	C.mtl_fused_gemm_f32_nn(MtlBufPtr(a), MtlBufPtr(b), MtlBufPtr(c), C.int(M), C.int(K), C.int(N))
+	func() {
+		_cgo0 := MtlBufPtr(a)
+		_cgo1 := MtlBufPtr(b)
+		_cgo2 := MtlBufPtr(c)
+		var _cgo3 C.int = C.int(M)
+		var _cgo4 C.int = C.int(K)
+		var _cgo5 C.int = C.int(N)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, nil)
+		_cgoCheckPointer(_cgo2, nil)
+		C.mtl_fused_gemm_f32_nn(_cgo0, _cgo1, _cgo2, _cgo3, _cgo4, _cgo5)
+	}()
 }
 func (m *Metal) FusedGemmF32TN(a, b, c *Tensor, M, K, N int) {
-	C.mtl_fused_gemm_f32_tn(MtlBufPtr(a), MtlBufPtr(b), MtlBufPtr(c), C.int(M), C.int(K), C.int(N))
+	func() {
+		_cgo0 := MtlBufPtr(a)
+		_cgo1 := MtlBufPtr(b)
+		_cgo2 := MtlBufPtr(c)
+		var _cgo3 C.int = C.int(M)
+		var _cgo4 C.int = C.int(K)
+		var _cgo5 C.int = C.int(N)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, nil)
+		_cgoCheckPointer(_cgo2, nil)
+		C.mtl_fused_gemm_f32_tn(_cgo0, _cgo1, _cgo2, _cgo3, _cgo4, _cgo5)
+	}()
 }
 func (m *Metal) FusedRMSNorm(x, w, scale *Tensor, seqLen, dim int) {
-	C.mtl_fused_rmsnorm(MtlBufPtr(x), MtlBufPtr(w), MtlBufPtr(scale), C.int(seqLen), C.int(dim))
+	func() {
+		_cgo0 := MtlBufPtr(x)
+		_cgo1 := MtlBufPtr(w)
+		_cgo2 := MtlBufPtr(scale)
+		var _cgo3 C.int = C.int(seqLen)
+		var _cgo4 C.int = C.int(dim)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, nil)
+		_cgoCheckPointer(_cgo2, nil)
+		C.mtl_fused_rmsnorm(_cgo0, _cgo1, _cgo2, _cgo3, _cgo4)
+	}()
 }
 func (m *Metal) FusedRMSNormBwd(dOut, xIn, w, scale, dx *Tensor, seqLen, dim int) {
-	C.mtl_fused_rmsnorm_bwd(MtlBufPtr(dOut), MtlBufPtr(xIn), MtlBufPtr(w), MtlBufPtr(scale), MtlBufPtr(dx), C.int(seqLen), C.int(dim))
+	func() {
+		_cgo0 := MtlBufPtr(dOut)
+		_cgo1 := MtlBufPtr(xIn)
+		_cgo2 := MtlBufPtr(w)
+		_cgo3 := MtlBufPtr(scale)
+		_cgo4 := MtlBufPtr(dx)
+		var _cgo5 C.int = C.int(seqLen)
+		var _cgo6 C.int = C.int(dim)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, nil)
+		_cgoCheckPointer(_cgo2, nil)
+		_cgoCheckPointer(_cgo3, nil)
+		_cgoCheckPointer(_cgo4, nil)
+		C.mtl_fused_rmsnorm_bwd(_cgo0, _cgo1, _cgo2, _cgo3, _cgo4, _cgo5, _cgo6)
+	}()
 }
 func (m *Metal) FusedRoPE(x *Tensor, headDim, nHeads int, theta float32, stride, seqLen int) {
-	C.mtl_fused_rope(MtlBufPtr(x), C.int(headDim), C.int(nHeads), C.float(theta), C.int(stride), C.int(seqLen))
+	func() {
+		_cgo0 := MtlBufPtr(x)
+		var _cgo1 C.int = C.int(headDim)
+		var _cgo2 C.int = C.int(nHeads)
+		var _cgo3 C.float = C.float(theta)
+		var _cgo4 C.int = C.int(stride)
+		var _cgo5 C.int = C.int(seqLen)
+		_cgoCheckPointer(_cgo0, nil)
+		C.mtl_fused_rope(_cgo0, _cgo1, _cgo2, _cgo3, _cgo4, _cgo5)
+	}()
 }
 func (m *Metal) FusedAttention(q, k, v, out, scores *Tensor, dim, kvDim, headDim, nHeads, nKVHeads, seqLen int) {
-	C.mtl_fused_attn(MtlBufPtr(q), MtlBufPtr(k), MtlBufPtr(v), MtlBufPtr(out), MtlBufPtr(scores),
-		C.int(dim), C.int(kvDim), C.int(headDim), C.int(nHeads), C.int(nKVHeads), C.int(seqLen))
+	func() {
+		_cgo0 := MtlBufPtr(q)
+		_cgo1 := MtlBufPtr(k)
+		_cgo2 := MtlBufPtr(v)
+		_cgo3 := MtlBufPtr(out)
+		_cgo4 := MtlBufPtr(scores)
+		var _cgo5 C.int = C.int(dim)
+		var _cgo6 C.int = C.int(kvDim)
+		var _cgo7 C.int = C.int(headDim)
+		var _cgo8 C.int = C.int(nHeads)
+		var _cgo9 C.int = C.int(nKVHeads)
+		var _cgo10 C.int = C.int(seqLen)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, nil)
+		_cgoCheckPointer(_cgo2, nil)
+		_cgoCheckPointer(_cgo3, nil)
+		_cgoCheckPointer(_cgo4, nil)
+		C.mtl_fused_attn(_cgo0, _cgo1, _cgo2, _cgo3, _cgo4, _cgo5, _cgo6, _cgo7, _cgo8, _cgo9, _cgo10)
+	}()
 }
 func (m *Metal) FusedAttentionBwdQ(dOut, q, k, v, scores, dQ, dK, dV *Tensor,
 	dim, kvDim, headDim, nHeads, nKVHeads, seqLen, qLen int) {
-	C.mtl_fused_attention_bwd_q(MtlBufPtr(dOut), MtlBufPtr(q), MtlBufPtr(k), MtlBufPtr(v), MtlBufPtr(scores),
-		MtlBufPtr(dQ), MtlBufPtr(dK), MtlBufPtr(dV),
-		C.int(dim), C.int(kvDim), C.int(headDim), C.int(nHeads), C.int(nKVHeads), C.int(seqLen), C.int(qLen))
+	func() {
+		_cgo0 := MtlBufPtr(dOut)
+		_cgo1 := MtlBufPtr(q)
+		_cgo2 := MtlBufPtr(k)
+		_cgo3 := MtlBufPtr(v)
+		_cgo4 := MtlBufPtr(scores)
+		_cgo5 := MtlBufPtr(dQ)
+		_cgo6 := MtlBufPtr(dK)
+		_cgo7 := MtlBufPtr(dV)
+		var _cgo8 C.int = C.int(dim)
+		var _cgo9 C.int = C.int(kvDim)
+		var _cgo10 C.int = C.int(headDim)
+		var _cgo11 C.int = C.int(nHeads)
+		var _cgo12 C.int = C.int(nKVHeads)
+		var _cgo13 C.int = C.int(seqLen)
+		var _cgo14 C.int = C.int(qLen)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, nil)
+		_cgoCheckPointer(_cgo2, nil)
+		_cgoCheckPointer(_cgo3, nil)
+		_cgoCheckPointer(_cgo4, nil)
+		_cgoCheckPointer(_cgo5, nil)
+		_cgoCheckPointer(_cgo6, nil)
+		_cgoCheckPointer(_cgo7, nil)
+		C.mtl_fused_attention_bwd_q(_cgo0, _cgo1, _cgo2, _cgo3, _cgo4, _cgo5, _cgo6, _cgo7, _cgo8, _cgo9, _cgo10, _cgo11, _cgo12, _cgo13, _cgo14)
+	}()
 }
 func (m *Metal) FusedSiLUGateMul(gate, up, out *Tensor, n int) {
-	C.mtl_fused_silu_gate_mul(MtlBufPtr(gate), MtlBufPtr(up), MtlBufPtr(out), C.int(n))
+	func() {
+		_cgo0 := MtlBufPtr(gate)
+		_cgo1 := MtlBufPtr(up)
+		_cgo2 := MtlBufPtr(out)
+		var _cgo3 C.int = C.int(n)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, nil)
+		_cgoCheckPointer(_cgo2, nil)
+		C.mtl_fused_silu_gate_mul(_cgo0, _cgo1, _cgo2, _cgo3)
+	}()
 }
 func (m *Metal) SiLUGateBackward(dOut, gatePre, upOut, gateAct, dGatePre, dUp *Tensor) {
-	C.mtl_silu_gate_backward_gpu(MtlBufPtr(dOut), MtlBufPtr(gatePre), MtlBufPtr(upOut),
-		MtlBufPtr(gateAct), MtlBufPtr(dGatePre), MtlBufPtr(dUp), C.int(dOut.Size))
+	func() {
+		_cgo0 := MtlBufPtr(dOut)
+		_cgo1 := MtlBufPtr(gatePre)
+		_cgo2 := MtlBufPtr(upOut)
+		_cgo3 := MtlBufPtr(gateAct)
+		_cgo4 := MtlBufPtr(dGatePre)
+		_cgo5 := MtlBufPtr(dUp)
+		var _cgo6 C.int = C.int(dOut.Size)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, nil)
+		_cgoCheckPointer(_cgo2, nil)
+		_cgoCheckPointer(_cgo3, nil)
+		_cgoCheckPointer(_cgo4, nil)
+		_cgoCheckPointer(_cgo5, nil)
+		C.mtl_silu_gate_backward_gpu(_cgo0, _cgo1, _cgo2, _cgo3, _cgo4, _cgo5, _cgo6)
+	}()
 }
 func (m *Metal) FusedAddInPlace(a, b *Tensor, n int) {
-	C.mtl_fused_add_inplace(MtlBufPtr(a), MtlBufPtr(b), C.int(n))
+	func() {
+		_cgo0 := MtlBufPtr(a)
+		_cgo1 := MtlBufPtr(b)
+		var _cgo2 C.int = C.int(n)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, nil)
+		C.mtl_fused_add_inplace(_cgo0, _cgo1, _cgo2)
+	}()
 }
 func (m *Metal) FusedCopy(dst, src *Tensor, n int) {
-	C.mtl_fused_copy(MtlBufPtr(dst), MtlBufPtr(src), C.int(n))
+	func() {
+		_cgo0 := MtlBufPtr(dst)
+		_cgo1 := MtlBufPtr(src)
+		var _cgo2 C.int = C.int(n)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, nil)
+		C.mtl_fused_copy(_cgo0, _cgo1, _cgo2)
+	}()
 }
 func (m *Metal) CELoss(logits, targets, losses *Tensor, seqLen, vocabSize int) {
-	C.mtl_ce_loss(MtlBufPtr(logits), MtlBufPtr(targets), MtlBufPtr(losses), C.int(seqLen), C.int(vocabSize))
+	func() {
+		_cgo0 := MtlBufPtr(logits)
+		_cgo1 := MtlBufPtr(targets)
+		_cgo2 := MtlBufPtr(losses)
+		var _cgo3 C.int = C.int(seqLen)
+		var _cgo4 C.int = C.int(vocabSize)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, nil)
+		_cgoCheckPointer(_cgo2, nil)
+		C.mtl_ce_loss(_cgo0, _cgo1, _cgo2, _cgo3, _cgo4)
+	}()
 }
 func (m *Metal) AdamWT(param, grad, mState, vState *Tensor, lr, wd float32, step int) {
 	bc1 := C.float(1.0 - math.Pow(0.9, float64(step)))
 	bc2 := C.float(1.0 - math.Pow(0.95, float64(step)))
-	C.mtl_adamw_gpu(MtlBufPtr(param), MtlBufPtr(grad), MtlBufPtr(mState), MtlBufPtr(vState),
-		C.float(lr), C.float(0.9), C.float(0.95), bc1, bc2, C.float(1e-8), C.float(wd), C.int(param.Size))
+	func() {
+		_cgo0 := MtlBufPtr(param)
+		_cgo1 := MtlBufPtr(grad)
+		_cgo2 := MtlBufPtr(mState)
+		_cgo3 := MtlBufPtr(vState)
+		var _cgo4 C.float = C.float(lr)
+		var _cgo5 C.float = C.float(0.9)
+		var _cgo6 C.float = C.float(0.95)
+		var _cgo7 C.float = bc1
+		var _cgo8 C.float = bc2
+		var _cgo9 C.float = C.float(1e-8)
+		var _cgo10 C.float = C.float(wd)
+		var _cgo11 C.int = C.int(param.Size)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, nil)
+		_cgoCheckPointer(_cgo2, nil)
+		_cgoCheckPointer(_cgo3, nil)
+		C.mtl_adamw_gpu(_cgo0, _cgo1, _cgo2, _cgo3, _cgo4, _cgo5, _cgo6, _cgo7, _cgo8, _cgo9, _cgo10, _cgo11)
+	}()
 }
 func (m *Metal) DNARungGPU(d1, g1, m1, v1, d2, g2, m2, v2 *Tensor,
 	bb1, gly1, hb1, hb2, gly2, bb2, bondStr, lr, beta1, beta2, bc1, bc2, eps, wd float32, n int) {
-	C.mtl_dna_rung_gpu(MtlBufPtr(d1), MtlBufPtr(g1), MtlBufPtr(m1), MtlBufPtr(v1),
-		MtlBufPtr(d2), MtlBufPtr(g2), MtlBufPtr(m2), MtlBufPtr(v2),
-		C.float(bb1), C.float(gly1), C.float(hb1), C.float(hb2), C.float(gly2), C.float(bb2),
-		C.float(bondStr), C.float(lr), C.float(beta1), C.float(beta2),
-		C.float(bc1), C.float(bc2), C.float(eps), C.float(wd), C.int(n))
+	func() {
+		_cgo0 := MtlBufPtr(d1)
+		_cgo1 := MtlBufPtr(g1)
+		_cgo2 := MtlBufPtr(m1)
+		_cgo3 := MtlBufPtr(v1)
+		_cgo4 := MtlBufPtr(d2)
+		_cgo5 := MtlBufPtr(g2)
+		_cgo6 := MtlBufPtr(m2)
+		_cgo7 := MtlBufPtr(v2)
+		var _cgo8 C.float = C.float(bb1)
+		var _cgo9 C.float = C.float(gly1)
+		var _cgo10 C.float = C.float(hb1)
+		var _cgo11 C.float = C.float(hb2)
+		var _cgo12 C.float = C.float(gly2)
+		var _cgo13 C.float = C.float(bb2)
+		var _cgo14 C.float = C.float(bondStr)
+		var _cgo15 C.float = C.float(lr)
+		var _cgo16 C.float = C.float(beta1)
+		var _cgo17 C.float = C.float(beta2)
+		var _cgo18 C.float = C.float(bc1)
+		var _cgo19 C.float = C.float(bc2)
+		var _cgo20 C.float = C.float(eps)
+		var _cgo21 C.float = C.float(wd)
+		var _cgo22 C.int = C.int(n)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, nil)
+		_cgoCheckPointer(_cgo2, nil)
+		_cgoCheckPointer(_cgo3, nil)
+		_cgoCheckPointer(_cgo4, nil)
+		_cgoCheckPointer(_cgo5, nil)
+		_cgoCheckPointer(_cgo6, nil)
+		_cgoCheckPointer(_cgo7, nil)
+		C.mtl_dna_rung_gpu(_cgo0, _cgo1, _cgo2, _cgo3, _cgo4, _cgo5, _cgo6, _cgo7, _cgo8, _cgo9, _cgo10, _cgo11, _cgo12, _cgo13, _cgo14, _cgo15, _cgo16, _cgo17, _cgo18, _cgo19, _cgo20, _cgo21, _cgo22)
+	}()
 }
 func (m *Metal) GradNormSqGPU(grad, out *Tensor, n int) {
-	C.mtl_grad_norm_sq(MtlBufPtr(grad), MtlBufPtr(out), C.int(n))
+	func() {
+		_cgo0 := MtlBufPtr(grad)
+		_cgo1 := MtlBufPtr(out)
+		var _cgo2 C.int = C.int(n)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, nil)
+		C.mtl_grad_norm_sq(_cgo0, _cgo1, _cgo2)
+	}()
 }
 
 // WarmCache is a single MTLBuffer in unified memory that holds all optimizer state
@@ -734,19 +1237,24 @@ func (m *Metal) GradNormSqGPU(grad, out *Tensor, n int) {
 // pages — the CPU (helix) computes rung geometry and reads/writes m/v via []float32
 // slices; the GPU kernel reads/writes the same m/v via buffer offsets. No copy.
 type WarmCache struct {
-	buf      C.MTLBufferRef
-	nFloats  int
-	sharedF  []float32
+	buf     C.MTLBufferRef
+	nFloats int
+	sharedF []float32
 }
 
 // NewWarmCache allocates a single unified-memory buffer large enough to hold
 // nFloats float32 values. Returns a WarmCache whose Slice method yields
 // CPU-visible []float32 windows that the GPU also reads/writes.
 func (m *Metal) NewWarmCache(nFloats int) *WarmCache {
-	buf := C.mtl_alloc(C.size_t(nFloats * 4))
-	C.mtl_zero(buf, C.size_t(nFloats*4))
+	buf := (C.mtl_alloc)(C.size_t(nFloats * 4))
+	func() {
+		_cgo0 := buf
+		var _cgo1 C.size_t = C.size_t(nFloats * 4)
+		_cgoCheckPointer(_cgo0, nil)
+		C.mtl_zero(_cgo0, _cgo1)
+	}()
 
-	ptr := C.mtl_shared_ptr(buf)
+	ptr := func() unsafe.Pointer { _cgo0 := buf; _cgoCheckPointer(_cgo0, nil); return C.mtl_shared_ptr(_cgo0) }()
 	shared := (*[1 << 30]float32)(ptr)[:nFloats:nFloats]
 
 	return &WarmCache{
@@ -777,7 +1285,7 @@ func (wc *WarmCache) BufPtr() unsafe.Pointer {
 // Release frees the underlying MTLBuffer.
 func (wc *WarmCache) Release() {
 	if wc.buf != nil {
-		C.mtl_free(wc.buf)
+		func() { _cgo0 := wc.buf; _cgoCheckPointer(_cgo0, nil); C.mtl_free(_cgo0) }()
 		wc.buf = nil
 		wc.sharedF = nil
 	}
@@ -788,7 +1296,7 @@ func (wc *WarmCache) Release() {
 // The returned slice is valid as long as the Tensor is not released.
 func (m *Metal) SharedSlice(t *Tensor) []float32 {
 	mp := t.device.(*mtlPtr)
-	ptr := C.mtl_shared_ptr(mp.buf)
+	ptr := func() unsafe.Pointer { _cgo0 := mp.buf; _cgoCheckPointer(_cgo0, nil); return C.mtl_shared_ptr(_cgo0) }()
 	return (*[1 << 30]float32)(ptr)[:t.Size:t.Size]
 }
 
@@ -797,42 +1305,90 @@ func (m *Metal) SharedSlice(t *Tensor) []float32 {
 func (m *Metal) DNARungWarm(d1, g1, d2, g2 *Tensor, wc *WarmCache,
 	m1Off, v1Off, m2Off, v2Off int,
 	bb1, gly1, hb1, hb2, gly2, bb2, bondStr, lr, beta1, beta2, bc1, bc2, eps, wd float32, n int) {
-	C.mtl_dna_rung_warm(MtlBufPtr(d1), MtlBufPtr(g1), MtlBufPtr(d2), MtlBufPtr(g2),
-		wc.BufPtr(),
-		C.int(wc.ByteOffset(m1Off)), C.int(wc.ByteOffset(v1Off)),
-		C.int(wc.ByteOffset(m2Off)), C.int(wc.ByteOffset(v2Off)),
-		C.float(bb1), C.float(gly1), C.float(hb1), C.float(hb2), C.float(gly2), C.float(bb2),
-		C.float(bondStr), C.float(lr), C.float(beta1), C.float(beta2),
-		C.float(bc1), C.float(bc2), C.float(eps), C.float(wd), C.int(n))
+	func() {
+		_cgo0 := MtlBufPtr(d1)
+		_cgo1 := MtlBufPtr(g1)
+		_cgo2 := MtlBufPtr(d2)
+		_cgo3 := MtlBufPtr(g2)
+		_cgo4 := wc.BufPtr()
+		var _cgo5 C.int = C.int(wc.ByteOffset(m1Off))
+		var _cgo6 C.int = C.int(wc.ByteOffset(v1Off))
+		var _cgo7 C.int = C.int(wc.ByteOffset(m2Off))
+		var _cgo8 C.int = C.int(wc.ByteOffset(v2Off))
+		var _cgo9 C.float = C.float(bb1)
+		var _cgo10 C.float = C.float(gly1)
+		var _cgo11 C.float = C.float(hb1)
+		var _cgo12 C.float = C.float(hb2)
+		var _cgo13 C.float = C.float(gly2)
+		var _cgo14 C.float = C.float(bb2)
+		var _cgo15 C.float = C.float(bondStr)
+		var _cgo16 C.float = C.float(lr)
+		var _cgo17 C.float = C.float(beta1)
+		var _cgo18 C.float = C.float(beta2)
+		var _cgo19 C.float = C.float(bc1)
+		var _cgo20 C.float = C.float(bc2)
+		var _cgo21 C.float = C.float(eps)
+		var _cgo22 C.float = C.float(wd)
+		var _cgo23 C.int = C.int(n)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, nil)
+		_cgoCheckPointer(_cgo2, nil)
+		_cgoCheckPointer(_cgo3, nil)
+		_cgoCheckPointer(_cgo4, nil)
+		C.mtl_dna_rung_warm(_cgo0, _cgo1, _cgo2, _cgo3, _cgo4, _cgo5, _cgo6, _cgo7, _cgo8, _cgo9, _cgo10, _cgo11, _cgo12, _cgo13, _cgo14, _cgo15, _cgo16, _cgo17, _cgo18, _cgo19, _cgo20, _cgo21, _cgo22, _cgo23)
+	}()
 }
 
 // AdamWWarm dispatches the AdamW kernel with m/v read from a warm cache at the given
 // float offsets. Single-strand update for unpaired parameters.
 func (m *Metal) AdamWWarm(param, grad *Tensor, wc *WarmCache, mOff, vOff int,
 	lr, beta1, beta2, bc1, bc2, eps, wd float32, n int) {
-	C.mtl_adamw_warm(MtlBufPtr(param), MtlBufPtr(grad),
-		wc.BufPtr(),
-		C.int(wc.ByteOffset(mOff)), C.int(wc.ByteOffset(vOff)),
-		C.float(lr), C.float(beta1), C.float(beta2),
-		C.float(bc1), C.float(bc2), C.float(eps), C.float(wd), C.int(n))
+	func() {
+		_cgo0 := MtlBufPtr(param)
+		_cgo1 := MtlBufPtr(grad)
+		_cgo2 := wc.BufPtr()
+		var _cgo3 C.int = C.int(wc.ByteOffset(mOff))
+		var _cgo4 C.int = C.int(wc.ByteOffset(vOff))
+		var _cgo5 C.float = C.float(lr)
+		var _cgo6 C.float = C.float(beta1)
+		var _cgo7 C.float = C.float(beta2)
+		var _cgo8 C.float = C.float(bc1)
+		var _cgo9 C.float = C.float(bc2)
+		var _cgo10 C.float = C.float(eps)
+		var _cgo11 C.float = C.float(wd)
+		var _cgo12 C.int = C.int(n)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, nil)
+		_cgoCheckPointer(_cgo2, nil)
+		C.mtl_adamw_warm(_cgo0, _cgo1, _cgo2, _cgo3, _cgo4, _cgo5, _cgo6, _cgo7, _cgo8, _cgo9, _cgo10, _cgo11, _cgo12)
+	}()
 }
 
-func (m *Metal) FusedZeroScalar(buf *Tensor) { C.mtl_fused_zero_scalar(MtlBufPtr(buf)) }
-func (m *Metal) FusedBarrierBuffers()        { C.mtl_fused_barrier_buffers() }
-func (m *Metal) FusedEndAsync()              { C.mtl_fused_end_async() }
-func (m *Metal) FusedWait()                  { C.mtl_fused_wait() }
+func (m *Metal) FusedZeroScalar(buf *Tensor) {
+	func() { _cgo0 := MtlBufPtr(buf); _cgoCheckPointer(_cgo0, nil); C.mtl_fused_zero_scalar(_cgo0) }()
+}
+func (m *Metal) FusedBarrierBuffers() { (C.mtl_fused_barrier_buffers)() }
+func (m *Metal) FusedEndAsync()       { (C.mtl_fused_end_async)() }
+func (m *Metal) FusedWait()           { (C.mtl_fused_wait)() }
 
 func (m *Metal) FusedGradNormSq(grad, sumSq *Tensor, n int) {
-	C.mtl_fused_grad_norm_sq(MtlBufPtr(grad), MtlBufPtr(sumSq), C.int(n))
+	func() {
+		_cgo0 := MtlBufPtr(grad)
+		_cgo1 := MtlBufPtr(sumSq)
+		var _cgo2 C.int = C.int(n)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, nil)
+		C.mtl_fused_grad_norm_sq(_cgo0, _cgo1, _cgo2)
+	}()
 }
 
-func (m *Metal) ICBExecuteFwd()  { C.mtl_icb_execute_fwd() }
-func (m *Metal) ICBExecuteFull() { C.mtl_icb_execute_full() }
+func (m *Metal) ICBExecuteFwd()  { (C.mtl_icb_execute_fwd)() }
+func (m *Metal) ICBExecuteFull() { (C.mtl_icb_execute_full)() }
 
 type ICBLayerActs struct {
-	XIn, Normed, Q, K, V, AttnOut           *Tensor
-	XMid, Normed2, GatePre, UpOut, FfnMid   *Tensor
-	RmsScale1, RmsScale2, GateAct           *Tensor
+	XIn, Normed, Q, K, V, AttnOut         *Tensor
+	XMid, Normed2, GatePre, UpOut, FfnMid *Tensor
+	RmsScale1, RmsScale2, GateAct         *Tensor
 }
 
 type ICBLayerInt8 struct {
@@ -841,14 +1397,14 @@ type ICBLayerInt8 struct {
 }
 
 type ICBLayerBwd struct {
-	DFfnMid, DGate, DUp, DN2, Dx        *Tensor
-	DAttnOut, DQ, DK, DV, DN1           *Tensor
+	DFfnMid, DGate, DUp, DN2, Dx             *Tensor
+	DAttnOut, DQ, DK, DV, DN1                *Tensor
 	DWDown, DWGate, DWUp, DWO, DWQ, DWK, DWV *Tensor
 }
 
 type ICBLayerWeights struct {
 	WQ, WK, WV, WO, Gate, Up, Down ICBLayerInt8
-	Norm1, Norm2                    *Tensor
+	Norm1, Norm2                   *Tensor
 }
 
 func (m *Metal) ICBBuildTraining(
@@ -867,70 +1423,194 @@ func (m *Metal) ICBBuildTraining(
 ) int {
 	nL := nLayers
 	mkArr := func(tensors []*Tensor) *unsafe.Pointer {
-		arr := (*[64]unsafe.Pointer)(C.malloc(C.size_t(len(tensors) * 8)))
-		for i, t := range tensors { arr[i] = MtlBufPtr(t) }
+		arr := (*[64]unsafe.Pointer)((C.malloc)(C.size_t(len(tensors) * 8)))
+		for i, t := range tensors {
+			arr[i] = MtlBufPtr(t)
+		}
 		return &arr[0]
 	}
 	mkMaskArr := func(masks []*HotRowMask) *unsafe.Pointer {
-		arr := (*[64]unsafe.Pointer)(C.malloc(C.size_t(len(masks) * 8)))
-		for i, m := range masks { arr[i] = m.BufPtr() }
+		arr := (*[64]unsafe.Pointer)((C.malloc)(C.size_t(len(masks) * 8)))
+		for i, m := range masks {
+			arr[i] = m.BufPtr()
+		}
 		return &arr[0]
 	}
 
 	// Collect per-layer arrays
-	norm1s := make([]*Tensor, nL); norm2s := make([]*Tensor, nL)
-	aXIn := make([]*Tensor, nL); aNormed := make([]*Tensor, nL)
-	aQ := make([]*Tensor, nL); aK := make([]*Tensor, nL); aV := make([]*Tensor, nL)
-	aAttnOut := make([]*Tensor, nL); aXMid := make([]*Tensor, nL)
-	aNormed2 := make([]*Tensor, nL); aGatePre := make([]*Tensor, nL)
-	aUpOut := make([]*Tensor, nL); aFfnMid := make([]*Tensor, nL)
-	aRmsScale1 := make([]*Tensor, nL); aRmsScale2 := make([]*Tensor, nL)
+	norm1s := make([]*Tensor, nL)
+	norm2s := make([]*Tensor, nL)
+	aXIn := make([]*Tensor, nL)
+	aNormed := make([]*Tensor, nL)
+	aQ := make([]*Tensor, nL)
+	aK := make([]*Tensor, nL)
+	aV := make([]*Tensor, nL)
+	aAttnOut := make([]*Tensor, nL)
+	aXMid := make([]*Tensor, nL)
+	aNormed2 := make([]*Tensor, nL)
+	aGatePre := make([]*Tensor, nL)
+	aUpOut := make([]*Tensor, nL)
+	aFfnMid := make([]*Tensor, nL)
+	aRmsScale1 := make([]*Tensor, nL)
+	aRmsScale2 := make([]*Tensor, nL)
 	aGateAct := make([]*Tensor, nL)
 
-	wqD := make([]*Tensor, nL); wqS := make([]*Tensor, nL); wqDl := make([]*Tensor, nL)
-	wqM := make([]*Tensor, nL); wqV := make([]*Tensor, nL); wqL := make([]*Tensor, nL); wqMk := make([]*HotRowMask, nL)
-	wkD := make([]*Tensor, nL); wkS := make([]*Tensor, nL); wkDl := make([]*Tensor, nL)
-	wkM := make([]*Tensor, nL); wkV := make([]*Tensor, nL); wkL := make([]*Tensor, nL); wkMk := make([]*HotRowMask, nL)
-	wvD := make([]*Tensor, nL); wvS := make([]*Tensor, nL); wvDl := make([]*Tensor, nL)
-	wvM := make([]*Tensor, nL); wvV := make([]*Tensor, nL); wvL := make([]*Tensor, nL); wvMk := make([]*HotRowMask, nL)
-	woD := make([]*Tensor, nL); woS := make([]*Tensor, nL); woDl := make([]*Tensor, nL)
-	woM := make([]*Tensor, nL); woV := make([]*Tensor, nL); woL := make([]*Tensor, nL); woMk := make([]*HotRowMask, nL)
-	gD := make([]*Tensor, nL); gS := make([]*Tensor, nL); gDl := make([]*Tensor, nL)
-	gM := make([]*Tensor, nL); gV := make([]*Tensor, nL); gL := make([]*Tensor, nL); gMk := make([]*HotRowMask, nL)
-	uD := make([]*Tensor, nL); uS := make([]*Tensor, nL); uDl := make([]*Tensor, nL)
-	uM := make([]*Tensor, nL); uV := make([]*Tensor, nL); uL := make([]*Tensor, nL); uMk := make([]*HotRowMask, nL)
-	dD := make([]*Tensor, nL); dS := make([]*Tensor, nL); dDl := make([]*Tensor, nL)
-	dM := make([]*Tensor, nL); dV2 := make([]*Tensor, nL); dL := make([]*Tensor, nL); dMk := make([]*HotRowMask, nL)
+	wqD := make([]*Tensor, nL)
+	wqS := make([]*Tensor, nL)
+	wqDl := make([]*Tensor, nL)
+	wqM := make([]*Tensor, nL)
+	wqV := make([]*Tensor, nL)
+	wqL := make([]*Tensor, nL)
+	wqMk := make([]*HotRowMask, nL)
+	wkD := make([]*Tensor, nL)
+	wkS := make([]*Tensor, nL)
+	wkDl := make([]*Tensor, nL)
+	wkM := make([]*Tensor, nL)
+	wkV := make([]*Tensor, nL)
+	wkL := make([]*Tensor, nL)
+	wkMk := make([]*HotRowMask, nL)
+	wvD := make([]*Tensor, nL)
+	wvS := make([]*Tensor, nL)
+	wvDl := make([]*Tensor, nL)
+	wvM := make([]*Tensor, nL)
+	wvV := make([]*Tensor, nL)
+	wvL := make([]*Tensor, nL)
+	wvMk := make([]*HotRowMask, nL)
+	woD := make([]*Tensor, nL)
+	woS := make([]*Tensor, nL)
+	woDl := make([]*Tensor, nL)
+	woM := make([]*Tensor, nL)
+	woV := make([]*Tensor, nL)
+	woL := make([]*Tensor, nL)
+	woMk := make([]*HotRowMask, nL)
+	gD := make([]*Tensor, nL)
+	gS := make([]*Tensor, nL)
+	gDl := make([]*Tensor, nL)
+	gM := make([]*Tensor, nL)
+	gV := make([]*Tensor, nL)
+	gL := make([]*Tensor, nL)
+	gMk := make([]*HotRowMask, nL)
+	uD := make([]*Tensor, nL)
+	uS := make([]*Tensor, nL)
+	uDl := make([]*Tensor, nL)
+	uM := make([]*Tensor, nL)
+	uV := make([]*Tensor, nL)
+	uL := make([]*Tensor, nL)
+	uMk := make([]*HotRowMask, nL)
+	dD := make([]*Tensor, nL)
+	dS := make([]*Tensor, nL)
+	dDl := make([]*Tensor, nL)
+	dM := make([]*Tensor, nL)
+	dV2 := make([]*Tensor, nL)
+	dL := make([]*Tensor, nL)
+	dMk := make([]*HotRowMask, nL)
 
-	bDFfn := make([]*Tensor, nL); bDGate := make([]*Tensor, nL); bDUp := make([]*Tensor, nL)
-	bDN2 := make([]*Tensor, nL); bDx := make([]*Tensor, nL); bDAttn := make([]*Tensor, nL)
-	bDQ := make([]*Tensor, nL); bDK := make([]*Tensor, nL); bDV := make([]*Tensor, nL)
-	bDN1 := make([]*Tensor, nL); bDWD := make([]*Tensor, nL); bDWG := make([]*Tensor, nL)
-	bDWU := make([]*Tensor, nL); bDWO := make([]*Tensor, nL); bDWQ := make([]*Tensor, nL)
-	bDWK := make([]*Tensor, nL); bDWV := make([]*Tensor, nL)
+	bDFfn := make([]*Tensor, nL)
+	bDGate := make([]*Tensor, nL)
+	bDUp := make([]*Tensor, nL)
+	bDN2 := make([]*Tensor, nL)
+	bDx := make([]*Tensor, nL)
+	bDAttn := make([]*Tensor, nL)
+	bDQ := make([]*Tensor, nL)
+	bDK := make([]*Tensor, nL)
+	bDV := make([]*Tensor, nL)
+	bDN1 := make([]*Tensor, nL)
+	bDWD := make([]*Tensor, nL)
+	bDWG := make([]*Tensor, nL)
+	bDWU := make([]*Tensor, nL)
+	bDWO := make([]*Tensor, nL)
+	bDWQ := make([]*Tensor, nL)
+	bDWK := make([]*Tensor, nL)
+	bDWV := make([]*Tensor, nL)
 
 	for i := 0; i < nL; i++ {
-		norm1s[i] = weights[i].Norm1; norm2s[i] = weights[i].Norm2
+		norm1s[i] = weights[i].Norm1
+		norm2s[i] = weights[i].Norm2
 		a := acts[i]
-		aXIn[i] = a.XIn; aNormed[i] = a.Normed; aQ[i] = a.Q; aK[i] = a.K; aV[i] = a.V
-		aAttnOut[i] = a.AttnOut; aXMid[i] = a.XMid; aNormed2[i] = a.Normed2
-		aGatePre[i] = a.GatePre; aUpOut[i] = a.UpOut; aFfnMid[i] = a.FfnMid
-		aRmsScale1[i] = a.RmsScale1; aRmsScale2[i] = a.RmsScale2; aGateAct[i] = a.GateAct
+		aXIn[i] = a.XIn
+		aNormed[i] = a.Normed
+		aQ[i] = a.Q
+		aK[i] = a.K
+		aV[i] = a.V
+		aAttnOut[i] = a.AttnOut
+		aXMid[i] = a.XMid
+		aNormed2[i] = a.Normed2
+		aGatePre[i] = a.GatePre
+		aUpOut[i] = a.UpOut
+		aFfnMid[i] = a.FfnMid
+		aRmsScale1[i] = a.RmsScale1
+		aRmsScale2[i] = a.RmsScale2
+		aGateAct[i] = a.GateAct
 
 		w := weights[i]
-		wqD[i]=w.WQ.Data; wqS[i]=w.WQ.Scales; wqDl[i]=w.WQ.Delta; wqM[i]=w.WQ.Mom; wqV[i]=w.WQ.Vel; wqL[i]=w.WQ.Live; wqMk[i]=w.WQ.Mask
-		wkD[i]=w.WK.Data; wkS[i]=w.WK.Scales; wkDl[i]=w.WK.Delta; wkM[i]=w.WK.Mom; wkV[i]=w.WK.Vel; wkL[i]=w.WK.Live; wkMk[i]=w.WK.Mask
-		wvD[i]=w.WV.Data; wvS[i]=w.WV.Scales; wvDl[i]=w.WV.Delta; wvM[i]=w.WV.Mom; wvV[i]=w.WV.Vel; wvL[i]=w.WV.Live; wvMk[i]=w.WV.Mask
-		woD[i]=w.WO.Data; woS[i]=w.WO.Scales; woDl[i]=w.WO.Delta; woM[i]=w.WO.Mom; woV[i]=w.WO.Vel; woL[i]=w.WO.Live; woMk[i]=w.WO.Mask
-		gD[i]=w.Gate.Data; gS[i]=w.Gate.Scales; gDl[i]=w.Gate.Delta; gM[i]=w.Gate.Mom; gV[i]=w.Gate.Vel; gL[i]=w.Gate.Live; gMk[i]=w.Gate.Mask
-		uD[i]=w.Up.Data; uS[i]=w.Up.Scales; uDl[i]=w.Up.Delta; uM[i]=w.Up.Mom; uV[i]=w.Up.Vel; uL[i]=w.Up.Live; uMk[i]=w.Up.Mask
-		dD[i]=w.Down.Data; dS[i]=w.Down.Scales; dDl[i]=w.Down.Delta; dM[i]=w.Down.Mom; dV2[i]=w.Down.Vel; dL[i]=w.Down.Live; dMk[i]=w.Down.Mask
+		wqD[i] = w.WQ.Data
+		wqS[i] = w.WQ.Scales
+		wqDl[i] = w.WQ.Delta
+		wqM[i] = w.WQ.Mom
+		wqV[i] = w.WQ.Vel
+		wqL[i] = w.WQ.Live
+		wqMk[i] = w.WQ.Mask
+		wkD[i] = w.WK.Data
+		wkS[i] = w.WK.Scales
+		wkDl[i] = w.WK.Delta
+		wkM[i] = w.WK.Mom
+		wkV[i] = w.WK.Vel
+		wkL[i] = w.WK.Live
+		wkMk[i] = w.WK.Mask
+		wvD[i] = w.WV.Data
+		wvS[i] = w.WV.Scales
+		wvDl[i] = w.WV.Delta
+		wvM[i] = w.WV.Mom
+		wvV[i] = w.WV.Vel
+		wvL[i] = w.WV.Live
+		wvMk[i] = w.WV.Mask
+		woD[i] = w.WO.Data
+		woS[i] = w.WO.Scales
+		woDl[i] = w.WO.Delta
+		woM[i] = w.WO.Mom
+		woV[i] = w.WO.Vel
+		woL[i] = w.WO.Live
+		woMk[i] = w.WO.Mask
+		gD[i] = w.Gate.Data
+		gS[i] = w.Gate.Scales
+		gDl[i] = w.Gate.Delta
+		gM[i] = w.Gate.Mom
+		gV[i] = w.Gate.Vel
+		gL[i] = w.Gate.Live
+		gMk[i] = w.Gate.Mask
+		uD[i] = w.Up.Data
+		uS[i] = w.Up.Scales
+		uDl[i] = w.Up.Delta
+		uM[i] = w.Up.Mom
+		uV[i] = w.Up.Vel
+		uL[i] = w.Up.Live
+		uMk[i] = w.Up.Mask
+		dD[i] = w.Down.Data
+		dS[i] = w.Down.Scales
+		dDl[i] = w.Down.Delta
+		dM[i] = w.Down.Mom
+		dV2[i] = w.Down.Vel
+		dL[i] = w.Down.Live
+		dMk[i] = w.Down.Mask
 
 		b := bwds[i]
-		bDFfn[i]=b.DFfnMid; bDGate[i]=b.DGate; bDUp[i]=b.DUp; bDN2[i]=b.DN2; bDx[i]=b.Dx
-		bDAttn[i]=b.DAttnOut; bDQ[i]=b.DQ; bDK[i]=b.DK; bDV[i]=b.DV; bDN1[i]=b.DN1
-		bDWD[i]=b.DWDown; bDWG[i]=b.DWGate; bDWU[i]=b.DWUp; bDWO[i]=b.DWO
-		bDWQ[i]=b.DWQ; bDWK[i]=b.DWK; bDWV[i]=b.DWV
+		bDFfn[i] = b.DFfnMid
+		bDGate[i] = b.DGate
+		bDUp[i] = b.DUp
+		bDN2[i] = b.DN2
+		bDx[i] = b.Dx
+		bDAttn[i] = b.DAttnOut
+		bDQ[i] = b.DQ
+		bDK[i] = b.DK
+		bDV[i] = b.DV
+		bDN1[i] = b.DN1
+		bDWD[i] = b.DWDown
+		bDWG[i] = b.DWGate
+		bDWU[i] = b.DWUp
+		bDWO[i] = b.DWO
+		bDWQ[i] = b.DWQ
+		bDWK[i] = b.DWK
+		bDWV[i] = b.DWV
 	}
 
 	p := C.ICBBuildParams{
@@ -943,18 +1623,18 @@ func (m *Metal) ICBBuildTraining(
 		lmLoss: MtlBufPtr(lmLoss), targetsGPU: MtlBufPtr(targetsGPU),
 		dHidden: MtlBufPtr(dHidden), dScratch: MtlBufPtr(dScratch), dEmbed: MtlBufPtr(dEmbed),
 		gradSumSq: MtlBufPtr(gradSumSq), clipScaleBuf: MtlBufPtr(clipScaleBuf), scores: MtlBufPtr(scores),
-		embed: MtlBufPtr(embed),
+		embed:     MtlBufPtr(embed),
 		embedData: MtlBufPtr(embedInt8.Data), embedScales: MtlBufPtr(embedInt8.Scales),
 		embedDelta: MtlBufPtr(embedInt8.Delta), embedMom: MtlBufPtr(embedInt8.Mom),
 		embedVel: MtlBufPtr(embedInt8.Vel), embedMask: embedInt8.Mask.BufPtr(),
 		embedLive: MtlBufPtr(embedInt8.Live),
-		norm1: mkArr(norm1s), norm2: mkArr(norm2s),
+		norm1:     mkArr(norm1s), norm2: mkArr(norm2s),
 		a_xIn: mkArr(aXIn), a_normed: mkArr(aNormed), a_Q: mkArr(aQ), a_K: mkArr(aK),
 		a_V: mkArr(aV), a_attnOut: mkArr(aAttnOut), a_xMid: mkArr(aXMid),
 		a_normed2: mkArr(aNormed2), a_gatePre: mkArr(aGatePre), a_upOut: mkArr(aUpOut),
 		a_ffnMid: mkArr(aFfnMid), a_rmsScale1: mkArr(aRmsScale1), a_rmsScale2: mkArr(aRmsScale2),
 		a_gateAct: mkArr(aGateAct),
-		wq_data: mkArr(wqD), wq_scales: mkArr(wqS), wq_delta: mkArr(wqDl),
+		wq_data:   mkArr(wqD), wq_scales: mkArr(wqS), wq_delta: mkArr(wqDl),
 		wq_mom: mkArr(wqM), wq_vel: mkArr(wqV), wq_live: mkArr(wqL), wq_mask: mkMaskArr(wqMk),
 		wk_data: mkArr(wkD), wk_scales: mkArr(wkS), wk_delta: mkArr(wkDl),
 		wk_mom: mkArr(wkM), wk_vel: mkArr(wkV), wk_live: mkArr(wkL), wk_mask: mkMaskArr(wkMk),
@@ -975,96 +1655,343 @@ func (m *Metal) ICBBuildTraining(
 		b_dWO: mkArr(bDWO), b_dWQ: mkArr(bDWQ), b_dWK: mkArr(bDWK), b_dWV: mkArr(bDWV),
 		lrBuf: MtlBufPtr(lrBuf), bc1Buf: MtlBufPtr(bc1Buf), bc2Buf: MtlBufPtr(bc2Buf),
 		maxNormBuf: MtlBufPtr(maxNormBuf),
-		bb1Buf: MtlBufPtr(bb1Buf), gly1Buf: MtlBufPtr(gly1Buf), hb1Buf: MtlBufPtr(hb1Buf),
+		bb1Buf:     MtlBufPtr(bb1Buf), gly1Buf: MtlBufPtr(gly1Buf), hb1Buf: MtlBufPtr(hb1Buf),
 		hb2Buf: MtlBufPtr(hb2Buf), gly2Buf: MtlBufPtr(gly2Buf), bb2Buf: MtlBufPtr(bb2Buf),
 		bondStrBuf: MtlBufPtr(bondStrBuf),
 	}
-	return int(C.mtl_icb_build_training(&p))
+	return int(func() C.int {
+		_cgoBase0 := &p
+		_cgo0 := _cgoBase0
+		_cgoCheckPointer(_cgoBase0, 0 == 0)
+		return C.mtl_icb_build_training(_cgo0)
+	}())
 }
 
 func (m *Metal) FusedComputeClipScale(sumSq, clipScale *Tensor, maxNorm float32) {
-	C.mtl_fused_compute_clip_scale(MtlBufPtr(sumSq), MtlBufPtr(clipScale), C.float(maxNorm))
+	func() {
+		_cgo0 := MtlBufPtr(sumSq)
+		_cgo1 := MtlBufPtr(clipScale)
+		var _cgo2 C.float = C.float(maxNorm)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, nil)
+		C.mtl_fused_compute_clip_scale(_cgo0, _cgo1, _cgo2)
+	}()
 }
 
 func (m *Metal) FusedGradClipScale(grad, sumSq *Tensor, maxNorm float32, n int) {
-	C.mtl_fused_grad_clip_scale(MtlBufPtr(grad), MtlBufPtr(sumSq), C.float(maxNorm), C.int(n))
+	func() {
+		_cgo0 := MtlBufPtr(grad)
+		_cgo1 := MtlBufPtr(sumSq)
+		var _cgo2 C.float = C.float(maxNorm)
+		var _cgo3 C.int = C.int(n)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, nil)
+		C.mtl_fused_grad_clip_scale(_cgo0, _cgo1, _cgo2, _cgo3)
+	}()
 }
 
 func (m *Metal) FusedDequantDelta(src, scales, delta, dst *Tensor, n, cols int) {
-	C.mtl_fused_dequant_delta(MtlBufPtr(src), MtlBufPtr(scales), MtlBufPtr(delta), MtlBufPtr(dst), C.int(n), C.int(cols))
+	func() {
+		_cgo0 := MtlBufPtr(src)
+		_cgo1 := MtlBufPtr(scales)
+		_cgo2 := MtlBufPtr(delta)
+		_cgo3 := MtlBufPtr(dst)
+		var _cgo4 C.int = C.int(n)
+		var _cgo5 C.int = C.int(cols)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, nil)
+		_cgoCheckPointer(_cgo2, nil)
+		_cgoCheckPointer(_cgo3, nil)
+		C.mtl_fused_dequant_delta(_cgo0, _cgo1, _cgo2, _cgo3, _cgo4, _cgo5)
+	}()
 }
 
-func (m *Metal) FusedTrainAvailable() bool { return C.mtl_fused_train_available() == 1 }
+func (m *Metal) FusedTrainAvailable() bool { return (C.mtl_fused_train_available)() == 1 }
 
 func (m *Metal) FusedPreAttn(hidden, normW, wq, wk, wv, Q, K, V, normedOut, rmsScale, xIn *Tensor,
 	dim, kvDim, headDim, nHeads, nKVHeads, ffnDim, seqLen int, ropeTheta, eps float32) {
-	C.mtl_fused_pre_attn(MtlBufPtr(hidden), MtlBufPtr(normW), MtlBufPtr(wq), MtlBufPtr(wk), MtlBufPtr(wv),
-		MtlBufPtr(Q), MtlBufPtr(K), MtlBufPtr(V), MtlBufPtr(normedOut), MtlBufPtr(rmsScale), MtlBufPtr(xIn),
-		C.int(dim), C.int(kvDim), C.int(headDim), C.int(nHeads), C.int(nKVHeads), C.int(ffnDim), C.int(seqLen),
-		C.float(ropeTheta), C.float(eps))
+	func() {
+		_cgo0 := MtlBufPtr(hidden)
+		_cgo1 := MtlBufPtr(normW)
+		_cgo2 := MtlBufPtr(wq)
+		_cgo3 := MtlBufPtr(wk)
+		_cgo4 := MtlBufPtr(wv)
+		_cgo5 := MtlBufPtr(Q)
+		_cgo6 := MtlBufPtr(K)
+		_cgo7 := MtlBufPtr(V)
+		_cgo8 := MtlBufPtr(normedOut)
+		_cgo9 := MtlBufPtr(rmsScale)
+		_cgo10 := MtlBufPtr(xIn)
+		var _cgo11 C.int = C.int(dim)
+		var _cgo12 C.int = C.int(kvDim)
+		var _cgo13 C.int = C.int(headDim)
+		var _cgo14 C.int = C.int(nHeads)
+		var _cgo15 C.int = C.int(nKVHeads)
+		var _cgo16 C.int = C.int(ffnDim)
+		var _cgo17 C.int = C.int(seqLen)
+		var _cgo18 C.float = C.float(ropeTheta)
+		var _cgo19 C.float = C.float(eps)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, nil)
+		_cgoCheckPointer(_cgo2, nil)
+		_cgoCheckPointer(_cgo3, nil)
+		_cgoCheckPointer(_cgo4, nil)
+		_cgoCheckPointer(_cgo5, nil)
+		_cgoCheckPointer(_cgo6, nil)
+		_cgoCheckPointer(_cgo7, nil)
+		_cgoCheckPointer(_cgo8, nil)
+		_cgoCheckPointer(_cgo9, nil)
+		_cgoCheckPointer(_cgo10, nil)
+		C.mtl_fused_pre_attn(_cgo0, _cgo1, _cgo2, _cgo3, _cgo4, _cgo5, _cgo6, _cgo7, _cgo8, _cgo9, _cgo10, _cgo11, _cgo12, _cgo13, _cgo14, _cgo15, _cgo16, _cgo17, _cgo18, _cgo19)
+	}()
 }
 
 func (m *Metal) FusedPostAttn(hidden, attnOut, wo, normW2, gate, up, down, xMid, normed2, rmsScale2, gatePre, upOut, ffnMid *Tensor,
 	dim, kvDim, headDim, nHeads, nKVHeads, ffnDim, seqLen int, ropeTheta, eps float32) {
-	C.mtl_fused_post_attn(MtlBufPtr(hidden), MtlBufPtr(attnOut), MtlBufPtr(wo), MtlBufPtr(normW2),
-		MtlBufPtr(gate), MtlBufPtr(up), MtlBufPtr(down),
-		MtlBufPtr(xMid), MtlBufPtr(normed2), MtlBufPtr(rmsScale2), MtlBufPtr(gatePre), MtlBufPtr(upOut), MtlBufPtr(ffnMid),
-		C.int(dim), C.int(kvDim), C.int(headDim), C.int(nHeads), C.int(nKVHeads), C.int(ffnDim), C.int(seqLen),
-		C.float(ropeTheta), C.float(eps))
+	func() {
+		_cgo0 := MtlBufPtr(hidden)
+		_cgo1 := MtlBufPtr(attnOut)
+		_cgo2 := MtlBufPtr(wo)
+		_cgo3 := MtlBufPtr(normW2)
+		_cgo4 := MtlBufPtr(gate)
+		_cgo5 := MtlBufPtr(up)
+		_cgo6 := MtlBufPtr(down)
+		_cgo7 := MtlBufPtr(xMid)
+		_cgo8 := MtlBufPtr(normed2)
+		_cgo9 := MtlBufPtr(rmsScale2)
+		_cgo10 := MtlBufPtr(gatePre)
+		_cgo11 := MtlBufPtr(upOut)
+		_cgo12 := MtlBufPtr(ffnMid)
+		var _cgo13 C.int = C.int(dim)
+		var _cgo14 C.int = C.int(kvDim)
+		var _cgo15 C.int = C.int(headDim)
+		var _cgo16 C.int = C.int(nHeads)
+		var _cgo17 C.int = C.int(nKVHeads)
+		var _cgo18 C.int = C.int(ffnDim)
+		var _cgo19 C.int = C.int(seqLen)
+		var _cgo20 C.float = C.float(ropeTheta)
+		var _cgo21 C.float = C.float(eps)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, nil)
+		_cgoCheckPointer(_cgo2, nil)
+		_cgoCheckPointer(_cgo3, nil)
+		_cgoCheckPointer(_cgo4, nil)
+		_cgoCheckPointer(_cgo5, nil)
+		_cgoCheckPointer(_cgo6, nil)
+		_cgoCheckPointer(_cgo7, nil)
+		_cgoCheckPointer(_cgo8, nil)
+		_cgoCheckPointer(_cgo9, nil)
+		_cgoCheckPointer(_cgo10, nil)
+		_cgoCheckPointer(_cgo11, nil)
+		_cgoCheckPointer(_cgo12, nil)
+		C.mtl_fused_post_attn(_cgo0, _cgo1, _cgo2, _cgo3, _cgo4, _cgo5, _cgo6, _cgo7, _cgo8, _cgo9, _cgo10, _cgo11, _cgo12, _cgo13, _cgo14, _cgo15, _cgo16, _cgo17, _cgo18, _cgo19, _cgo20, _cgo21)
+	}()
 }
 
 func (m *Metal) FusedLMHeadPass1(hidden, embed, maxBuf, sumExp *Tensor, dim, vocabSize, n int) {
-	C.mtl_fused_lm_head_pass1(MtlBufPtr(hidden), MtlBufPtr(embed), MtlBufPtr(maxBuf), MtlBufPtr(sumExp),
-		C.int(dim), C.int(vocabSize), C.int(n))
+	func() {
+		_cgo0 := MtlBufPtr(hidden)
+		_cgo1 := MtlBufPtr(embed)
+		_cgo2 := MtlBufPtr(maxBuf)
+		_cgo3 := MtlBufPtr(sumExp)
+		var _cgo4 C.int = C.int(dim)
+		var _cgo5 C.int = C.int(vocabSize)
+		var _cgo6 C.int = C.int(n)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, nil)
+		_cgoCheckPointer(_cgo2, nil)
+		_cgoCheckPointer(_cgo3, nil)
+		C.mtl_fused_lm_head_pass1(_cgo0, _cgo1, _cgo2, _cgo3, _cgo4, _cgo5, _cgo6)
+	}()
 }
 
 func (m *Metal) FusedLMHeadPass2(hidden, embed, maxBuf, sumExp, targets, dHidden, loss *Tensor, dim, vocabSize, n int) {
-	C.mtl_fused_lm_head_pass2(MtlBufPtr(hidden), MtlBufPtr(embed), MtlBufPtr(maxBuf), MtlBufPtr(sumExp),
-		MtlBufPtr(targets), MtlBufPtr(dHidden), MtlBufPtr(loss),
-		C.int(dim), C.int(vocabSize), C.int(n))
+	func() {
+		_cgo0 := MtlBufPtr(hidden)
+		_cgo1 := MtlBufPtr(embed)
+		_cgo2 := MtlBufPtr(maxBuf)
+		_cgo3 := MtlBufPtr(sumExp)
+		_cgo4 := MtlBufPtr(targets)
+		_cgo5 := MtlBufPtr(dHidden)
+		_cgo6 := MtlBufPtr(loss)
+		var _cgo7 C.int = C.int(dim)
+		var _cgo8 C.int = C.int(vocabSize)
+		var _cgo9 C.int = C.int(n)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, nil)
+		_cgoCheckPointer(_cgo2, nil)
+		_cgoCheckPointer(_cgo3, nil)
+		_cgoCheckPointer(_cgo4, nil)
+		_cgoCheckPointer(_cgo5, nil)
+		_cgoCheckPointer(_cgo6, nil)
+		C.mtl_fused_lm_head_pass2(_cgo0, _cgo1, _cgo2, _cgo3, _cgo4, _cgo5, _cgo6, _cgo7, _cgo8, _cgo9)
+	}()
 }
 
 func (m *Metal) LMHeadForwardGrad(hidden, embed, maxBuf, sumExp, targets, dHidden, loss *Tensor, dim, vocabSize, n int) {
-	C.mtl_lm_head_forward_grad(MtlBufPtr(hidden), MtlBufPtr(embed), MtlBufPtr(maxBuf), MtlBufPtr(sumExp),
-		MtlBufPtr(targets), MtlBufPtr(dHidden), MtlBufPtr(loss),
-		C.int(dim), C.int(vocabSize), C.int(n))
+	func() {
+		_cgo0 := MtlBufPtr(hidden)
+		_cgo1 := MtlBufPtr(embed)
+		_cgo2 := MtlBufPtr(maxBuf)
+		_cgo3 := MtlBufPtr(sumExp)
+		_cgo4 := MtlBufPtr(targets)
+		_cgo5 := MtlBufPtr(dHidden)
+		_cgo6 := MtlBufPtr(loss)
+		var _cgo7 C.int = C.int(dim)
+		var _cgo8 C.int = C.int(vocabSize)
+		var _cgo9 C.int = C.int(n)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, nil)
+		_cgoCheckPointer(_cgo2, nil)
+		_cgoCheckPointer(_cgo3, nil)
+		_cgoCheckPointer(_cgo4, nil)
+		_cgoCheckPointer(_cgo5, nil)
+		_cgoCheckPointer(_cgo6, nil)
+		C.mtl_lm_head_forward_grad(_cgo0, _cgo1, _cgo2, _cgo3, _cgo4, _cgo5, _cgo6, _cgo7, _cgo8, _cgo9)
+	}()
 }
 
 func (m *Metal) SoftmaxCEGrad(logits, targets, losses, grad *Tensor, seqLen, vocabSize int, invN float32) {
-	C.mtl_softmax_ce_grad(MtlBufPtr(logits), MtlBufPtr(targets), MtlBufPtr(losses), MtlBufPtr(grad),
-		C.int(seqLen), C.int(vocabSize), C.float(invN))
+	func() {
+		_cgo0 := MtlBufPtr(logits)
+		_cgo1 := MtlBufPtr(targets)
+		_cgo2 := MtlBufPtr(losses)
+		_cgo3 := MtlBufPtr(grad)
+		var _cgo4 C.int = C.int(seqLen)
+		var _cgo5 C.int = C.int(vocabSize)
+		var _cgo6 C.float = C.float(invN)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, nil)
+		_cgoCheckPointer(_cgo2, nil)
+		_cgoCheckPointer(_cgo3, nil)
+		C.mtl_softmax_ce_grad(_cgo0, _cgo1, _cgo2, _cgo3, _cgo4, _cgo5, _cgo6)
+	}()
 }
 
 func (m *Metal) FusedGemmF32TNSparse(a, b, c *Tensor, mask *HotRowMask, M, K, N int) {
-	C.mtl_fused_gemm_tn_sparse(MtlBufPtr(a), MtlBufPtr(b), MtlBufPtr(c), mask.BufPtr(), C.int(M), C.int(K), C.int(N))
+	func() {
+		_cgo0 := MtlBufPtr(a)
+		_cgo1 := MtlBufPtr(b)
+		_cgo2 := MtlBufPtr(c)
+		_cgo3 := mask.BufPtr()
+		var _cgo4 C.int = C.int(M)
+		var _cgo5 C.int = C.int(K)
+		var _cgo6 C.int = C.int(N)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, nil)
+		_cgoCheckPointer(_cgo2, nil)
+		_cgoCheckPointer(_cgo3, nil)
+		C.mtl_fused_gemm_tn_sparse(_cgo0, _cgo1, _cgo2, _cgo3, _cgo4, _cgo5, _cgo6)
+	}()
 }
 
 func (m *Metal) FusedDequantDeltaSparse(src, scales, delta, dst *Tensor, mask *HotRowMask, n, cols int) {
-	C.mtl_fused_dequant_delta_sparse(MtlBufPtr(src), MtlBufPtr(scales), MtlBufPtr(delta), MtlBufPtr(dst), mask.BufPtr(), C.int(n), C.int(cols))
+	func() {
+		_cgo0 := MtlBufPtr(src)
+		_cgo1 := MtlBufPtr(scales)
+		_cgo2 := MtlBufPtr(delta)
+		_cgo3 := MtlBufPtr(dst)
+		_cgo4 := mask.BufPtr()
+		var _cgo5 C.int = C.int(n)
+		var _cgo6 C.int = C.int(cols)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, nil)
+		_cgoCheckPointer(_cgo2, nil)
+		_cgoCheckPointer(_cgo3, nil)
+		_cgoCheckPointer(_cgo4, nil)
+		C.mtl_fused_dequant_delta_sparse(_cgo0, _cgo1, _cgo2, _cgo3, _cgo4, _cgo5, _cgo6)
+	}()
 }
 
 func (m *Metal) FusedNeedle(data, scales, grad, mom, vel *Tensor, mask *HotRowMask, delta *Tensor,
 	lr, beta1, beta2, bc1, bc2, eps, wd float32, n, cols int, live, clipBuf *Tensor) {
-	C.mtl_fused_needle(MtlBufPtr(data), MtlBufPtr(scales), MtlBufPtr(grad),
-		MtlBufPtr(mom), MtlBufPtr(vel), mask.BufPtr(), MtlBufPtr(delta),
-		C.float(lr), C.float(beta1), C.float(beta2),
-		C.float(bc1), C.float(bc2), C.float(eps), C.float(wd),
-		C.int(n), C.int(cols), MtlBufPtr(live), MtlBufPtr(clipBuf))
+	func() {
+		_cgo0 := MtlBufPtr(data)
+		_cgo1 := MtlBufPtr(scales)
+		_cgo2 := MtlBufPtr(grad)
+		_cgo3 := MtlBufPtr(mom)
+		_cgo4 := MtlBufPtr(vel)
+		_cgo5 := mask.BufPtr()
+		_cgo6 := MtlBufPtr(delta)
+		var _cgo7 C.float = C.float(lr)
+		var _cgo8 C.float = C.float(beta1)
+		var _cgo9 C.float = C.float(beta2)
+		var _cgo10 C.float = C.float(bc1)
+		var _cgo11 C.float = C.float(bc2)
+		var _cgo12 C.float = C.float(eps)
+		var _cgo13 C.float = C.float(wd)
+		var _cgo14 C.int = C.int(n)
+		var _cgo15 C.int = C.int(cols)
+		_cgo16 := MtlBufPtr(live)
+		_cgo17 := MtlBufPtr(clipBuf)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, nil)
+		_cgoCheckPointer(_cgo2, nil)
+		_cgoCheckPointer(_cgo3, nil)
+		_cgoCheckPointer(_cgo4, nil)
+		_cgoCheckPointer(_cgo5, nil)
+		_cgoCheckPointer(_cgo6, nil)
+		_cgoCheckPointer(_cgo16, nil)
+		_cgoCheckPointer(_cgo17, nil)
+		C.mtl_fused_needle(_cgo0, _cgo1, _cgo2, _cgo3, _cgo4, _cgo5, _cgo6, _cgo7, _cgo8, _cgo9, _cgo10, _cgo11, _cgo12, _cgo13, _cgo14, _cgo15, _cgo16, _cgo17)
+	}()
 }
 
 func (m *Metal) FusedNeedlePaired(d1, d2, s1, s2, g1, g2, m1, m2, v1, v2 *Tensor, mask *HotRowMask, delta1, delta2 *Tensor,
 	lr, beta1, beta2, bc1, bc2, eps, wd,
 	backbone1, glyco1, hbond1, hbond2, glyco2, backbone2, bondStrength float32,
 	n, cols int, live1, live2, clipBuf *Tensor) {
-	C.mtl_fused_needle_paired(MtlBufPtr(d1), MtlBufPtr(d2), MtlBufPtr(s1), MtlBufPtr(s2),
-		MtlBufPtr(g1), MtlBufPtr(g2), MtlBufPtr(m1), MtlBufPtr(m2),
-		MtlBufPtr(v1), MtlBufPtr(v2), mask.BufPtr(), MtlBufPtr(delta1), MtlBufPtr(delta2),
-		C.float(lr), C.float(beta1), C.float(beta2),
-		C.float(bc1), C.float(bc2), C.float(eps), C.float(wd),
-		C.float(backbone1), C.float(glyco1), C.float(hbond1),
-		C.float(hbond2), C.float(glyco2), C.float(backbone2),
-		C.float(bondStrength), C.int(n), C.int(cols),
-		MtlBufPtr(live1), MtlBufPtr(live2), MtlBufPtr(clipBuf))
+	func() {
+		_cgo0 := MtlBufPtr(d1)
+		_cgo1 := MtlBufPtr(d2)
+		_cgo2 := MtlBufPtr(s1)
+		_cgo3 := MtlBufPtr(s2)
+		_cgo4 := MtlBufPtr(g1)
+		_cgo5 := MtlBufPtr(g2)
+		_cgo6 := MtlBufPtr(m1)
+		_cgo7 := MtlBufPtr(m2)
+		_cgo8 := MtlBufPtr(v1)
+		_cgo9 := MtlBufPtr(v2)
+		_cgo10 := mask.BufPtr()
+		_cgo11 := MtlBufPtr(delta1)
+		_cgo12 := MtlBufPtr(delta2)
+		var _cgo13 C.float = C.float(lr)
+		var _cgo14 C.float = C.float(beta1)
+		var _cgo15 C.float = C.float(beta2)
+		var _cgo16 C.float = C.float(bc1)
+		var _cgo17 C.float = C.float(bc2)
+		var _cgo18 C.float = C.float(eps)
+		var _cgo19 C.float = C.float(wd)
+		var _cgo20 C.float = C.float(backbone1)
+		var _cgo21 C.float = C.float(glyco1)
+		var _cgo22 C.float = C.float(hbond1)
+		var _cgo23 C.float = C.float(hbond2)
+		var _cgo24 C.float = C.float(glyco2)
+		var _cgo25 C.float = C.float(backbone2)
+		var _cgo26 C.float = C.float(bondStrength)
+		var _cgo27 C.int = C.int(n)
+		var _cgo28 C.int = C.int(cols)
+		_cgo29 := MtlBufPtr(live1)
+		_cgo30 := MtlBufPtr(live2)
+		_cgo31 := MtlBufPtr(clipBuf)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, nil)
+		_cgoCheckPointer(_cgo2, nil)
+		_cgoCheckPointer(_cgo3, nil)
+		_cgoCheckPointer(_cgo4, nil)
+		_cgoCheckPointer(_cgo5, nil)
+		_cgoCheckPointer(_cgo6, nil)
+		_cgoCheckPointer(_cgo7, nil)
+		_cgoCheckPointer(_cgo8, nil)
+		_cgoCheckPointer(_cgo9, nil)
+		_cgoCheckPointer(_cgo10, nil)
+		_cgoCheckPointer(_cgo11, nil)
+		_cgoCheckPointer(_cgo12, nil)
+		_cgoCheckPointer(_cgo29, nil)
+		_cgoCheckPointer(_cgo30, nil)
+		_cgoCheckPointer(_cgo31, nil)
+		C.mtl_fused_needle_paired(_cgo0, _cgo1, _cgo2, _cgo3, _cgo4, _cgo5, _cgo6, _cgo7, _cgo8, _cgo9, _cgo10, _cgo11, _cgo12, _cgo13, _cgo14, _cgo15, _cgo16, _cgo17, _cgo18, _cgo19, _cgo20, _cgo21, _cgo22, _cgo23, _cgo24, _cgo25, _cgo26, _cgo27, _cgo28, _cgo29, _cgo30, _cgo31)
+	}()
 }
 
 type HotRowMask struct {
@@ -1074,9 +2001,14 @@ type HotRowMask struct {
 }
 
 func (m *Metal) NewHotRowMask(nRows int) *HotRowMask {
-	buf := C.mtl_alloc(C.size_t(nRows))
-	C.mtl_zero(buf, C.size_t(nRows))
-	ptr := C.mtl_shared_ptr(buf)
+	buf := (C.mtl_alloc)(C.size_t(nRows))
+	func() {
+		_cgo0 := buf
+		var _cgo1 C.size_t = C.size_t(nRows)
+		_cgoCheckPointer(_cgo0, nil)
+		C.mtl_zero(_cgo0, _cgo1)
+	}()
+	ptr := func() unsafe.Pointer { _cgo0 := buf; _cgoCheckPointer(_cgo0, nil); return C.mtl_shared_ptr(_cgo0) }()
 	shared := (*[1 << 30]int8)(ptr)[:nRows:nRows]
 	return &HotRowMask{buf: buf, nRows: nRows, shared: shared}
 }
@@ -1096,7 +2028,7 @@ func (h *HotRowMask) BufPtr() unsafe.Pointer { return unsafe.Pointer(h.buf) }
 
 func (h *HotRowMask) Release() {
 	if h.buf != nil {
-		C.mtl_free(h.buf)
+		func() { _cgo0 := h.buf; _cgoCheckPointer(_cgo0, nil); C.mtl_free(_cgo0) }()
 		h.buf = nil
 		h.shared = nil
 	}

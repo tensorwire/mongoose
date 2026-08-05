@@ -1,3 +1,4 @@
+
 //go:build darwin && cgo
 
 package mongoose
@@ -20,6 +21,7 @@ void* mtl_shared_ptr(MTLBufferRef buf);
 int mtl_graph_sgemm(void* aRef, void* bRef, void* cRef, int m, int k, int n, int transA, int transB);
 */
 import "C"
+import _ "unsafe"
 
 import (
 	"unsafe"
@@ -38,8 +40,16 @@ func (m *Metal) FromHost(data []float32, shape []int) *Tensor {
 	for _, s := range shape {
 		size *= s
 	}
-	buf := C.mtl_alloc(C.size_t(size * 4))
-	C.mtl_upload(buf, unsafe.Pointer(&data[0]), C.size_t(size*4))
+	buf := (C.mtl_alloc)(C.size_t(size * 4))
+	func() {
+		_cgo0 := buf
+		_cgoIndex1 := &data
+		_cgo1 := unsafe.Pointer(&(*_cgoIndex1)[0])
+		var _cgo2 C.size_t = C.size_t(size * 4)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, *_cgoIndex1)
+		C.mtl_upload(_cgo0, _cgo1, _cgo2)
+	}()
 	return &Tensor{
 		Shape:  shape,
 		Size:   size,
@@ -53,8 +63,13 @@ func (m *Metal) Zeros(shape []int) *Tensor {
 	for _, s := range shape {
 		size *= s
 	}
-	buf := C.mtl_alloc(C.size_t(size * 4))
-	C.mtl_zero(buf, C.size_t(size*4))
+	buf := (C.mtl_alloc)(C.size_t(size * 4))
+	func() {
+		_cgo0 := buf
+		var _cgo1 C.size_t = C.size_t(size * 4)
+		_cgoCheckPointer(_cgo0, nil)
+		C.mtl_zero(_cgo0, _cgo1)
+	}()
 	return &Tensor{
 		Shape:  shape,
 		Size:   size,
@@ -66,14 +81,22 @@ func (m *Metal) Zeros(shape []int) *Tensor {
 func (m *Metal) ToHost(t *Tensor) []float32 {
 	mp := t.device.(*mtlPtr)
 	data := make([]float32, t.Size)
-	C.mtl_download(unsafe.Pointer(&data[0]), mp.buf, C.size_t(t.Size*4))
+	func() {
+		_cgoIndex0 := &data
+		_cgo0 := unsafe.Pointer(&(*_cgoIndex0)[0])
+		_cgo1 := mp.buf
+		var _cgo2 C.size_t = C.size_t(t.Size * 4)
+		_cgoCheckPointer(_cgo0, *_cgoIndex0)
+		_cgoCheckPointer(_cgo1, nil)
+		C.mtl_download(_cgo0, _cgo1, _cgo2)
+	}()
 	return data
 }
 
 func (m *Metal) Release(t *Tensor) {
 	if t.device != nil {
 		mp := t.device.(*mtlPtr)
-		C.mtl_free(mp.buf)
+		func() { _cgo0 := mp.buf; _cgoCheckPointer(_cgo0, nil); C.mtl_free(_cgo0) }()
 		t.device = nil
 	}
 }
@@ -81,50 +104,83 @@ func (m *Metal) Release(t *Tensor) {
 // AllocRaw allocates an MTLBuffer of exactly nBytes, zeroed. Returns a Tensor
 // with Size = nElements (caller provides this for dispatch sizing).
 func (m *Metal) AllocRaw(nBytes, nElements int, shape []int) *Tensor {
-	buf := C.mtl_alloc(C.size_t(nBytes))
-	C.mtl_zero(buf, C.size_t(nBytes))
+	buf := (C.mtl_alloc)(C.size_t(nBytes))
+	func() {
+		_cgo0 := buf
+		var _cgo1 C.size_t = C.size_t(nBytes)
+		_cgoCheckPointer(_cgo0, nil)
+		C.mtl_zero(_cgo0, _cgo1)
+	}()
 	return &Tensor{Shape: shape, Size: nElements, device: &mtlPtr{buf: buf}, eng: m}
 }
 
 // UploadRaw uploads arbitrary bytes into a Tensor's underlying MTLBuffer.
 func (m *Metal) UploadRaw(t *Tensor, data unsafe.Pointer, nBytes int) {
 	mp := t.device.(*mtlPtr)
-	C.mtl_upload(mp.buf, data, C.size_t(nBytes))
+	func() {
+		_cgo0 := mp.buf
+		_cgo1 := data
+		var _cgo2 C.size_t = C.size_t(nBytes)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, nil)
+		C.mtl_upload(_cgo0, _cgo1, _cgo2)
+	}()
 }
 
 // MatMulT computes C = A @ B. A[m,k], B[k,n] → C[m,n].
 func (m *Metal) MatMulT(a, b *Tensor, rows, k, n int) *Tensor {
 	size := rows * n
-	bufC := C.mtl_alloc(C.size_t(size * 4))
-	C.mtl_sgemm(
-		a.device.(*mtlPtr).buf,
-		b.device.(*mtlPtr).buf,
-		bufC,
-		C.int(rows), C.int(k), C.int(n))
+	bufC := (C.mtl_alloc)(C.size_t(size * 4))
+	func() C.int {
+		_cgo0 := a.device.(*mtlPtr).buf
+		_cgo1 := b.device.(*mtlPtr).buf
+		_cgo2 := bufC
+		var _cgo3 C.int = C.int(rows)
+		var _cgo4 C.int = C.int(k)
+		var _cgo5 C.int = C.int(n)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, nil)
+		_cgoCheckPointer(_cgo2, nil)
+		return C.mtl_sgemm(_cgo0, _cgo1, _cgo2, _cgo3, _cgo4, _cgo5)
+	}()
 	return &Tensor{Shape: []int{rows, n}, Size: size, device: &mtlPtr{buf: bufC}, eng: m}
 }
 
 // MatMulTransposeBT computes C[m,n] = A[m,k] @ B[n,k]^T.
 func (m *Metal) MatMulTransposeBT(a, b *Tensor, rows, k, n int) *Tensor {
 	size := rows * n
-	bufC := C.mtl_alloc(C.size_t(size * 4))
-	C.mtl_sgemm_transB(
-		a.device.(*mtlPtr).buf,
-		b.device.(*mtlPtr).buf,
-		bufC,
-		C.int(rows), C.int(k), C.int(n))
+	bufC := (C.mtl_alloc)(C.size_t(size * 4))
+	func() C.int {
+		_cgo0 := a.device.(*mtlPtr).buf
+		_cgo1 := b.device.(*mtlPtr).buf
+		_cgo2 := bufC
+		var _cgo3 C.int = C.int(rows)
+		var _cgo4 C.int = C.int(k)
+		var _cgo5 C.int = C.int(n)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, nil)
+		_cgoCheckPointer(_cgo2, nil)
+		return C.mtl_sgemm_transB(_cgo0, _cgo1, _cgo2, _cgo3, _cgo4, _cgo5)
+	}()
 	return &Tensor{Shape: []int{rows, n}, Size: size, device: &mtlPtr{buf: bufC}, eng: m}
 }
 
 // MatMulTransposeAT computes C[k,n] = A[m,k]^T @ B[m,n].
 func (m *Metal) MatMulTransposeAT(a, b *Tensor, rows, k, n int) *Tensor {
 	size := k * n
-	bufC := C.mtl_alloc(C.size_t(size * 4))
-	C.mtl_sgemm_transA(
-		a.device.(*mtlPtr).buf,
-		b.device.(*mtlPtr).buf,
-		bufC,
-		C.int(rows), C.int(k), C.int(n))
+	bufC := (C.mtl_alloc)(C.size_t(size * 4))
+	func() C.int {
+		_cgo0 := a.device.(*mtlPtr).buf
+		_cgo1 := b.device.(*mtlPtr).buf
+		_cgo2 := bufC
+		var _cgo3 C.int = C.int(rows)
+		var _cgo4 C.int = C.int(k)
+		var _cgo5 C.int = C.int(n)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, nil)
+		_cgoCheckPointer(_cgo2, nil)
+		return C.mtl_sgemm_transA(_cgo0, _cgo1, _cgo2, _cgo3, _cgo4, _cgo5)
+	}()
 	return &Tensor{Shape: []int{k, n}, Size: size, device: &mtlPtr{buf: bufC}, eng: m}
 }
 
@@ -135,7 +191,15 @@ func (m *Metal) AddInPlace(a, b *Tensor) {
 	for i := range aData {
 		aData[i] += bData[i]
 	}
-	C.mtl_upload(a.device.(*mtlPtr).buf, unsafe.Pointer(&aData[0]), C.size_t(a.Size*4))
+	func() {
+		_cgo0 := a.device.(*mtlPtr).buf
+		_cgoIndex1 := &aData
+		_cgo1 := unsafe.Pointer(&(*_cgoIndex1)[0])
+		var _cgo2 C.size_t = C.size_t(a.Size * 4)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, *_cgoIndex1)
+		C.mtl_upload(_cgo0, _cgo1, _cgo2)
+	}()
 }
 
 func (m *Metal) AddT(a, b *Tensor) *Tensor {
@@ -200,15 +264,43 @@ func (m *Metal) MatVecResidentW(W *Tensor, x []float32, rows, cols int) []float3
 	bufX := m.poolGet(cols)
 	bufC := m.poolGet(rows)
 
-	ptrX := C.mtl_shared_ptr(bufX)
-	C.memcpy(ptrX, unsafe.Pointer(&x[0]), C.size_t(cols*4))
+	ptrX := func() unsafe.Pointer { _cgo0 := bufX; _cgoCheckPointer(_cgo0, nil); return C.mtl_shared_ptr(_cgo0) }()
+	func() unsafe.Pointer {
+		_cgo0 := ptrX
+		_cgoIndex1 := &x
+		_cgo1 := unsafe.Pointer(&(*_cgoIndex1)[0])
+		var _cgo2 C.size_t = C.size_t(cols * 4)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, *_cgoIndex1)
+		return C.memcpy(_cgo0, _cgo1, _cgo2)
+	}()
 
-	C.mtl_graph_sgemm(unsafe.Pointer(mp.buf), unsafe.Pointer(bufX), unsafe.Pointer(bufC),
-		C.int(rows), C.int(cols), C.int(1), C.int(0), C.int(0))
+	func() C.int {
+		_cgo0 := unsafe.Pointer(mp.buf)
+		_cgo1 := unsafe.Pointer(bufX)
+		_cgo2 := unsafe.Pointer(bufC)
+		var _cgo3 C.int = C.int(rows)
+		var _cgo4 C.int = C.int(cols)
+		var _cgo5 C.int = C.int(1)
+		var _cgo6 C.int = C.int(0)
+		var _cgo7 C.int = C.int(0)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, nil)
+		_cgoCheckPointer(_cgo2, nil)
+		return C.mtl_graph_sgemm(_cgo0, _cgo1, _cgo2, _cgo3, _cgo4, _cgo5, _cgo6, _cgo7)
+	}()
 
 	out := make([]float32, rows)
-	ptrC := C.mtl_shared_ptr(bufC)
-	C.memcpy(unsafe.Pointer(&out[0]), ptrC, C.size_t(rows*4))
+	ptrC := func() unsafe.Pointer { _cgo0 := bufC; _cgoCheckPointer(_cgo0, nil); return C.mtl_shared_ptr(_cgo0) }()
+	func() unsafe.Pointer {
+		_cgoIndex0 := &out
+		_cgo0 := unsafe.Pointer(&(*_cgoIndex0)[0])
+		_cgo1 := ptrC
+		var _cgo2 C.size_t = C.size_t(rows * 4)
+		_cgoCheckPointer(_cgo0, *_cgoIndex0)
+		_cgoCheckPointer(_cgo1, nil)
+		return C.memcpy(_cgo0, _cgo1, _cgo2)
+	}()
 
 	m.poolPut(cols, bufX)
 	m.poolPut(rows, bufC)
@@ -223,12 +315,24 @@ func MtlBufPtr(t *Tensor) unsafe.Pointer {
 // UploadInto overwrites an existing Metal tensor's buffer with new float32 data.
 // Uses direct memcpy to shared memory — no allocation, no command buffer needed.
 func (m *Metal) UploadInto(dst *Tensor, data []float32) {
-	C.mtl_upload(dst.device.(*mtlPtr).buf, unsafe.Pointer(&data[0]), C.size_t(len(data)*4))
+	func() {
+		_cgo0 := dst.device.(*mtlPtr).buf
+		_cgoIndex1 := &data
+		_cgo1 := unsafe.Pointer(&(*_cgoIndex1)[0])
+		var _cgo2 C.size_t = C.size_t(len(data) * 4)
+		_cgoCheckPointer(_cgo0, nil)
+		_cgoCheckPointer(_cgo1, *_cgoIndex1)
+		C.mtl_upload(_cgo0, _cgo1, _cgo2)
+	}()
 }
 
 // SharedPtr returns the raw CPU-accessible pointer for a StorageModeShared GPU buffer.
 // On Apple Silicon unified memory this is the same physical pages the GPU reads —
 // writes here are visible to the GPU with no explicit copy or flush.
 func (m *Metal) SharedPtr(t *Tensor) unsafe.Pointer {
-	return C.mtl_shared_ptr(t.device.(*mtlPtr).buf)
+	return func() unsafe.Pointer {
+		_cgo0 := t.device.(*mtlPtr).buf
+		_cgoCheckPointer(_cgo0, nil)
+		return C.mtl_shared_ptr(_cgo0)
+	}()
 }
