@@ -1259,8 +1259,8 @@ static float g_arch_logits_scaling = 0.0f;
 // mtl_fused_infer_build. Calling it afterwards returns -1 rather than silently
 // having no effect, because a silent no-op here is exactly the failure that
 // costs hours: the model loads, runs, and emits confident garbage.
-int mtl_fused_set_arch(float embeddingMultiplier, float residualMultiplier,
-                       float attentionScale, float logitsScaling) {
+int mtl_graph_fused_set_arch(float embeddingMultiplier, float residualMultiplier,
+                             float attentionScale, float logitsScaling) {
     if (g_fused_graph) return -1;
     g_arch_embedding_mult = embeddingMultiplier;
     g_arch_residual_mult  = residualMultiplier;

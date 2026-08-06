@@ -1777,3 +1777,42 @@ kernel void argmax_sample(
 
     if (tid == 0) result[0] = sidx[0];
 }
+
+// ============================================================================
+// Architecture scalar multipliers.
+//
+// Granite applies four scalars on top of an otherwise Llama-shaped forward
+// pass. Its tensor layout is identical to Llama's, so a model run without them
+// loads, runs at full speed, and emits fluent-looking token soup — there is no
+// shape error to catch it.
+// ============================================================================
+
+// arch_scale multiplies a buffer in place. Used for embedding_multiplier (once
+// on entry) and residual_multiplier (on each block's output before it joins
+// the residual stream).
+kernel void arch_scale(
+    device float* x            [[buffer(0)]],
+    device const float* p_mult [[buffer(1)]],
+    device const uint* p_n     [[buffer(2)]],
+    uint i [[thread_position_in_grid]])
+{
+    if (i >= p_n[0]) return;
+    x[i] *= p_mult[0];
+}
+
+// arch_div divides a buffer in place.
+//
+// Separate from arch_scale because logits_scaling DIVIDES despite its name.
+// Granite-4.1-3b ships 10.0, so multiplying instead would be a 100x error on
+// every logit — which does not crash, it just flattens the distribution and
+// wrecks sampling. Passing 1/x to arch_scale would work but puts the burden of
+// remembering the inversion on every call site.
+kernel void arch_div(
+    device float* x           [[buffer(0)]],
+    device const float* p_div [[buffer(1)]],
+    device const uint* p_n    [[buffer(2)]],
+    uint i [[thread_position_in_grid]])
+{
+    if (i >= p_n[0]) return;
+    x[i] /= p_div[0];
+}

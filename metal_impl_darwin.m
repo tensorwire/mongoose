@@ -5899,6 +5899,21 @@ static NSString* g_infer_kernel_src =
 "    out[h * headDim + tid] = acc / runSum;\n"
 "}\n";
 
+// Architecture scalars for the fused KERNEL inference path (this file).
+// Distinct from the MPSGraph path's copy in metal_graph_darwin.m: ai uses
+// mtl_fused_build/mtl_fused_partial_step_slot, so scalars set only on the graph
+// side would never reach the kernels that actually run.
+static float g_inf_arch_embedding_mult = 0.0f;
+static float g_inf_arch_residual_mult  = 0.0f;
+static float g_inf_arch_attn_scale     = 0.0f;
+static float g_inf_arch_logits_scaling = 0.0f;
+static id<MTLBuffer> g_inf_arch_emb_buf = nil;
+static id<MTLBuffer> g_inf_arch_res_buf = nil;
+static id<MTLBuffer> g_inf_arch_attn_buf = nil;
+static id<MTLBuffer> g_inf_arch_log_buf = nil;
+static id<MTLComputePipelineState> g_ps_arch_scale = nil;
+static id<MTLComputePipelineState> g_ps_arch_div = nil;
+
 static id<MTLComputePipelineState> g_ps_rope_rh = nil;  // rotate-half RoPE
 static id<MTLComputePipelineState> g_ps_dec_attn = nil;  // decode attention
 static id<MTLComputePipelineState> g_ps_q8mv = nil;      // Q8 fused dequant matvec
@@ -6064,6 +6079,10 @@ int mtl_fused_build(int dim, int kvDim, int headDim,
     if (!lib) { NSLog(@"infer kernel load failed: %@", err); return -1; }
     g_ps_rope_rh = [g_device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rope_rotate_half"] error:&err];
     g_ps_dec_attn = [g_device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"decode_attn"] error:&err];
+    { id<MTLFunction> f1 = [lib newFunctionWithName:@"arch_scale"];
+      id<MTLFunction> f2 = [lib newFunctionWithName:@"arch_div"];
+      if (f1) g_ps_arch_scale = [g_device newComputePipelineStateWithFunction:f1 error:&err];
+      if (f2) g_ps_arch_div = [g_device newComputePipelineStateWithFunction:f2 error:&err]; }
     g_ps_q8mv = [g_device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"q8_matvec"] error:&err];
     g_ps_q4mv = [g_device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"q4_matvec"] error:&err];
     if (!g_ps_rope_rh || !g_ps_dec_attn || !g_ps_q8mv || !g_ps_q4mv) { NSLog(@"infer pipeline: %@", err); return -1; }
@@ -6219,6 +6238,20 @@ int mtl_fused_set_weight(int idx, const float* data, int nFloats) {
     } \
 } while(0)
 
+// ARCH_SCALE dispatches an in-place multiply when the multiplier is set.
+// Skipped entirely when zero, which is what keeps Llama-family models on the
+// exact instruction sequence they had before arch scalars existed.
+#define ARCH_SCALE(buf, mbuf, cnt, cntbuf) \
+    do { if ((mbuf) && g_ps_arch_scale) { \
+        PS(g_ps_arch_scale); BUF(buf, 0); \
+        [enc setBuffer:(mbuf) offset:0 atIndex:1]; CB(cntbuf, 2); \
+        DT(cnt,1,1, 256,1,1); BARRIER(); } } while (0)
+#define ARCH_DIV(buf, dbuf, cnt, cntbuf) \
+    do { if ((dbuf) && g_ps_arch_div) { \
+        PS(g_ps_arch_div); BUF(buf, 0); \
+        [enc setBuffer:(dbuf) offset:0 atIndex:1]; CB(cntbuf, 2); \
+        DT(cnt,1,1, 256,1,1); BARRIER(); } } while (0)
+
 int mtl_fused_step(const float* hiddenIn, const float* cosData, const float* sinData,
                    int pos, float* logitsOut) {
     if (!g_inf.built) return -1;
@@ -6241,6 +6274,9 @@ int mtl_fused_step(const float* hiddenIn, const float* cosData, const float* sin
 
     NSUInteger tpg_norm = (dim / 32) * 32; if (tpg_norm == 0) tpg_norm = 32;
     if (tpg_norm > g_ps_rmsnorm_save.maxTotalThreadsPerThreadgroup) tpg_norm = g_ps_rmsnorm_save.maxTotalThreadsPerThreadgroup;
+
+    // Embeddings scale once on entry to the stack.
+    ARCH_SCALE(g_inf.hidden, g_inf_arch_emb_buf, dim, g_inf.cb_dim);
 
     for (int l = 0; l < nLayers; l++) {
         // --- Pre-attention: RMSNorm → QKV → bias → RoPE ---
@@ -6283,10 +6319,12 @@ int mtl_fused_step(const float* hiddenIn, const float* cosData, const float* sin
         BUF(g_inf.Q, 0); BUF(g_inf.kCache[l], 1); BUF(g_inf.vCache[l], 2); BUF(g_inf.attnOut, 3);
         CB(g_inf.cb_kvDim, 4); CB(g_inf.cb_headDim, 5); CB(g_inf.cb_nHeads, 6);
         CB(g_inf.cb_nKVHeads, 7); CB(cb_seq, 8);
+        if (g_inf_arch_attn_buf) [enc setBuffer:g_inf_arch_attn_buf offset:0 atIndex:9];
         DTG(nHeads,1,1, headDim,1,1); BARRIER();
 
         // O-proj + residual
         MV(g_inf.attnOut, g_inf.wo[l], g_inf.proj, g_inf.cb_Kdim, g_inf.cb_dim); BARRIER();
+        ARCH_SCALE(g_inf.proj, g_inf_arch_res_buf, dim, g_inf.cb_dim);
         PS(g_ps_add_inplace); BUF(g_inf.hidden, 0); BUF(g_inf.proj, 1);
         DT(dim,1,1, 256,1,1); BARRIER();
 
@@ -6301,6 +6339,7 @@ int mtl_fused_step(const float* hiddenIn, const float* cosData, const float* sin
         PS(g_ps_silu_gate_mul); BUF(g_inf.gatePre, 0); BUF(g_inf.upOut, 1); BUF(g_inf.ffnMid, 2);
         DT(ffnDim,1,1, 256,1,1); BARRIER();
         MV(g_inf.ffnMid, g_inf.wdown[l], g_inf.proj, g_inf.cb_Nffn, g_inf.cb_dim); BARRIER();
+        ARCH_SCALE(g_inf.proj, g_inf_arch_res_buf, dim, g_inf.cb_dim);
         PS(g_ps_add_inplace); BUF(g_inf.hidden, 0); BUF(g_inf.proj, 1);
         DT(dim,1,1, 256,1,1); BARRIER();
     }
@@ -6309,6 +6348,8 @@ int mtl_fused_step(const float* hiddenIn, const float* cosData, const float* sin
     PS(g_ps_rmsnorm_save); BUF(g_inf.hidden, 0); BUF(g_inf.finalNorm, 1); BUF(g_inf.rmsScale, 2);
     CB(g_inf.cb_dim, 3); CB(g_inf.cb_eps, 4); DTG(1,1,1, tpg_norm,1,1); BARRIER();
     MV(g_inf.hidden, g_inf.lmHead, g_inf.logits, g_inf.cb_Kdim, g_inf.cb_Nvocab);
+    BARRIER();
+    ARCH_DIV(g_inf.logits, g_inf_arch_log_buf, vocabSize, g_inf.cb_Nvocab);
 
     [enc endEncoding];
     [cmd commit];
@@ -6368,6 +6409,11 @@ int mtl_fused_partial_step_slot(int slot, const float* hiddenIn, int pos,
     NSUInteger tpg_norm = (dim / 32) * 32; if (tpg_norm == 0) tpg_norm = 32;
     if (tpg_norm > g_ps_rmsnorm_save.maxTotalThreadsPerThreadgroup) tpg_norm = g_ps_rmsnorm_save.maxTotalThreadsPerThreadgroup;
 
+    // Embeddings scale once on entry to the stack. layerStart > 0 means this is
+    // a continuation of a partially-run stack, where the scaling already
+    // happened on the first segment.
+    if (layerStart == 0) ARCH_SCALE(sl->hidden, g_inf_arch_emb_buf, dim, g_inf.cb_dim);
+
     for (int l = layerStart; l < layerEnd; l++) {
         PS(g_ps_copy_mem); BUF(sl->hidden, 0); BUF(sl->normed, 1);
         DT(dim,1,1, 256,1,1); BARRIER();
@@ -6404,9 +6450,11 @@ int mtl_fused_partial_step_slot(int slot, const float* hiddenIn, int pos,
         BUF(sl->Q, 0); BUF(sl->kCache[l], 1); BUF(sl->vCache[l], 2); BUF(sl->attnOut, 3);
         CB(g_inf.cb_kvDim, 4); CB(g_inf.cb_headDim, 5); CB(g_inf.cb_nHeads, 6);
         CB(g_inf.cb_nKVHeads, 7); CB(cb_seq, 8);
+        if (g_inf_arch_attn_buf) [enc setBuffer:g_inf_arch_attn_buf offset:0 atIndex:9];
         DTG(nHeads,1,1, headDim,1,1); BARRIER();
 
         MV(sl->attnOut, g_inf.wo[l], sl->proj, g_inf.cb_Kdim, g_inf.cb_dim); BARRIER();
+        ARCH_SCALE(sl->proj, g_inf_arch_res_buf, dim, g_inf.cb_dim);
         PS(g_ps_add_inplace); BUF(sl->hidden, 0); BUF(sl->proj, 1);
         DT(dim,1,1, 256,1,1); BARRIER();
 
@@ -6421,6 +6469,7 @@ int mtl_fused_partial_step_slot(int slot, const float* hiddenIn, int pos,
         PS(g_ps_silu_gate_mul); BUF(sl->gatePre, 0); BUF(sl->upOut, 1); BUF(sl->ffnMid, 2);
         DT(ffnDim,1,1, 256,1,1); BARRIER();
         MV(sl->ffnMid, g_inf.wdown[l], sl->proj, g_inf.cb_Nffn, g_inf.cb_dim); BARRIER();
+        ARCH_SCALE(sl->proj, g_inf_arch_res_buf, dim, g_inf.cb_dim);
         PS(g_ps_add_inplace); BUF(sl->hidden, 0); BUF(sl->proj, 1);
         DT(dim,1,1, 256,1,1); BARRIER();
     }
@@ -6429,6 +6478,8 @@ int mtl_fused_partial_step_slot(int slot, const float* hiddenIn, int pos,
         PS(g_ps_rmsnorm_save); BUF(sl->hidden, 0); BUF(g_inf.finalNorm, 1); BUF(sl->rmsScale, 2);
         CB(g_inf.cb_dim, 3); CB(g_inf.cb_eps, 4); DTG(1,1,1, tpg_norm,1,1); BARRIER();
         MV(sl->hidden, g_inf.lmHead, sl->logits, g_inf.cb_Kdim, g_inf.cb_Nvocab);
+        BARRIER();
+        ARCH_DIV(sl->logits, g_inf_arch_log_buf, vocabSize, g_inf.cb_Nvocab);
     }
 
     [enc endEncoding];
@@ -6534,6 +6585,7 @@ int mtl_fused_prefill_batch(int slot, const float* hiddenIn, int B, int basePos,
 
         memcpy(((__bridge id<MTLBuffer>)sl->hidden).contents,
                hiddenIn + (size_t)b * dim, dim * sizeof(float));
+        ARCH_SCALE(sl->hidden, g_inf_arch_emb_buf, dim, g_inf.cb_dim);
 
         for (int l = 0; l < nLayers; l++) {
             PS(g_ps_copy_mem); BUF(sl->hidden, 0); BUF(sl->normed, 1);
@@ -6571,6 +6623,7 @@ int mtl_fused_prefill_batch(int slot, const float* hiddenIn, int B, int basePos,
             BUF(sl->Q, 0); BUF(sl->kCache[l], 1); BUF(sl->vCache[l], 2); BUF(sl->attnOut, 3);
             CB(g_inf.cb_kvDim, 4); CB(g_inf.cb_headDim, 5); CB(g_inf.cb_nHeads, 6);
             CB(g_inf.cb_nKVHeads, 7); CB(cb_seq, 8);
+            if (g_inf_arch_attn_buf) [enc setBuffer:g_inf_arch_attn_buf offset:0 atIndex:9];
             DTG(nHeads,1,1, headDim,1,1); BARRIER();
 
             MV(sl->attnOut, g_inf.wo[l], sl->proj, g_inf.cb_Kdim, g_inf.cb_dim); BARRIER();
@@ -6599,6 +6652,8 @@ int mtl_fused_prefill_batch(int slot, const float* hiddenIn, int B, int basePos,
             PS(g_ps_rmsnorm_save); BUF(sl->hidden, 0); BUF(g_inf.finalNorm, 1); BUF(sl->rmsScale, 2);
             CB(g_inf.cb_dim, 3); CB(g_inf.cb_eps, 4); DTG(1,1,1, tpg_norm,1,1); BARRIER();
             MV(sl->hidden, g_inf.lmHead, sl->logits, g_inf.cb_Kdim, g_inf.cb_Nvocab);
+        BARRIER();
+        ARCH_DIV(sl->logits, g_inf_arch_log_buf, vocabSize, g_inf.cb_Nvocab);
             BARRIER();
         }
     }
@@ -6811,6 +6866,35 @@ void mtl_stream_set_hidden(const float* hiddenIn) {
 // place. This is the kernel that actually serves tokens, so it is the reference
 // the training path must agree with: changing it instead would invalidate every
 // checkpoint already served correctly.
+// mtl_fused_set_arch records architecture scalars for the fused KERNEL path.
+//
+// Unlike the MPSGraph path, nothing is baked in at build time here — the
+// kernels read the values from buffers each step — so this may be called before
+// or after mtl_fused_build. Zero means "Llama default" and the corresponding
+// dispatch is skipped entirely, leaving the forward pass byte-identical.
+int mtl_fused_set_arch(float embeddingMultiplier, float residualMultiplier,
+                       float attentionScale, float logitsScaling) {
+    if (mtl_init() != 0) return -1;
+    g_inf_arch_embedding_mult = embeddingMultiplier;
+    g_inf_arch_residual_mult  = residualMultiplier;
+    g_inf_arch_attn_scale     = attentionScale;
+    g_inf_arch_logits_scaling = logitsScaling;
+
+    if (embeddingMultiplier != 0.0f)
+        g_inf_arch_emb_buf = [g_device newBufferWithBytes:&embeddingMultiplier length:4
+                                                  options:MTLResourceStorageModeShared];
+    if (residualMultiplier != 0.0f)
+        g_inf_arch_res_buf = [g_device newBufferWithBytes:&residualMultiplier length:4
+                                                  options:MTLResourceStorageModeShared];
+    if (attentionScale != 0.0f)
+        g_inf_arch_attn_buf = [g_device newBufferWithBytes:&attentionScale length:4
+                                                   options:MTLResourceStorageModeShared];
+    if (logitsScaling != 0.0f)
+        g_inf_arch_log_buf = [g_device newBufferWithBytes:&logitsScaling length:4
+                                                  options:MTLResourceStorageModeShared];
+    return 0;
+}
+
 int mtl_infer_rope_probe(float* x, int nHeads, int headDim, int pos, float theta) {
     if (!x || nHeads <= 0 || headDim < 2 || (headDim & 1) || pos < 0) return -1;
     if (mtl_init() != 0) return -2;
