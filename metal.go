@@ -141,6 +141,7 @@ void mtl_fused_attention_bwd_q(void* dOut, void* q, void* k, void* v, void* scor
 void mtl_fused_silu_gate_mul(void* gate, void* up, void* out, int n);
 void mtl_silu_gate_backward_gpu(void* dOut, void* gatePre, void* upOut, void* gateAct, void* dGatePre, void* dUp, int n);
 void mtl_fused_add_inplace(void* a, void* b, int n);
+void mtl_scale_inplace(void* aRef, float s, int n);
 void mtl_fused_copy(void* dst, void* src, int n);
 void mtl_ce_loss(void* logits, void* targets, void* losses, int seqLen, int vocabSize);
 void mtl_adamw_gpu(void* param, void* grad, void* m, void* v, float lr, float beta1, float beta2, float bc1, float bc2, float eps, float wd, int n);
@@ -1128,6 +1129,15 @@ func (m *Metal) SiLUGateBackward(dOut, gatePre, upOut, gateAct, dGatePre, dUp *T
 		C.mtl_silu_gate_backward_gpu(_cgo0, _cgo1, _cgo2, _cgo3, _cgo4, _cgo5, _cgo6)
 	}()
 }
+// ScaleInPlace multiplies a tensor by a scalar in place.
+//
+// Exists for architecture multipliers (Granite's embedding_multiplier,
+// residual_multiplier, logits_scaling). Those are plain Go floats at the call
+// site, so the scalar is passed by value rather than as a device buffer.
+func (m *Metal) ScaleInPlace(a *Tensor, s float32, n int) {
+	C.mtl_scale_inplace(MtlBufPtr(a), C.float(s), C.int(n))
+}
+
 func (m *Metal) FusedAddInPlace(a, b *Tensor, n int) {
 	func() {
 		_cgo0 := MtlBufPtr(a)

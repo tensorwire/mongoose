@@ -2522,6 +2522,22 @@ void mtl_scale_out(void* aRef, void* bRef, void* sRef, int n) {
     dispatch_1d_finish(g_ps_scale_out, n, cmd, enc);
 }
 
+// mtl_scale_inplace multiplies a buffer by a scalar in place.
+//
+// Takes the scalar by value rather than as a buffer: callers applying an
+// architecture multiplier have a Go float, not a device allocation, and making
+// each of them build a one-element buffer is how that scalar ends up silently
+// unapplied.
+void mtl_scale_inplace(void* aRef, float s, int n) {
+    id<MTLCommandBuffer> cmd; id<MTLComputeCommandEncoder> enc;
+    dispatch_1d_setup(g_ps_scale_inplace, n, &cmd, &enc);
+    [enc setBuffer:(__bridge id<MTLBuffer>)aRef offset:0 atIndex:0];
+    id<MTLBuffer> sBuf = [g_device newBufferWithBytes:&s length:sizeof(float)
+                                              options:MTLResourceStorageModeShared];
+    [enc setBuffer:sBuf offset:0 atIndex:1];
+    dispatch_1d_finish(g_ps_scale_inplace, n, cmd, enc);
+}
+
 void mtl_relu_out(void* xRef, void* yRef, int n) {
     id<MTLCommandBuffer> cmd; id<MTLComputeCommandEncoder> enc;
     dispatch_1d_setup(g_ps_relu_out, n, &cmd, &enc);
