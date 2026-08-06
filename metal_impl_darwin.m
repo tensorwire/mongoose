@@ -5960,6 +5960,21 @@ typedef struct {
 // had to be reverted. Measure both paths before touching this.
 #define PREFILL_TILE 256
 
+// Below this batch size the dequant pass costs more than the tensor-core GEMM
+// saves, and the scalar batched kernel wins. gemm4f_bt also tiles 64x32, so a
+// very small B leaves it with no full tile of work.
+#define MVB_TC_MIN_B 32
+
+// The tensor-core MVB branch is OFF pending equivalence. Dequant-then-gemm4f_bt
+// is the right design on paper — gemm4f_bt measures 7.36 TFLOP/s against
+// q8_gemm_batch's ~750 GFLOP/s — but as wired it produces a different argmax
+// from the scalar path on real prompts, at both ragged and 64-aligned B. The
+// scalar batched path is correct and already 2.81x faster than per-token, so it
+// stays the default until the difference is understood.
+//
+// Set MONGOOSE_MVB_TENSOR_CORE=1 to enable it and work on it.
+static bool g_mvb_tensor_core = false;
+
 // Per-slot state: KV cache + scratch buffers. Slots run on separate command queues.
 #define INF_NUM_SLOTS 2
 
@@ -5979,6 +5994,11 @@ typedef struct {
     void* bQ; void* bK; void* bV; void* bAttnOut;
     void* bRmsScale; void* bRmsScale2;
     void* bGatePre; void* bUpOut; void* bFfnMid; void* bProj;
+
+    // FP32 scratch for the dequantized weight tile, sized for the largest
+    // matrix the prefill dequantizes (ffnDim x dim). Shared across layers: the
+    // dequant is re-done per GEMM, and its cost amortizes over the whole tile.
+    void* bDeqW;
 } inf_slot_t;
 
 // Inference state
@@ -6244,6 +6264,7 @@ int mtl_fused_build(int dim, int kvDim, int headDim,
         sl->bRmsScale=inf_buf(PREFILL_TILE); sl->bRmsScale2=inf_buf(PREFILL_TILE);
         sl->bGatePre=inf_buf(PREFILL_TILE*ffnDim); sl->bUpOut=inf_buf(PREFILL_TILE*ffnDim);
         sl->bFfnMid=inf_buf(PREFILL_TILE*ffnDim); sl->bProj=inf_buf(PREFILL_TILE*dim);
+        sl->bDeqW=inf_buf((size_t)ffnDim*dim);
     }
 
     // Legacy aliases → slot 0 (backward compat with mtl_fused_step)
@@ -6264,6 +6285,7 @@ int mtl_fused_build(int dim, int kvDim, int headDim,
 
     // Arch scalars default to the identity so a Llama model runs exactly as it
     // did before these existed. mtl_fused_set_arch overwrites them.
+    g_mvb_tensor_core = (getenv("MONGOOSE_MVB_TENSOR_CORE") != NULL);
     if (g_inf.embedMul == 0.0f) g_inf.embedMul = 1.0f;
     if (g_inf.residMul == 0.0f) g_inf.residMul = 1.0f;
     if (g_inf.qPreScale == 0.0f) g_inf.qPreScale = 1.0f;
@@ -6660,15 +6682,49 @@ int mtl_fused_prefill_batch(int slot, const float* hiddenIn, int B, int basePos,
 
     // Batched matvec: one threadgroup per 4 output rows, 4 simdgroups.
     // Mirrors MV() but with the batch dimension.
+    // MVB: batched matvec C[B,N] = act[B,K] @ W[N,K]^T.
+    //
+    // Three paths, fastest first:
+    //
+    //   Q8 + tensor core — dequantize the weight to FP32 once, then run
+    //   gemm4f_bt, the Metal 4 matmul2d GEMM. q8_gemm_batch is scalar FMAs at
+    //   ~750 GFLOP/s; gemm4f_bt measures 7.36 TFLOP/s on this device, so GEMM
+    //   goes from being nearly all of prefill to a fraction of it. The dequant
+    //   costs one pass over the weight, which amortizes across the whole tile —
+    //   the larger B is, the better the trade. Below a threshold B it does not
+    //   pay, and the scalar kernel wins.
+    //
+    //   This deliberately does NOT touch matmul2d's dequant loop or introduce a
+    //   new scale format: gemm4f_bt consumes plain FP32 and is already trusted
+    //   elsewhere in this codebase. The alternative — porting the training GEMM
+    //   to per-row scales — failed adversarial review with 198 defects and
+    //   measured 1.96 TFLOP/s against a required 19.2.
+    //
+    //   FP32 weights and small B fall through to the hand-rolled batched
+    //   kernels unchanged.
     #define MVB(act, w, out, cb_K, cb_N) do { \
-        if ((w).fp32) { \
+        if (g_mvb_tensor_core && !(w).fp32 && g_ps_deq_rows && g_ps_gemm4f_bt && B >= MVB_TC_MIN_B) { \
+            uint32_t _k = (uint32_t)(w).cols, _n = (uint32_t)(w).rows; \
+            id<MTLBuffer> _kb = const_buf(&_k, 4); \
+            id<MTLBuffer> _nb = const_buf(&_n, 4); \
+            PS(g_ps_deq_rows); BUF((w).data, 0); BUF((w).scales, 1); BUF(sl->bDeqW, 2); \
+            CB(_kb, 3); CB(_nb, 4); \
+            DT((int)((size_t)_n * _k / 4), 1, 1, 256, 1, 1); BARRIER(); \
+            uint32_t _m = (uint32_t)B; \
+            id<MTLBuffer> _mb = const_buf(&_m, 4); \
+            PS(g_ps_gemm4f_bt); BUF(act, 0); BUF(sl->bDeqW, 1); BUF(out, 2); \
+            CB(_mb, 3); CB(_kb, 4); CB(_nb, 5); \
+            DTG(((int)_n + 31) / 32, (B + 63) / 64, 1, \
+                (int)g_ps_gemm4f_bt.threadExecutionWidth * 4, 1, 1); \
+        } else if ((w).fp32) { \
             PS(g_ps_f32gemm_b); BUF(act, 0); BUF((w).data, 1); BUF(out, 2); \
             CB(cb_K, 3); CB(cb_N, 4); CB(cb_B, 5); \
+            DTG(((w).rows + 3) / 4, 1, 1, 256, 1, 1); \
         } else { \
             PS(g_ps_q8gemm_b); BUF(act, 0); BUF((w).data, 1); BUF((w).scales, 2); BUF(out, 3); \
             CB(cb_K, 4); CB(cb_N, 5); CB(cb_B, 6); \
+            DTG(((w).rows + 3) / 4, 1, 1, 256, 1, 1); \
         } \
-        DTG(((w).rows + 3) / 4, 1, 1, 256, 1, 1); \
     } while(0)
 
     // Granite embedding scale, applied to every row of the tile.
