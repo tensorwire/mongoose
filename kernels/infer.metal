@@ -1816,3 +1816,448 @@ kernel void arch_div(
     if (i >= p_n[0]) return;
     x[i] /= p_div[0];
 }
+
+// ============================================================================
+// Batched prefill kernels.
+//
+// Prompt tokens are all known up front, so they need not go through the model
+// one at a time. Prefill is memory-bound on weights — each token otherwise
+// re-reads the whole model — so a batched pass that reads each weight once per
+// tile is where the win comes from, not from any single-kernel optimization.
+//
+// Every kernel here takes B and handles a whole tile. The host encodes ONE
+// dispatch per operation per layer, never a loop over tokens: a host-side loop
+// re-reads the weights per token and defeats the entire purpose.
+// ============================================================================
+
+// ATTN_TILE is the KV chunk batch_causal_attn streams over; ATTN_TG is its
+// threadgroup size.
+#define ATTN_TILE 1024
+#define ATTN_TG 256
+// batch_causal_attn_q processes ATTN_QBLK query rows per threadgroup, sharing
+// the K/V tile read across them. MAX_HEAD_DIM bounds its per-thread arrays.
+#define ATTN_QBLK 8
+#define MAX_HEAD_DIM 1024
+// The batched GEMMs emit GEMM_SUB output rows per threadgroup; the host
+// dispatches (rows + GEMM_SUB - 1) / GEMM_SUB threadgroups to match.
+#define GEMM_SUB 4
+
+kernel void batch_causal_attn(
+    device const float* Q      [[buffer(0)]],   // [B, nHeads*headDim]
+    device const float* kCache [[buffer(1)]],
+    device const float* vCache [[buffer(2)]],
+    device float* out          [[buffer(3)]],   // [B, nHeads*headDim]
+    device const uint* p_kvDim   [[buffer(4)]],
+    device const uint* p_headDim [[buffer(5)]],
+    device const uint* p_nHeads  [[buffer(6)]],
+    device const uint* p_nKVH   [[buffer(7)]],
+    device const uint* p_base   [[buffer(8)]],  // absolute position of row 0
+    uint2 gid [[threadgroup_position_in_grid]], // .x = head, .y = token in tile
+    uint tid [[thread_index_in_threadgroup]])
+{
+    uint kvDim = p_kvDim[0], headDim = p_headDim[0];
+    uint nHeads = p_nHeads[0], nKVH = p_nKVH[0], basePos = p_base[0];
+    uint h = gid.x, b = gid.y;
+    if (h >= nHeads) return;
+
+    uint kvMul = nHeads / nKVH;
+    uint kvH = h / kvMul;
+    float scale = 1.0f / sqrt(float(headDim));
+    uint seqLen = basePos + b + 1;   // causal bound for this token
+
+    threadgroup float tile[ATTN_TILE];
+    threadgroup float red[ATTN_TG];
+    threadgroup float partial[ATTN_TG];
+    threadgroup float sh_m, sh_l;
+
+    const device float* qh = Q + b * nHeads * headDim + h * headDim;
+    uint kvBase = kvH * headDim;
+
+    uint dLane = tid % headDim;
+    uint pGroup = tid / headDim;
+    uint nGroups = ATTN_TG / headDim;
+    if (nGroups == 0) nGroups = 1;
+
+    float m_run = -INFINITY, l_run = 0.0f, o_run = 0.0f;
+
+    for (uint base = 0; base < seqLen; base += ATTN_TILE) {
+        uint n = min((uint)ATTN_TILE, seqLen - base);
+
+        for (uint j = tid; j < n; j += ATTN_TG) {
+            float dot = 0.0f;
+            const device float* kt = kCache + (base + j) * kvDim + kvBase;
+            for (uint d = 0; d < headDim; d++) dot += qh[d] * kt[d];
+            tile[j] = dot * scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float p = -INFINITY;
+        for (uint j = tid; j < n; j += ATTN_TG) p = max(p, tile[j]);
+        red[tid] = p;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = ATTN_TG / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) red[tid] = max(red[tid], red[tid + stride]);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (tid == 0) sh_m = red[0];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float m_tile = sh_m;
+
+        for (uint j = tid; j < n; j += ATTN_TG) tile[j] = exp(tile[j] - m_tile);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float sacc = 0.0f;
+        for (uint j = tid; j < n; j += ATTN_TG) sacc += tile[j];
+        red[tid] = sacc;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = ATTN_TG / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) red[tid] += red[tid + stride];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (tid == 0) sh_l = red[0];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float l_tile = sh_l;
+
+        float o_tile = 0.0f;
+        if (dLane < headDim) {
+            for (uint j = pGroup; j < n; j += nGroups)
+                o_tile += tile[j] * vCache[(base + j) * kvDim + kvBase + dLane];
+        }
+        partial[tid] = o_tile;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tid < headDim) {
+            float acc = 0.0f;
+            for (uint g = 0; g < nGroups; g++) acc += partial[g * headDim + tid];
+            o_tile = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float m_new = max(m_run, m_tile);
+        float c_run = exp(m_run - m_new);
+        float c_tile = exp(m_tile - m_new);
+        l_run = l_run * c_run + l_tile * c_tile;
+        o_run = o_run * c_run + o_tile * c_tile;
+        m_run = m_new;
+    }
+
+    if (tid < headDim)
+        out[b * nHeads * headDim + h * headDim + tid] = (l_run > 0.0f) ? (o_run / l_run) : 0.0f;
+}
+
+kernel void batch_causal_attn_q(
+    device const float* Q      [[buffer(0)]],   // [B, nHeads*headDim]
+    device const float* kCache [[buffer(1)]],
+    device const float* vCache [[buffer(2)]],
+    device float* out          [[buffer(3)]],   // [B, nHeads*headDim]
+    constant uint& kvDim       [[buffer(4)]],
+    constant uint& headDim     [[buffer(5)]],
+    constant uint& nHeads      [[buffer(6)]],
+    constant uint& nKVH        [[buffer(7)]],
+    constant uint& basePos     [[buffer(8)]],
+    constant uint& B           [[buffer(9)]],
+    uint2 gid [[threadgroup_position_in_grid]], // .x = head, .y = query block
+    uint tid [[thread_index_in_threadgroup]])
+{
+    uint h = gid.x;
+    uint q0 = gid.y * ATTN_QBLK;              // first query row of this block
+    if (h >= nHeads || q0 >= B) return;       // uniform across the threadgroup
+
+    uint kvMul = nHeads / nKVH;
+    uint kvH = h / kvMul;
+    uint kvBase = kvH * headDim;
+    float scale = 1.0f / sqrt(float(headDim));
+
+    uint nq = min((uint)ATTN_QBLK, B - q0);   // queries actually present
+    uint dLane = tid % headDim;
+    uint qi    = tid / headDim;               // which query this thread serves
+    uint nqThreads = ATTN_QBLK;               // query slots covered by the block
+
+    // Staged query block: [ATTN_QBLK][headDim]. Read once from device memory,
+    // then re-read from threadgroup memory for every score.
+    threadgroup float qs[ATTN_QBLK * MAX_HEAD_DIM];
+    threadgroup float sc[ATTN_QBLK * ATTN_TILE];   // scores for the current tile
+    threadgroup float sh_m[ATTN_QBLK], sh_l[ATTN_QBLK];
+
+    for (uint i = tid; i < nq * headDim; i += nqThreads * headDim) {
+        uint qq = i / headDim, dd = i % headDim;
+        qs[qq * headDim + dd] = Q[(q0 + qq) * nHeads * headDim + h * headDim + dd];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    bool vec4 = ((headDim & 3u) == 0u) && ((kvBase & 3u) == 0u) && ((kvDim & 3u) == 0u);
+    uint headDim4 = headDim / 4;
+
+    // Per-query online-softmax running state. Each thread owns lane dLane of
+    // query qi's output accumulator.
+    float m_run = -INFINITY, l_run = 0.0f, o_run = 0.0f;
+
+    // The block's causal bound is that of its LAST query; earlier queries mask
+    // off the tail themselves.
+    uint seqLenMax = basePos + q0 + nq;
+
+    for (uint base = 0; base < seqLenMax; base += ATTN_TILE) {
+        uint n = min((uint)ATTN_TILE, seqLenMax - base);
+
+        // Scores for every (query, key) in this tile. Threads cooperate over the
+        // whole [nq, n] block; each K row loaded here serves all nq queries,
+        // which is the reuse this kernel exists for.
+        for (uint idx = tid; idx < nq * n; idx += nqThreads * headDim) {
+            uint qq = idx / n, j = idx % n;
+            uint pos = base + j;
+            float dot;
+            if (pos > basePos + q0 + qq) {
+                dot = -INFINITY;                 // causal mask for this query
+            } else {
+                dot = 0.0f;
+                const device float* kt = kCache + pos * kvDim + kvBase;
+                threadgroup const float* qv = qs + qq * headDim;
+                if (vec4) {
+                    const device float4* kt4 = (const device float4*)kt;
+                    threadgroup const float4* qv4 = (threadgroup const float4*)qv;
+                    for (uint d = 0; d < headDim4; d++) {
+                        float4 kk = kt4[d], qq4 = qv4[d];
+                        dot += kk.x*qq4.x + kk.y*qq4.y + kk.z*qq4.z + kk.w*qq4.w;
+                    }
+                } else {
+                    for (uint d = 0; d < headDim; d++) dot += qv[d] * kt[d];
+                }
+                dot *= scale;
+            }
+            sc[qq * ATTN_TILE + j] = dot;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Per-query max and sum. One thread per query does the serial reduction
+        // over this tile — n is bounded by ATTN_TILE and there are only nq of
+        // them, so this is short next to the score pass above.
+        if (tid < nq) {
+            float m = -INFINITY;
+            threadgroup float* row = sc + tid * ATTN_TILE;
+            for (uint j = 0; j < n; j++) m = max(m, row[j]);
+            float l = 0.0f;
+            for (uint j = 0; j < n; j++) {
+                float e = (m == -INFINITY) ? 0.0f : exp(row[j] - m);
+                row[j] = e;
+                l += e;
+            }
+            sh_m[tid] = m;
+            sh_l[tid] = l;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Value pass: thread (qi, dLane) accumulates output lane dLane of query
+        // qi over this tile.
+        if (qi < nq && dLane < headDim) {
+            float o_tile = 0.0f;
+            threadgroup const float* row = sc + qi * ATTN_TILE;
+            for (uint j = 0; j < n; j++)
+                o_tile += row[j] * vCache[(base + j) * kvDim + kvBase + dLane];
+
+            float m_tile = sh_m[qi], l_tile = sh_l[qi];
+            float m_new = max(m_run, m_tile);
+            float c_run  = (m_run  == -INFINITY) ? 0.0f : exp(m_run  - m_new);
+            float c_tile = (m_tile == -INFINITY) ? 0.0f : exp(m_tile - m_new);
+            l_run = l_run * c_run + l_tile * c_tile;
+            o_run = o_run * c_run + o_tile * c_tile;
+            m_run = m_new;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (qi < nq && dLane < headDim)
+        out[(q0 + qi) * nHeads * headDim + h * headDim + dLane] =
+            (l_run > 0.0f) ? (o_run / l_run) : 0.0f;
+}
+
+kernel void q8_gemm_batch(
+    device const float* act    [[buffer(0)]],   // [B, K]
+    device const char4* weight [[buffer(1)]],   // [N, K] row-major, Q8
+    device const float* scales [[buffer(2)]],   // [N]
+    device float* out          [[buffer(3)]],   // [B, N]
+    device const uint* p_K     [[buffer(4)]],
+    device const uint* p_N     [[buffer(5)]],
+    device const uint* p_B     [[buffer(6)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]])
+{
+    uint K = p_K[0], N = p_N[0], B = p_B[0];
+    // Same tiling as q8_matvec: 4 rows per threadgroup, 2 simdgroups (64 lanes)
+    // per row, so the K loop is short and every lane stays busy.
+    uint row = tgid * 4 + sgitg / 2;
+    if (row >= N) return;
+    ushort half_sg = sgitg % 2;
+    uint tid_in_row = half_sg * 32 + tiisg;
+
+    uint K4 = K / 4;
+    device const char4* wRow = weight + row * K4;
+    float s = scales[row];
+
+    threadgroup float shmem[8];
+
+    for (uint b0 = 0; b0 < B; b0 += GEMM_SUB) {
+        uint nb = min((uint)GEMM_SUB, B - b0);
+
+        float acc[GEMM_SUB];
+        for (uint j = 0; j < GEMM_SUB; j++) acc[j] = 0.0f;
+
+        // One weight load feeds nb tokens — the reuse this kernel exists for.
+        for (uint k4 = tid_in_row; k4 < K4; k4 += 64) {
+            char4 w = wRow[k4];
+            for (uint j = 0; j < nb; j++) {
+                float4 a = ((device const float4*)(act + (b0 + j) * K))[k4];
+                acc[j] += a.x * w.x + a.y * w.y + a.z * w.z + a.w * w.w;
+            }
+        }
+
+        // Reduce each token's partial across the row's two simdgroups.
+        for (uint j = 0; j < nb; j++) {
+            float v = simd_sum(acc[j]) * s;
+            if (tiisg == 0) shmem[sgitg] = v;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (half_sg == 0 && tiisg == 0)
+                out[(b0 + j) * N + row] = shmem[sgitg] + shmem[sgitg + 1];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+}
+
+kernel void f32_gemm_batch(
+    device const float* act    [[buffer(0)]],   // [B, K]
+    device const float* weight [[buffer(1)]],   // [N, K] row-major
+    device float* out          [[buffer(2)]],   // [B, N]
+    device const uint* p_K     [[buffer(3)]],
+    device const uint* p_N     [[buffer(4)]],
+    device const uint* p_B     [[buffer(5)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]])
+{
+    uint K = p_K[0], N = p_N[0], B = p_B[0];
+    uint row = tgid * 4 + sgitg / 2;
+    if (row >= N) return;
+    ushort half_sg = sgitg % 2;
+    uint tid_in_row = half_sg * 32 + tiisg;
+
+    uint K4 = K / 4;
+    device const float4* wRow = (device const float4*)(weight + row * K);
+
+    threadgroup float shmem[8];
+
+    for (uint b0 = 0; b0 < B; b0 += GEMM_SUB) {
+        uint nb = min((uint)GEMM_SUB, B - b0);
+
+        float acc[GEMM_SUB];
+        for (uint j = 0; j < GEMM_SUB; j++) acc[j] = 0.0f;
+
+        for (uint k4 = tid_in_row; k4 < K4; k4 += 64) {
+            float4 w = wRow[k4];
+            for (uint j = 0; j < nb; j++) {
+                float4 a = ((device const float4*)(act + (b0 + j) * K))[k4];
+                acc[j] += a.x * w.x + a.y * w.y + a.z * w.z + a.w * w.w;
+            }
+        }
+
+        for (uint j = 0; j < nb; j++) {
+            float v = simd_sum(acc[j]);
+            if (tiisg == 0) shmem[sgitg] = v;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (half_sg == 0 && tiisg == 0)
+                out[(b0 + j) * N + row] = shmem[sgitg] + shmem[sgitg + 1];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+}
+
+kernel void rope_rotate_half_batch(
+    device float* x          [[buffer(0)]],   // [B, nHeads*headDim]
+    device const uint* p_hd  [[buffer(1)]],
+    device const uint* p_nh  [[buffer(2)]],
+    device const uint* p_base [[buffer(3)]],  // absolute position of row 0
+    device const float* p_th [[buffer(4)]],
+    device const uint* p_B   [[buffer(5)]],
+    uint pid [[thread_position_in_grid]])
+{
+    uint headDim = p_hd[0], nHeads = p_nh[0], basePos = p_base[0], B = p_B[0];
+    float theta = p_th[0];
+    uint halfDim = headDim / 2;
+    uint perRow = nHeads * halfDim;
+    uint b = pid / perRow;
+    uint rem = pid % perRow;
+    uint h = rem / halfDim;
+    uint j = rem % halfDim;
+    if (b >= B || h >= nHeads) return;
+
+    uint pos = basePos + b;
+    float freq = 1.0f / pow(theta, float(2*j) / float(headDim));
+    float angle = float(pos) * freq;
+    float cosA = cos(angle), sinA = sin(angle);
+    uint base = b * nHeads * headDim + h * headDim;
+    float x0 = x[base + j], x1 = x[base + j + halfDim];
+    x[base + j]           = x0 * cosA - x1 * sinA;
+    x[base + j + halfDim] = x0 * sinA + x1 * cosA;
+}
+
+kernel void kv_write_batch(
+    device const float* K      [[buffer(0)]],   // [B, kvDim]
+    device const float* V      [[buffer(1)]],
+    device float* kCache       [[buffer(2)]],
+    device float* vCache       [[buffer(3)]],
+    device const uint* p_kvDim [[buffer(4)]],
+    device const uint* p_base  [[buffer(5)]],
+    device const uint* p_B     [[buffer(6)]],
+    uint pid [[thread_position_in_grid]])
+{
+    uint kvDim = p_kvDim[0], basePos = p_base[0], B = p_B[0];
+    uint b = pid / kvDim, i = pid % kvDim;
+    if (b >= B) return;
+    uint dst = (basePos + b) * kvDim + i;
+    kCache[dst] = K[b * kvDim + i];
+    vCache[dst] = V[b * kvDim + i];
+}
+
+kernel void bias_add_batch(
+    device float* x            [[buffer(0)]],
+    device const float* bias   [[buffer(1)]],
+    device const uint* p_n     [[buffer(2)]],
+    device const uint* p_B     [[buffer(3)]],
+    uint pid [[thread_position_in_grid]])
+{
+    uint n = p_n[0], B = p_B[0];
+    uint b = pid / n, i = pid % n;
+    if (b >= B) return;
+    x[b * n + i] += bias[i];
+}
+
+kernel void q8_dequant_rows(
+    device const char4* w      [[buffer(0)]],   // [N, K] int8, row-major
+    device const float* scales [[buffer(1)]],   // [N] per-row
+    device float4* out         [[buffer(2)]],   // [N, K] fp32
+    device const uint* p_K     [[buffer(3)]],
+    device const uint* p_N     [[buffer(4)]],
+    uint pid [[thread_position_in_grid]])
+{
+    uint K = p_K[0], N = p_N[0];
+    uint K4 = K / 4;
+    uint total = N * K4;
+    if (pid >= total) return;
+    uint row = pid / K4;
+    float s = scales[row];
+    char4 v = w[pid];
+    out[pid] = float4(float(v.x), float(v.y), float(v.z), float(v.w)) * s;
+}
+
+kernel void zero_rows(
+    device float* x        [[buffer(0)]],
+    device const uint* p_n [[buffer(1)]],   // elements per row
+    device const uint* p_r0 [[buffer(2)]],  // first row to zero
+    device const uint* p_r1 [[buffer(3)]],  // one past last row to zero
+    uint pid [[thread_position_in_grid]])
+{
+    uint n = p_n[0], r0 = p_r0[0], r1 = p_r1[0];
+    if (r1 <= r0) return;
+    uint total = (r1 - r0) * n;
+    if (pid >= total) return;
+    x[r0 * n + pid] = 0.0f;
+}

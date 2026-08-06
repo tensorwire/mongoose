@@ -5914,6 +5914,18 @@ static id<MTLBuffer> g_inf_arch_log_buf = nil;
 static id<MTLComputePipelineState> g_ps_arch_scale = nil;
 static id<MTLComputePipelineState> g_ps_arch_div = nil;
 
+// Batched-prefill pipelines. Optional: a metallib predating them still runs,
+// just on the per-token path.
+static id<MTLComputePipelineState> g_ps_q8gemm_b = nil;
+static id<MTLComputePipelineState> g_ps_f32gemm_b = nil;
+static id<MTLComputePipelineState> g_ps_rope_b = nil;
+static id<MTLComputePipelineState> g_ps_battn = nil;
+static id<MTLComputePipelineState> g_ps_battn_q = nil;
+static id<MTLComputePipelineState> g_ps_kvwrite_b = nil;
+static id<MTLComputePipelineState> g_ps_bias_b = nil;
+static id<MTLComputePipelineState> g_ps_deq_rows = nil;
+static id<MTLComputePipelineState> g_ps_zero_rows = nil;
+
 static id<MTLComputePipelineState> g_ps_rope_rh = nil;  // rotate-half RoPE
 static id<MTLComputePipelineState> g_ps_dec_attn = nil;  // decode attention
 static id<MTLComputePipelineState> g_ps_q8mv = nil;      // Q8 fused dequant matvec
@@ -5929,6 +5941,25 @@ typedef struct {
     bool fp32;    // true = FP32 (Metal 4 path)
 } inf_weight_t;
 
+// PREFILL_TILE bounds how many prompt tokens mtl_fused_prefill_batch accepts per
+// call. Callers must chunk longer prompts.
+//
+// 256 is not a tunable — it is the only value measured to be sane. It was swept
+// by rebuilding infer.metallib at each value under an otherwise identical
+// binary, on the same 2738-token prompt and 178-token generation:
+//
+//     tile   decode        cold prefill
+//     256    74.3 tok/s    4.16 s     <- shipped
+//     320    75.7 tok/s    (not measured)
+//     384    85.9 tok/s    56.8 s     <- prefill collapses
+//     512     3.5 tok/s    3.83 s     <- decode collapses (20x regression)
+//
+// Both 384 and 512 fall off a cliff, in opposite directions, because this sizes
+// per-lane register arrays in kernels that DECODE also uses. A prefill-only
+// benchmark cannot see the decode side; that is how 512 shipped once before and
+// had to be reverted. Measure both paths before touching this.
+#define PREFILL_TILE 256
+
 // Per-slot state: KV cache + scratch buffers. Slots run on separate command queues.
 #define INF_NUM_SLOTS 2
 
@@ -5937,11 +5968,30 @@ typedef struct {
     void* hidden; void* normed; void* Q; void* K; void* V; void* attnOut;
     void* rmsScale; void* normed2; void* rmsScale2;
     void* gatePre; void* upOut; void* ffnMid; void* proj; void* logits;
+
+    // Batched-prefill scratch: the same activations, but [B, ...] instead of
+    // [1, ...]. They exist separately from the single-token buffers above
+    // because prefill and decode can be in flight on the same slot, and because
+    // reusing the single-token buffers forces a per-token host memcpy — which
+    // does not work, since everything encoded into a command buffer executes at
+    // COMMIT time and every token would see the last memcpy's contents.
+    void* bHidden; void* bNormed; void* bNormed2;
+    void* bQ; void* bK; void* bV; void* bAttnOut;
+    void* bRmsScale; void* bRmsScale2;
+    void* bGatePre; void* bUpOut; void* bFfnMid; void* bProj;
 } inf_slot_t;
 
 // Inference state
 static struct {
     int dim, kvDim, headDim, nHeads, nKVHeads, ffnDim, vocabSize, nLayers, maxSeq;
+
+    // Architecture scalars, in the form the batched prefill wants them: the
+    // value (for a cheap "is this the identity?" test) plus a resident constant
+    // buffer to hand to a kernel. 1.0f means "no-op", so a Llama model skips
+    // every one of these dispatches.
+    float embedMul, residMul, qPreScale, logitsDiv;
+    id<MTLBuffer> cb_embedMul, cb_residMul, cb_qPreScale, cb_logitsMul;
+    id<MTLBuffer> cb_base, cb_B;
     bool built, metal4;
     // Per-layer weights (shared across slots — read-only)
     void** norm1; void** norm2;
@@ -6079,6 +6129,30 @@ int mtl_fused_build(int dim, int kvDim, int headDim,
     if (!lib) { NSLog(@"infer kernel load failed: %@", err); return -1; }
     g_ps_rope_rh = [g_device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rope_rotate_half"] error:&err];
     g_ps_dec_attn = [g_device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"decode_attn"] error:&err];
+    #define BPS(var, name) do { \
+        id<MTLFunction> _f = [lib newFunctionWithName:@name]; \
+        if (_f) var = [g_device newComputePipelineStateWithFunction:_f error:&err]; \
+    } while (0)
+    BPS(g_ps_q8gemm_b,  "q8_gemm_batch");
+    BPS(g_ps_f32gemm_b, "f32_gemm_batch");
+    BPS(g_ps_rope_b,    "rope_rotate_half_batch");
+    BPS(g_ps_battn,     "batch_causal_attn");
+    BPS(g_ps_battn_q,   "batch_causal_attn_q");
+    BPS(g_ps_kvwrite_b, "kv_write_batch");
+    BPS(g_ps_bias_b,    "bias_add_batch");
+    BPS(g_ps_deq_rows,  "q8_dequant_rows");
+    BPS(g_ps_zero_rows, "zero_rows");
+    #undef BPS
+    // Name the missing kernel rather than letting a nil pipeline reach
+    // setComputePipelineState, which aborts the process with "computeFunction
+    // must not be nil" and no indication of which one.
+    if (!g_ps_q8gemm_b || !g_ps_f32gemm_b || !g_ps_rope_b || !g_ps_battn ||
+        !g_ps_kvwrite_b || !g_ps_bias_b) {
+        NSLog(@"mongoose: batched prefill unavailable (q8gemm=%d f32gemm=%d rope=%d attn=%d kvwrite=%d bias=%d) — using per-token path",
+              g_ps_q8gemm_b!=nil, g_ps_f32gemm_b!=nil, g_ps_rope_b!=nil,
+              g_ps_battn!=nil, g_ps_kvwrite_b!=nil, g_ps_bias_b!=nil);
+    }
+
     { id<MTLFunction> f1 = [lib newFunctionWithName:@"arch_scale"];
       id<MTLFunction> f2 = [lib newFunctionWithName:@"arch_div"];
       if (f1) g_ps_arch_scale = [g_device newComputePipelineStateWithFunction:f1 error:&err];
@@ -6157,6 +6231,19 @@ int mtl_fused_build(int dim, int kvDim, int headDim,
         sl->normed2=inf_buf(dim); sl->gatePre=inf_buf(ffnDim);
         sl->upOut=inf_buf(ffnDim); sl->ffnMid=inf_buf(ffnDim);
         sl->proj=inf_buf(dim); sl->logits=inf_buf(vocabSize);
+
+        // Batched-prefill scratch, sized for a full tile. This is the memory
+        // cost of batching: PREFILL_TILE x the per-token activations, which for
+        // a 3B model at tile 256 is on the order of a few hundred MB — bought
+        // back many times over by reading each weight once per tile instead of
+        // once per token.
+        sl->bHidden=inf_buf(PREFILL_TILE*dim); sl->bNormed=inf_buf(PREFILL_TILE*dim);
+        sl->bNormed2=inf_buf(PREFILL_TILE*dim);
+        sl->bQ=inf_buf(PREFILL_TILE*dim); sl->bK=inf_buf(PREFILL_TILE*kvDim);
+        sl->bV=inf_buf(PREFILL_TILE*kvDim); sl->bAttnOut=inf_buf(PREFILL_TILE*dim);
+        sl->bRmsScale=inf_buf(PREFILL_TILE); sl->bRmsScale2=inf_buf(PREFILL_TILE);
+        sl->bGatePre=inf_buf(PREFILL_TILE*ffnDim); sl->bUpOut=inf_buf(PREFILL_TILE*ffnDim);
+        sl->bFfnMid=inf_buf(PREFILL_TILE*ffnDim); sl->bProj=inf_buf(PREFILL_TILE*dim);
     }
 
     // Legacy aliases → slot 0 (backward compat with mtl_fused_step)
@@ -6174,6 +6261,20 @@ int mtl_fused_build(int dim, int kvDim, int headDim,
     g_inf.cb_headDim=inf_const(headDim); g_inf.cb_nHeads=inf_const(nHeads);
     g_inf.cb_nKVHeads=inf_const(nKVHeads); g_inf.cb_ffnDim=inf_const(ffnDim);
     g_inf.cb_eps=inf_constf(rmsEps); g_inf.cb_theta=inf_constf(ropeTheta);
+
+    // Arch scalars default to the identity so a Llama model runs exactly as it
+    // did before these existed. mtl_fused_set_arch overwrites them.
+    if (g_inf.embedMul == 0.0f) g_inf.embedMul = 1.0f;
+    if (g_inf.residMul == 0.0f) g_inf.residMul = 1.0f;
+    if (g_inf.qPreScale == 0.0f) g_inf.qPreScale = 1.0f;
+    if (g_inf.logitsDiv == 0.0f) g_inf.logitsDiv = 1.0f;
+    g_inf.cb_embedMul = inf_constf(g_inf.embedMul);
+    g_inf.cb_residMul = inf_constf(g_inf.residMul);
+    g_inf.cb_qPreScale = inf_constf(g_inf.qPreScale);
+    g_inf.cb_logitsMul = inf_constf(1.0f / g_inf.logitsDiv);
+    { uint32_t z = 0;
+      g_inf.cb_base = [g_device newBufferWithBytes:&z length:4 options:MTLResourceStorageModeShared];
+      g_inf.cb_B    = [g_device newBufferWithBytes:&z length:4 options:MTLResourceStorageModeShared]; }
     g_inf.cb_M1=inf_const(1); g_inf.cb_Kdim=inf_const(dim); g_inf.cb_Nkvdim=inf_const(kvDim);
     g_inf.cb_Nffn=inf_const(ffnDim); g_inf.cb_Nvocab=inf_const(vocabSize);
     g_inf.cb_pos=inf_const(0); g_inf.cb_seq=inf_const(0);
@@ -6235,6 +6336,16 @@ int mtl_fused_set_weight(int idx, const float* data, int nFloats) {
     } else { \
         PS(g_ps_q8mv); BUF(act, 0); BUF((w).data, 1); BUF((w).scales, 2); BUF(out, 3); CB(cb_K, 4); CB(cb_N, 5); \
         DTG(((w).rows + 3) / 4, 1, 1, 256, 1, 1); \
+    } \
+} while(0)
+
+// SCALE dispatches an in-place multiply when `cond` holds. The condition is
+// evaluated at encode time, so an identity scalar costs nothing at all — not
+// even a dispatch.
+#define SCALE(buf, cb, n, cond) do { \
+    if (cond) { \
+        PS(g_ps_scale_inplace); BUF(buf, 0); CB(cb, 1); \
+        DT((n),1,1, 256,1,1); BARRIER(); \
     } \
 } while(0)
 
@@ -6502,24 +6613,6 @@ int mtl_fused_partial_step(const float* hiddenIn, int pos,
     return mtl_fused_partial_step_slot(0, hiddenIn, pos, layerStart, layerEnd, hiddenOut, logitsOut);
 }
 
-// PREFILL_TILE bounds how many prompt tokens mtl_fused_prefill_batch accepts per
-// call. Callers must chunk longer prompts.
-//
-// 256 is not a tunable — it is the only value measured to be sane. It was swept
-// by rebuilding infer.metallib at each value under an otherwise identical
-// binary, on the same 2738-token prompt and 178-token generation:
-//
-//     tile   decode        cold prefill
-//     256    74.3 tok/s    4.16 s     <- shipped
-//     320    75.7 tok/s    (not measured)
-//     384    85.9 tok/s    56.8 s     <- prefill collapses
-//     512     3.5 tok/s    3.83 s     <- decode collapses (20x regression)
-//
-// Both 384 and 512 fall off a cliff, in opposite directions, because this sizes
-// per-lane register arrays in kernels that DECODE also uses. A prefill-only
-// benchmark cannot see the decode side; that is how 512 shipped once before and
-// had to be reverted. Measure both paths before touching this.
-#define PREFILL_TILE 256
 
 int mtl_fused_prefill_tile(void) { return PREFILL_TILE; }
 
@@ -6543,145 +6636,148 @@ int mtl_fused_prefill_tile(void) { return PREFILL_TILE; }
 int mtl_fused_prefill_batch(int slot, const float* hiddenIn, int B, int basePos,
                             float* logitsOut) {
     if (!g_inf.built || slot < 0 || slot >= INF_NUM_SLOTS) return -1;
-    if (B <= 0 || !hiddenIn) return -1;
-    if (B > PREFILL_TILE) return -1;
-
+    if (B <= 0 || B > PREFILL_TILE) return -1;
+    if (!g_ps_q8gemm_b || !g_ps_battn || !g_ps_rope_b || !g_ps_kvwrite_b || !g_ps_bias_b) return -1;
     inf_slot_t* sl = &g_inf.slots[slot];
     id<MTLCommandQueue> queue = (slot == 0) ? g_queue : g_queue2;
 
     int dim=g_inf.dim, kvDim=g_inf.kvDim, headDim=g_inf.headDim;
     int nHeads=g_inf.nHeads, nKVHeads=g_inf.nKVHeads, ffnDim=g_inf.ffnDim;
     int nLayers=g_inf.nLayers, vocabSize=g_inf.vocabSize;
-
     if (basePos + B > g_inf.maxSeq) return -1;
 
-    NSUInteger tpg_norm = (dim / 32) * 32; if (tpg_norm == 0) tpg_norm = 32;
-    if (tpg_norm > g_ps_rmsnorm_save.maxTotalThreadsPerThreadgroup)
-        tpg_norm = g_ps_rmsnorm_save.maxTotalThreadsPerThreadgroup;
-
-    // Per-token scalar buffers are allocated once for the whole batch: writing
-    // g_inf.cb_pos between dispatches would not work, because all dispatches in
-    // an encoder observe the value at COMMIT time, not at encode time. Each
-    // token therefore needs its own position/seqLen buffer.
-    id<MTLBuffer> posBufs[PREFILL_TILE];
-    id<MTLBuffer> seqBufs[PREFILL_TILE];
-    for (int b = 0; b < B; b++) {
-        uint32_t p = (uint32_t)(basePos + b);
-        uint32_t s = p + 1u;
-        posBufs[b] = [g_device newBufferWithBytes:&p length:sizeof(uint32_t)
-                                          options:MTLResourceStorageModeShared];
-        seqBufs[b] = [g_device newBufferWithBytes:&s length:sizeof(uint32_t)
-                                          options:MTLResourceStorageModeShared];
-    }
-
-    // Upload all B embeddings ONCE, before encoding.
-    //
-    // A memcpy into sl->hidden between dispatches does not work: everything
-    // encoded into a command buffer executes at COMMIT time, so all B tokens
-    // would observe whatever the final memcpy left behind — the last token's
-    // embedding, repeated B times. The symptom is degenerate repetitive output
-    // rather than a crash. Each token instead copies its own row on the GPU,
-    // ordered correctly by the encoder.
-    id<MTLBuffer> embBuf = [g_device newBufferWithBytes:hiddenIn
-                                                 length:(size_t)B * dim * sizeof(float)
-                                                options:MTLResourceStorageModeShared];
+    memcpy(((__bridge id<MTLBuffer>)sl->bHidden).contents, hiddenIn, (size_t)B * dim * sizeof(float));
+    ((uint32_t*)g_inf.cb_base.contents)[0] = (uint32_t)basePos;
+    ((uint32_t*)g_inf.cb_B.contents)[0]    = (uint32_t)B;
+    id<MTLBuffer> cb_base = g_inf.cb_base;
+    id<MTLBuffer> cb_B = g_inf.cb_B;
 
     id<MTLCommandBuffer> cmd = [queue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
 
-    for (int b = 0; b < B; b++) {
-        int pos = basePos + b;
-        id<MTLBuffer> cb_pos = posBufs[b];
-        id<MTLBuffer> cb_seq = seqBufs[b];
-        bool lastTok = (b == B - 1);
+    NSUInteger tpg_norm = (dim / 32) * 32; if (tpg_norm == 0) tpg_norm = 32;
+    if (tpg_norm > g_ps_rmsnorm_save.maxTotalThreadsPerThreadgroup) tpg_norm = g_ps_rmsnorm_save.maxTotalThreadsPerThreadgroup;
 
+    // Batched matvec: one threadgroup per 4 output rows, 4 simdgroups.
+    // Mirrors MV() but with the batch dimension.
+    #define MVB(act, w, out, cb_K, cb_N) do { \
+        if ((w).fp32) { \
+            PS(g_ps_f32gemm_b); BUF(act, 0); BUF((w).data, 1); BUF(out, 2); \
+            CB(cb_K, 3); CB(cb_N, 4); CB(cb_B, 5); \
+        } else { \
+            PS(g_ps_q8gemm_b); BUF(act, 0); BUF((w).data, 1); BUF((w).scales, 2); BUF(out, 3); \
+            CB(cb_K, 4); CB(cb_N, 5); CB(cb_B, 6); \
+        } \
+        DTG(((w).rows + 3) / 4, 1, 1, 256, 1, 1); \
+    } while(0)
+
+    // Granite embedding scale, applied to every row of the tile.
+    if (g_inf.embedMul != 1.0f) {
+        PS(g_ps_scale_inplace); BUF(sl->bHidden, 0); CB(g_inf.cb_embedMul, 1);
+        DT(B*dim,1,1, 256,1,1); BARRIER();
+    }
+
+    for (int l = 0; l < nLayers; l++) {
+        PS(g_ps_copy_mem); BUF(sl->bHidden, 0); BUF(sl->bNormed, 1);
+        DT(B*dim,1,1, 256,1,1); BARRIER();
+
+        // rmsnorm_save already indexes rows by threadgroup, so B threadgroups
+        // normalize the whole tile.
+        PS(g_ps_rmsnorm_save); BUF(sl->bNormed, 0); BUF(g_inf.norm1[l], 1); BUF(sl->bRmsScale, 2);
+        CB(g_inf.cb_dim, 3); CB(g_inf.cb_eps, 4); DTG(B,1,1, tpg_norm,1,1); BARRIER();
+
+        MVB(sl->bNormed, g_inf.wq[l], sl->bQ, g_inf.cb_Kdim, g_inf.cb_dim);
+        MVB(sl->bNormed, g_inf.wk[l], sl->bK, g_inf.cb_Kdim, g_inf.cb_Nkvdim);
+        MVB(sl->bNormed, g_inf.wv[l], sl->bV, g_inf.cb_Kdim, g_inf.cb_Nkvdim);
+        BARRIER();
+
+        PS(g_ps_bias_b);
+        BUF(sl->bQ, 0); BUF(g_inf.bq[l], 1); CB(g_inf.cb_dim, 2); CB(cb_B, 3); DT(B*dim,1,1, 256,1,1);
+        BUF(sl->bK, 0); BUF(g_inf.bk[l], 1); CB(g_inf.cb_kvDim, 2); CB(cb_B, 3); DT(B*kvDim,1,1, 256,1,1);
+        BUF(sl->bV, 0); BUF(g_inf.bv[l], 1); CB(g_inf.cb_kvDim, 2); CB(cb_B, 3); DT(B*kvDim,1,1, 256,1,1);
+        BARRIER();
+
+        // RoPE with per-row absolute positions.
+        PS(g_ps_rope_b);
+        BUF(sl->bQ, 0); CB(g_inf.cb_headDim, 1); CB(g_inf.cb_nHeads, 2); CB(cb_base, 3);
+        CB(g_inf.cb_theta, 4); CB(cb_B, 5);
+        DT(B*nHeads*(headDim/2),1,1, 256,1,1);
+        BUF(sl->bK, 0); CB(g_inf.cb_headDim, 1); CB(g_inf.cb_nKVHeads, 2); CB(cb_base, 3);
+        CB(g_inf.cb_theta, 4); CB(cb_B, 5);
+        DT(B*nKVHeads*(headDim/2),1,1, 256,1,1);
+        BARRIER();
+
+        // Publish this tile's K/V before attending, so tokens inside the tile
+        // can attend to earlier tokens of the same tile.
+        PS(g_ps_kvwrite_b);
+        BUF(sl->bK, 0); BUF(sl->bV, 1); BUF(sl->kCache[l], 2); BUF(sl->vCache[l], 3);
+        CB(g_inf.cb_kvDim, 4); CB(cb_base, 5); CB(cb_B, 6);
+        DT(B*kvDim,1,1, 256,1,1); BARRIER();
+
+        // Granite attention scale via Q pre-scale (K is cached unscaled).
+        if (g_inf.qPreScale != 1.0f) {
+            PS(g_ps_scale_inplace); BUF(sl->bQ, 0); CB(g_inf.cb_qPreScale, 1);
+            DT(B*dim,1,1, 256,1,1); BARRIER();
+        }
+
+        PS(g_ps_battn);
+        BUF(sl->bQ, 0); BUF(sl->kCache[l], 1); BUF(sl->vCache[l], 2); BUF(sl->bAttnOut, 3);
+        CB(g_inf.cb_kvDim, 4); CB(g_inf.cb_headDim, 5); CB(g_inf.cb_nHeads, 6);
+        CB(g_inf.cb_nKVHeads, 7); CB(cb_base, 8);
+        DTG(nHeads,B,1, 256,1,1); BARRIER();
+
+        MVB(sl->bAttnOut, g_inf.wo[l], sl->bProj, g_inf.cb_Kdim, g_inf.cb_dim); BARRIER();
+        if (g_inf.residMul != 1.0f) {
+            PS(g_ps_scale_inplace); BUF(sl->bProj, 0); CB(g_inf.cb_residMul, 1);
+            DT(B*dim,1,1, 256,1,1); BARRIER();
+        }
+        PS(g_ps_add_inplace); BUF(sl->bHidden, 0); BUF(sl->bProj, 1);
+        DT(B*dim,1,1, 256,1,1); BARRIER();
+
+        PS(g_ps_copy_mem); BUF(sl->bHidden, 0); BUF(sl->bNormed2, 1);
+        DT(B*dim,1,1, 256,1,1); BARRIER();
+        PS(g_ps_rmsnorm_save); BUF(sl->bNormed2, 0); BUF(g_inf.norm2[l], 1); BUF(sl->bRmsScale2, 2);
+        CB(g_inf.cb_dim, 3); CB(g_inf.cb_eps, 4); DTG(B,1,1, tpg_norm,1,1); BARRIER();
+
+        MVB(sl->bNormed2, g_inf.wgate[l], sl->bGatePre, g_inf.cb_Kdim, g_inf.cb_Nffn);
+        MVB(sl->bNormed2, g_inf.wup[l], sl->bUpOut, g_inf.cb_Kdim, g_inf.cb_Nffn);
+        BARRIER();
+        PS(g_ps_silu_gate_mul); BUF(sl->bGatePre, 0); BUF(sl->bUpOut, 1); BUF(sl->bFfnMid, 2);
+        DT(B*ffnDim,1,1, 256,1,1); BARRIER();
+        MVB(sl->bFfnMid, g_inf.wdown[l], sl->bProj, g_inf.cb_Nffn, g_inf.cb_dim); BARRIER();
+        if (g_inf.residMul != 1.0f) {
+            PS(g_ps_scale_inplace); BUF(sl->bProj, 0); CB(g_inf.cb_residMul, 1);
+            DT(B*dim,1,1, 256,1,1); BARRIER();
+        }
+        PS(g_ps_add_inplace); BUF(sl->bHidden, 0); BUF(sl->bProj, 1);
+        DT(B*dim,1,1, 256,1,1); BARRIER();
+    }
+
+    // Logits for the final token only — see the note on logitsOut above. The
+    // last row is normalized in place into the single-token `hidden` buffer so
+    // the existing single-row lmHead matvec applies unchanged.
+    if (logitsOut) {
         PS(g_ps_copy_mem);
-        [enc setBuffer:embBuf offset:(NSUInteger)b * dim * sizeof(float) atIndex:0];
+        [enc setBuffer:(__bridge id<MTLBuffer>)sl->bHidden offset:(NSUInteger)(B-1)*dim*sizeof(float) atIndex:0];
         BUF(sl->hidden, 1);
         DT(dim,1,1, 256,1,1); BARRIER();
-        ARCH_SCALE(sl->hidden, g_inf_arch_emb_buf, dim, g_inf.cb_dim);
 
-        for (int l = 0; l < nLayers; l++) {
-            PS(g_ps_rmsnorm_out); BUF(sl->hidden, 0); BUF(sl->normed, 1); BUF(g_inf.norm1[l], 2);
-            CB(g_inf.cb_dim, 3); CB(g_inf.cb_eps, 4); DTG(1,1,1, tpg_norm,1,1); BARRIER();
-
-            MV(sl->normed, g_inf.wq[l], sl->Q, g_inf.cb_Kdim, g_inf.cb_dim);
-            MV(sl->normed, g_inf.wk[l], sl->K, g_inf.cb_Kdim, g_inf.cb_Nkvdim);
-            MV(sl->normed, g_inf.wv[l], sl->V, g_inf.cb_Kdim, g_inf.cb_Nkvdim);
-            BARRIER();
-
-            PS(g_ps_bias_add);
-            BUF(sl->Q, 0); BUF(g_inf.bq[l], 1); CB(g_inf.cb_dim, 2); DT(dim,1,1, 256,1,1);
-            BUF(sl->K, 0); BUF(g_inf.bk[l], 1); CB(g_inf.cb_kvDim, 2); DT(kvDim,1,1, 256,1,1);
-            BUF(sl->V, 0); BUF(g_inf.bv[l], 1); CB(g_inf.cb_kvDim, 2); DT(kvDim,1,1, 256,1,1);
-            BARRIER();
-
-            int nPQ = nHeads * (headDim / 2), nPK = nKVHeads * (headDim / 2);
-            PS(g_ps_rope_rh);
-            BUF(sl->Q, 0); CB(g_inf.cb_headDim, 1); CB(g_inf.cb_nHeads, 2); CB(cb_pos, 3); CB(g_inf.cb_theta, 4);
-            DT(nPQ,1,1, MIN(256,(int)g_ps_rope_rh.maxTotalThreadsPerThreadgroup),1,1);
-            BUF(sl->K, 0); CB(g_inf.cb_headDim, 1); CB(g_inf.cb_nKVHeads, 2); CB(cb_pos, 3); CB(g_inf.cb_theta, 4);
-            DT(nPK,1,1, MIN(256,(int)g_ps_rope_rh.maxTotalThreadsPerThreadgroup),1,1);
-            BARRIER();
-
-            int cOff = pos * kvDim * (int)sizeof(float);
-            PS(g_ps_copy_mem);
-            BUF(sl->K, 0); BUFO(sl->kCache[l], cOff, 1); DT(kvDim,1,1, 256,1,1);
-            BUF(sl->V, 0); BUFO(sl->vCache[l], cOff, 1); DT(kvDim,1,1, 256,1,1);
-            BARRIER();
-
-            PS(g_ps_dec_attn);
-            BUF(sl->Q, 0); BUF(sl->kCache[l], 1); BUF(sl->vCache[l], 2); BUF(sl->attnOut, 3);
-            CB(g_inf.cb_kvDim, 4); CB(g_inf.cb_headDim, 5); CB(g_inf.cb_nHeads, 6);
-            CB(g_inf.cb_nKVHeads, 7); CB(cb_seq, 8);
-            if (g_inf_arch_attn_buf) [enc setBuffer:g_inf_arch_attn_buf offset:0 atIndex:9];
-            DTG(nHeads,1,1, headDim,1,1); BARRIER();
-
-            MV(sl->attnOut, g_inf.wo[l], sl->proj, g_inf.cb_Kdim, g_inf.cb_dim); BARRIER();
-            PS(g_ps_add_inplace); BUF(sl->hidden, 0); BUF(sl->proj, 1);
-            DT(dim,1,1, 256,1,1); BARRIER();
-
-            PS(g_ps_rmsnorm_out); BUF(sl->hidden, 0); BUF(sl->normed2, 1); BUF(g_inf.norm2[l], 2);
-            CB(g_inf.cb_dim, 3); CB(g_inf.cb_eps, 4); DTG(1,1,1, tpg_norm,1,1); BARRIER();
-
-            MV(sl->normed2, g_inf.wgate[l], sl->gatePre, g_inf.cb_Kdim, g_inf.cb_Nffn);
-            MV(sl->normed2, g_inf.wup[l], sl->upOut, g_inf.cb_Kdim, g_inf.cb_Nffn);
-            BARRIER();
-            PS(g_ps_silu_gate_mul); BUF(sl->gatePre, 0); BUF(sl->upOut, 1); BUF(sl->ffnMid, 2);
-            DT(ffnDim,1,1, 256,1,1); BARRIER();
-            MV(sl->ffnMid, g_inf.wdown[l], sl->proj, g_inf.cb_Nffn, g_inf.cb_dim); BARRIER();
-            PS(g_ps_add_inplace); BUF(sl->hidden, 0); BUF(sl->proj, 1);
-            DT(dim,1,1, 256,1,1); BARRIER();
-        }
-
-        // The LM head is the single most expensive matvec in the model
-        // (vocabSize x dim). Only the final token's logits are ever sampled, so
-        // every other token skips it entirely.
-        if (lastTok && logitsOut) {
-            // rmsnorm_save normalizes hidden IN PLACE, so the head reads
-            // hidden rather than a separate normed buffer. Matching
-            // mtl_fused_step exactly here matters: using rmsnorm_out into
-            // normed instead changed the logits by ~19.7.
-            PS(g_ps_rmsnorm_save); BUF(sl->hidden, 0); BUF(g_inf.finalNorm, 1); BUF(sl->rmsScale, 2);
-            CB(g_inf.cb_dim, 3); CB(g_inf.cb_eps, 4); DTG(1,1,1, tpg_norm,1,1); BARRIER();
-            MV(sl->hidden, g_inf.lmHead, sl->logits, g_inf.cb_Kdim, g_inf.cb_Nvocab);
-        BARRIER();
-        ARCH_DIV(sl->logits, g_inf_arch_log_buf, vocabSize, g_inf.cb_Nvocab);
-            BARRIER();
-        }
+        PS(g_ps_rmsnorm_save); BUF(sl->hidden, 0); BUF(g_inf.finalNorm, 1); BUF(sl->rmsScale, 2);
+        CB(g_inf.cb_dim, 3); CB(g_inf.cb_eps, 4); DTG(1,1,1, tpg_norm,1,1); BARRIER();
+        MV(sl->hidden, g_inf.lmHead, sl->logits, g_inf.cb_Kdim, g_inf.cb_Nvocab);
+        if (g_inf.logitsDiv != 1.0f) { BARRIER(); }
+        SCALE(sl->logits, g_inf.cb_logitsMul, vocabSize, g_inf.logitsDiv != 1.0f);
     }
+
+    #undef MVB
 
     [enc endEncoding];
     [cmd commit];
     [cmd waitUntilCompleted];
 
-    if (cmd.error) { NSLog(@"prefill_batch: %@", cmd.error); return -2; }
-
     if (logitsOut) {
-        memcpy(logitsOut, ((__bridge id<MTLBuffer>)sl->logits).contents,
-               vocabSize * sizeof(float));
+        memcpy(logitsOut, ((__bridge id<MTLBuffer>)sl->logits).contents, vocabSize * sizeof(float));
     }
-    (void)vocabSize;
     return 0;
 }
 
@@ -6905,6 +7001,28 @@ int mtl_fused_set_arch(float embeddingMultiplier, float residualMultiplier,
     if (logitsScaling != 0.0f)
         g_inf_arch_log_buf = [g_device newBufferWithBytes:&logitsScaling length:4
                                                   options:MTLResourceStorageModeShared];
+
+    // The batched prefill wants the same scalars in value+buffer form, with
+    // 1.0f meaning no-op so it can skip the dispatch entirely.
+    //
+    // The attention scale becomes a Q PRE-SCALE rather than a kernel argument:
+    // batch_causal_attn hardcodes 1/sqrt(headDim), so Q is scaled by
+    // attnScale*sqrt(headDim) before attention. That is valid precisely because
+    // Q is per-token scratch, while K is written to the KV cache and must stay
+    // unscaled for every later token that reads it.
+    g_inf.embedMul  = (embeddingMultiplier != 0.0f) ? embeddingMultiplier : 1.0f;
+    g_inf.residMul  = (residualMultiplier  != 0.0f) ? residualMultiplier  : 1.0f;
+    g_inf.logitsDiv = (logitsScaling       != 0.0f) ? logitsScaling       : 1.0f;
+    g_inf.qPreScale = 1.0f;
+    if (attentionScale != 0.0f && g_inf.headDim > 0)
+        g_inf.qPreScale = attentionScale * sqrtf((float)g_inf.headDim);
+
+    if (g_inf.built) {
+        g_inf.cb_embedMul  = inf_constf(g_inf.embedMul);
+        g_inf.cb_residMul  = inf_constf(g_inf.residMul);
+        g_inf.cb_qPreScale = inf_constf(g_inf.qPreScale);
+        g_inf.cb_logitsMul = inf_constf(1.0f / g_inf.logitsDiv);
+    }
     return 0;
 }
 
