@@ -6574,6 +6574,18 @@ int mtl_fused_prefill_batch(int slot, const float* hiddenIn, int B, int basePos,
                                           options:MTLResourceStorageModeShared];
     }
 
+    // Upload all B embeddings ONCE, before encoding.
+    //
+    // A memcpy into sl->hidden between dispatches does not work: everything
+    // encoded into a command buffer executes at COMMIT time, so all B tokens
+    // would observe whatever the final memcpy left behind — the last token's
+    // embedding, repeated B times. The symptom is degenerate repetitive output
+    // rather than a crash. Each token instead copies its own row on the GPU,
+    // ordered correctly by the encoder.
+    id<MTLBuffer> embBuf = [g_device newBufferWithBytes:hiddenIn
+                                                 length:(size_t)B * dim * sizeof(float)
+                                                options:MTLResourceStorageModeShared];
+
     id<MTLCommandBuffer> cmd = [queue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
 
@@ -6583,15 +6595,14 @@ int mtl_fused_prefill_batch(int slot, const float* hiddenIn, int B, int basePos,
         id<MTLBuffer> cb_seq = seqBufs[b];
         bool lastTok = (b == B - 1);
 
-        memcpy(((__bridge id<MTLBuffer>)sl->hidden).contents,
-               hiddenIn + (size_t)b * dim, dim * sizeof(float));
+        PS(g_ps_copy_mem);
+        [enc setBuffer:embBuf offset:(NSUInteger)b * dim * sizeof(float) atIndex:0];
+        BUF(sl->hidden, 1);
+        DT(dim,1,1, 256,1,1); BARRIER();
         ARCH_SCALE(sl->hidden, g_inf_arch_emb_buf, dim, g_inf.cb_dim);
 
         for (int l = 0; l < nLayers; l++) {
-            PS(g_ps_copy_mem); BUF(sl->hidden, 0); BUF(sl->normed, 1);
-            DT(dim,1,1, 256,1,1); BARRIER();
-
-            PS(g_ps_rmsnorm_save); BUF(sl->normed, 0); BUF(g_inf.norm1[l], 1); BUF(sl->rmsScale, 2);
+            PS(g_ps_rmsnorm_out); BUF(sl->hidden, 0); BUF(sl->normed, 1); BUF(g_inf.norm1[l], 2);
             CB(g_inf.cb_dim, 3); CB(g_inf.cb_eps, 4); DTG(1,1,1, tpg_norm,1,1); BARRIER();
 
             MV(sl->normed, g_inf.wq[l], sl->Q, g_inf.cb_Kdim, g_inf.cb_dim);
@@ -6630,9 +6641,7 @@ int mtl_fused_prefill_batch(int slot, const float* hiddenIn, int B, int basePos,
             PS(g_ps_add_inplace); BUF(sl->hidden, 0); BUF(sl->proj, 1);
             DT(dim,1,1, 256,1,1); BARRIER();
 
-            PS(g_ps_copy_mem); BUF(sl->hidden, 0); BUF(sl->normed2, 1);
-            DT(dim,1,1, 256,1,1); BARRIER();
-            PS(g_ps_rmsnorm_save); BUF(sl->normed2, 0); BUF(g_inf.norm2[l], 1); BUF(sl->rmsScale2, 2);
+            PS(g_ps_rmsnorm_out); BUF(sl->hidden, 0); BUF(sl->normed2, 1); BUF(g_inf.norm2[l], 2);
             CB(g_inf.cb_dim, 3); CB(g_inf.cb_eps, 4); DTG(1,1,1, tpg_norm,1,1); BARRIER();
 
             MV(sl->normed2, g_inf.wgate[l], sl->gatePre, g_inf.cb_Kdim, g_inf.cb_Nffn);
@@ -6649,6 +6658,10 @@ int mtl_fused_prefill_batch(int slot, const float* hiddenIn, int B, int basePos,
         // (vocabSize x dim). Only the final token's logits are ever sampled, so
         // every other token skips it entirely.
         if (lastTok && logitsOut) {
+            // rmsnorm_save normalizes hidden IN PLACE, so the head reads
+            // hidden rather than a separate normed buffer. Matching
+            // mtl_fused_step exactly here matters: using rmsnorm_out into
+            // normed instead changed the logits by ~19.7.
             PS(g_ps_rmsnorm_save); BUF(sl->hidden, 0); BUF(g_inf.finalNorm, 1); BUF(sl->rmsScale, 2);
             CB(g_inf.cb_dim, 3); CB(g_inf.cb_eps, 4); DTG(1,1,1, tpg_norm,1,1); BARRIER();
             MV(sl->hidden, g_inf.lmHead, sl->logits, g_inf.cb_Kdim, g_inf.cb_Nvocab);
